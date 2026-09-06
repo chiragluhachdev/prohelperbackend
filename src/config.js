@@ -80,6 +80,14 @@ export const DEFAULT_SETTINGS = {
   search_radius_km: 12,          // covers most of a metro on the first wave
   radius_step_km: 15,            // widen by this much each dispatch round
   max_dispatch_rounds: 3,
+  /**
+   * MVP: alert every eligible helper regardless of distance.
+   *
+   * The other gates still apply — approved, not blocked, online, not on DND,
+   * offers the service, working that day and hour. Only the distance and
+   * service-area checks are skipped. Set to false to switch the radius back on.
+   */
+  match_ignore_location: true,
   dispatch_batch_size: 3,         // helpers alerted simultaneously per round
   accept_window_seconds: 60,      // the 60-second accept window
   // --- money (UC-C29 / UC-C30 / UC-C31) ---

@@ -20,7 +20,7 @@ const toMinutes = (hhmm) => {
  * requested services. Helpers already alerted for this task are skipped so a
  * later round never spams the same person twice.
  */
-export async function findEligibleHelpers(task, { radiusKm, excludeHelperIds = [] }) {
+export async function findEligibleHelpers(task, { radiusKm, excludeHelperIds = [], ignoreLocation = false }) {
   const point = { lat: task.address.lat, lng: task.address.lng };
   const box = boundingBox(point, radiusKm);
   const requestedCodes = task.services.map((s) => s.code);
@@ -28,16 +28,20 @@ export async function findEligibleHelpers(task, { radiusKm, excludeHelperIds = [
   const weekday = new Date(task.scheduledAt).getDay();
   const scheduledMinutes = toMinutes(task.scheduledTime);
 
-  const profiles = await HelperProfile.find({
+  const query = {
     approvalStatus: HELPER_APPROVAL.APPROVED,
     isOnline: true,
     dnd: false,
     services: { $in: requestedCodes },
     workDays: weekday,
-    'serviceArea.lat': { $gte: box.minLat, $lte: box.maxLat },
-    'serviceArea.lng': { $gte: box.minLng, $lte: box.maxLng },
     userId: { $nin: excludeHelperIds },
-  })
+  };
+  if (!ignoreLocation) {
+    query['serviceArea.lat'] = { $gte: box.minLat, $lte: box.maxLat };
+    query['serviceArea.lng'] = { $gte: box.minLng, $lte: box.maxLng };
+  }
+
+  const profiles = await HelperProfile.find(query)
     .populate('userId', 'name phone photoUrl status')
     .lean();
 
@@ -55,10 +59,13 @@ export async function findEligibleHelpers(task, { radiusKm, excludeHelperIds = [
       continue;
     }
 
-    // The address must sit inside both the search radius and the helper's own area.
+    // Distance is still reported so the helper sees how far the job is; in
+    // ignore-location mode it simply stops being a reason to exclude anyone.
     const km = distanceKm(profile.serviceArea, point);
-    const reach = Math.min(radiusKm, profile.serviceArea.radiusKm ?? radiusKm);
-    if (km > reach) continue;
+    if (!ignoreLocation) {
+      const reach = Math.min(radiusKm, profile.serviceArea.radiusKm ?? radiusKm);
+      if (km > reach) continue;
+    }
 
     const offered = new Set(profile.services || []);
     const matchedAll = requestedCodes.every((code) => offered.has(code));
@@ -66,7 +73,7 @@ export async function findEligibleHelpers(task, { radiusKm, excludeHelperIds = [
     candidates.push({
       helperId: user._id,
       name: user.name,
-      distanceKm: Math.round(km * 10) / 10,
+      distanceKm: Number.isFinite(km) ? Math.round(km * 10) / 10 : 0,
       matchedAllServices: matchedAll,
       rating: profile.ratingAvg || 0,
       completedJobs: profile.completedJobs || 0,
@@ -144,9 +151,14 @@ export async function dispatchTask(taskId) {
 
   // Widen the net each round: the first wave goes to the closest helpers, later
   // waves reach further out (UC-C08).
+  const ignoreLocation = settings.match_ignore_location !== false;
   const radiusKm = settings.search_radius_km + (round - 1) * settings.radius_step_km;
   const alreadyTried = await JobRequest.find({ taskId: task._id }).distinct('helperId');
-  const candidates = await findEligibleHelpers(task, { radiusKm, excludeHelperIds: alreadyTried });
+  const candidates = await findEligibleHelpers(task, {
+    radiusKm,
+    excludeHelperIds: alreadyTried,
+    ignoreLocation,
+  });
 
   if (candidates.length === 0) {
     // Nothing new within this radius — widen next round, or give up.
@@ -155,7 +167,9 @@ export async function dispatchTask(taskId) {
     return null;
   }
 
-  const batch = candidates.slice(0, settings.dispatch_batch_size);
+  // Location off means there is no "nearest few" to pick — everyone eligible
+  // gets the alert and the first to accept wins.
+  const batch = ignoreLocation ? candidates : candidates.slice(0, settings.dispatch_batch_size);
 
   const expiresAt = new Date(now.getTime() + settings.accept_window_seconds * 1000);
 
@@ -189,7 +203,10 @@ export async function dispatchTask(taskId) {
     { $set: { nextDispatchAt: new Date(expiresAt.getTime() + 1000) } },
   );
 
-  console.log(`[match] ${task.code} round ${round} → ${batch.length} helper(s) within ${radiusKm}km`);
+  console.log(
+    `[match] ${task.code} round ${round} → ${batch.length} helper(s)` +
+      (ignoreLocation ? ' (all areas)' : ` within ${radiusKm}km`),
+  );
   return batch;
 }
 
