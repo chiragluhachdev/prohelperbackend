@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Pro Helper MVP API \u2014 the source of truth for tasks, matching, assignment and money",
   "engines": {
-    "node": ">=20 <25"
+    "node": ">=20.11"
   },
   "scripts": {
     "dev": "node --watch src/server.js",

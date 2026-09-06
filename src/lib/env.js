@@ -3,25 +3,24 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
- * Loads `.env` into process.env when the file exists.
+ * Loads a local `.env` if one exists — nothing more.
  *
- * Deliberately not `node --env-file=.env`: that flag throws ENOENT when the
- * file is absent, which is exactly the case on a hosting platform where the
- * variables are supplied by the environment instead. Real environment
- * variables always win, so a platform value is never overwritten by a stale
- * local file.
+ * Hosts like Railway inject configuration as real environment variables and
+ * have no `.env` file, so `node --env-file=.env` crashes there with ENOENT.
+ * This does the same job without a flag, without a dependency, and without
+ * ever overwriting a variable the platform has already set.
  *
- * Must be imported before ./config.js, which reads process.env at load time.
+ * Import this before anything that reads `process.env`.
  */
-function loadEnv() {
-  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-  const file = process.env.ENV_FILE || path.join(root, '.env');
+function loadEnvFile() {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const envPath = process.env.ENV_FILE || path.resolve(here, '../../.env');
 
   let raw;
   try {
-    raw = fs.readFileSync(file, 'utf8');
+    raw = fs.readFileSync(envPath, 'utf8');
   } catch {
-    return false; // no local .env — the platform is providing the variables
+    return false; // no local file — the platform is supplying the config
   }
 
   for (const line of raw.split('\n')) {
@@ -32,7 +31,7 @@ function loadEnv() {
     if (eq === -1) continue;
 
     const key = trimmed.slice(0, eq).trim();
-    if (!key || key in process.env) continue; // never clobber a real env var
+    if (!key || key in process.env) continue; // a real env var always wins
 
     let value = trimmed.slice(eq + 1).trim();
     if (
@@ -46,4 +45,4 @@ function loadEnv() {
   return true;
 }
 
-export const loadedFromFile = loadEnv();
+export const loadedFromFile = loadEnvFile();
