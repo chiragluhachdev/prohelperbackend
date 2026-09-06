@@ -1,0 +1,24 @@
+{
+  "name": "prohelper-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pro Helper MVP API — the source of truth for tasks, matching, assignment and money",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "dev": "node --watch --env-file=.env src/server.js",
+    "start": "node --env-file=.env src/server.js",
+    "seed": "node --env-file=.env src/seed.js",
+    "seed:reset": "node --env-file=.env src/seed.js --reset",
+    "test": "node tests/smoke.mjs"
+  },
+  "dependencies": {
+    "cloudinary": "^2.5.1",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.9.5",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1"
+  }
+}
