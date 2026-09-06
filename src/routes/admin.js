@@ -485,23 +485,92 @@ router.get(
   }),
 );
 
+/**
+ * UC-C42 — services are data, not code. Everything the customer app renders for
+ * a service (name, copy, price, duration) is edited here and picked up by the
+ * apps on their next catalog fetch, with no release needed.
+ */
 router.patch(
   '/services/:code',
   wrap(async (req, res) => {
     const service = await Service.findOne({ code: req.params.code });
     if (!service) throw notFound('Service not found.');
 
-    const before = { basePrice: service.basePrice, active: service.active };
-    if (req.body.basePrice != null) service.basePrice = Number(req.body.basePrice);
+    const before = {
+      name: service.name, basePrice: service.basePrice, active: service.active,
+      durationLabel: service.durationLabel, defaultDurationMins: service.defaultDurationMins,
+      description: service.description, category: service.category, icon: service.icon,
+      sortOrder: service.sortOrder,
+    };
+
+    if (req.body.name != null) {
+      const name = String(req.body.name).trim();
+      if (!name) throw badRequest('Name cannot be empty.', 'NAME_REQUIRED');
+      service.name = name;
+    }
+    if (req.body.basePrice != null) {
+      const price = Number(req.body.basePrice);
+      if (!Number.isFinite(price) || price < 0) throw badRequest('Price must be zero or more.', 'INVALID_PRICE');
+      service.basePrice = Math.round(price * 100) / 100;
+    }
+    if (req.body.defaultDurationMins != null) {
+      const mins = Number(req.body.defaultDurationMins);
+      if (!Number.isFinite(mins) || mins <= 0) throw badRequest('Duration must be more than zero.', 'INVALID_DURATION');
+      service.defaultDurationMins = Math.round(mins);
+    }
     if (req.body.active != null) service.active = Boolean(req.body.active);
-    if (req.body.description != null) service.description = req.body.description;
+    if (req.body.description != null) service.description = String(req.body.description);
+    if (req.body.durationLabel != null) service.durationLabel = String(req.body.durationLabel);
+    if (req.body.category != null) service.category = String(req.body.category);
+    if (req.body.icon != null) service.icon = String(req.body.icon);
+    if (req.body.sortOrder != null) service.sortOrder = Number(req.body.sortOrder) || 0;
+
     await service.save();
 
     await audit(req, {
-      action: 'SERVICE_UPDATED', entity: 'Service', entityId: service.code,
-      before, after: { basePrice: service.basePrice, active: service.active },
+      action: 'SERVICE_UPDATED',
+      entity: 'Service',
+      entityId: service.code,
+      before,
+      after: {
+        name: service.name, basePrice: service.basePrice, active: service.active,
+        durationLabel: service.durationLabel, defaultDurationMins: service.defaultDurationMins,
+        description: service.description, category: service.category, icon: service.icon,
+        sortOrder: service.sortOrder,
+      },
+      reason: req.body.reason || '',
     });
     res.json({ service });
+  }),
+);
+
+/** Add a service to the catalog. It appears in both apps immediately. */
+router.post(
+  '/services',
+  wrap(async (req, res) => {
+    const code = String(req.body.code || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '_');
+    const name = String(req.body.name || '').trim();
+    const basePrice = Number(req.body.basePrice);
+
+    if (!code) throw badRequest('Give the service a code.', 'CODE_REQUIRED');
+    if (!name) throw badRequest('Give the service a name.', 'NAME_REQUIRED');
+    if (!Number.isFinite(basePrice) || basePrice < 0) throw badRequest('Enter a valid price.', 'INVALID_PRICE');
+    if (await Service.exists({ code })) throw conflict('A service with that code already exists.', 'DUPLICATE_CODE');
+
+    const service = await Service.create({
+      code, name, basePrice,
+      category: req.body.category || 'Cleaning',
+      description: req.body.description || '',
+      icon: req.body.icon || '🧹',
+      durationLabel: req.body.durationLabel || '1 - 2 hours',
+      defaultDurationMins: Number(req.body.defaultDurationMins) || 90,
+      sortOrder: Number(req.body.sortOrder) || 99,
+      active: true,
+      options: [],
+    });
+
+    await audit(req, { action: 'SERVICE_CREATED', entity: 'Service', entityId: code, after: service.toObject() });
+    res.status(201).json({ service });
   }),
 );
 
