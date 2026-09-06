@@ -3,13 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Pro Helper MVP API — the source of truth for tasks, matching, assignment and money",
-  "engines": { "node": ">=20" },
+  "description": "Pro Helper MVP API \u2014 the source of truth for tasks, matching, assignment and money",
+  "engines": {
+    "node": ">=20 <25"
+  },
   "scripts": {
-    "dev": "node --watch --env-file=.env src/server.js",
-    "start": "node --env-file=.env src/server.js",
-    "seed": "node --env-file=.env src/seed.js",
-    "seed:reset": "node --env-file=.env src/seed.js --reset",
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "seed": "node src/seed.js",
+    "seed:reset": "node src/seed.js --reset",
     "test": "node tests/smoke.mjs"
   },
   "dependencies": {

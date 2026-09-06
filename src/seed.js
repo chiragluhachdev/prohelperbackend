@@ -1,3 +1,6 @@
+// Must be first: populates process.env from .env when running locally.
+// On a host like Railway the variables already exist and this is a no-op.
+import './lib/env.js';
 /**
  * Seeds the catalog, the admin account and a small demo cast.
  *

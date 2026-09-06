@@ -1,3 +1,6 @@
+// Must be first: populates process.env from .env when running locally.
+// On a host like Railway the variables already exist and this is a no-op.
+import './lib/env.js';
 import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
