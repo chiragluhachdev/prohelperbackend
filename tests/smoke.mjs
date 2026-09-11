@@ -181,26 +181,33 @@ ok('customer can rate once', rate1.status === 201);
 ok('a second rating is refused', rate2.status === 409);
 
 // -------------------------------------------------- Test 4: no helper
-console.log('\n9. Nobody available for the slot');
-const nightSlot = nextWorkingSlot();
-const night = await api('/api/customer/tasks', {
+console.log('\n9. Nobody available');
+// Working hours no longer create this condition — the demo helpers work around
+// the clock and location filtering is off — so make it real: take everyone
+// offline and confirm the search exhausts rather than hanging.
+await api('/api/helper/online', { method: 'POST', token: helperA, body: { isOnline: false } });
+await api('/api/helper/online', { method: 'POST', token: helperB, body: { isOnline: false } });
+
+const quietSlot = nextWorkingSlot();
+const quiet = await api('/api/customer/tasks', {
   method: 'POST', token: customerToken,
   body: {
     services: [{ code: 'bathroom', options: {} }],
-    addressId, date: nightSlot.date, time: '03:15',
-    idempotencyKey: `smoke-night-${Date.now()}`,
+    addressId, date: quietSlot.date, time: quietSlot.time,
+    idempotencyKey: `smoke-quiet-${Date.now()}`,
   },
 });
-let nightStatus = night.task?.status;
-for (let i = 0; i < 20 && nightStatus !== 'NO_HELPER_AVAILABLE'; i += 1) {
+let quietStatus = quiet.task?.status;
+for (let i = 0; i < 25 && quietStatus !== 'NO_HELPER_AVAILABLE'; i += 1) {
   await sleep(700);
-  nightStatus = (await api(`/api/customer/tasks/${night.task.id}`, { token: customerToken })).task?.status;
+  quietStatus = (await api(`/api/customer/tasks/${quiet.task.id}`, { token: customerToken })).task?.status;
 }
-ok('a 3 AM booking ends as NO_HELPER_AVAILABLE', nightStatus === 'NO_HELPER_AVAILABLE', String(nightStatus));
+ok('with nobody online the search ends as NO_HELPER_AVAILABLE',
+  quietStatus === 'NO_HELPER_AVAILABLE', String(quietStatus));
 
-const retried = await api(`/api/customer/tasks/${night.task.id}/retry`, { method: 'POST', token: customerToken });
+const retried = await api(`/api/customer/tasks/${quiet.task.id}/retry`, { method: 'POST', token: customerToken });
 ok('customer can retry the search', retried.task?.status === 'SEARCHING', JSON.stringify(retried.error));
-await api(`/api/customer/tasks/${night.task.id}/cancel`, { method: 'POST', token: customerToken, body: { reason: 'Smoke test cleanup' } });
+await api(`/api/customer/tasks/${quiet.task.id}/cancel`, { method: 'POST', token: customerToken, body: { reason: 'Smoke test cleanup' } });
 
 // ---------------------------------------------------------------- admin
 console.log('\n10. Admin dashboard');
