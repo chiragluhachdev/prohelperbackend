@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
 import { HelperProfile, JobRequest, Task, User } from './models/index.js';
-import { TASK_STATUS, HELPER_APPROVAL } from './config.js';
+import { TASK_STATUS, HELPER_APPROVAL, ROLES } from './config.js';
 import { getSettings } from './lib/settings.js';
 import { distanceKm, boundingBox } from './lib/geo.js';
 import { notify, notifyMany } from './lib/notify.js';
@@ -320,7 +320,56 @@ export async function declineJob(taskId, helperId) {
       { $set: { nextDispatchAt: now } },
     );
   }
+
+  await recordRejection(helperId);
   return request;
+}
+
+/**
+ * UC-C23 — a helper who keeps turning work down is blocked automatically.
+ *
+ * Counted per explicit decline over the lifetime of the account, not per
+ * expired alert: ignoring a request while you are busy is not the same as
+ * refusing it, and the spec is explicit that the threshold is a business
+ * decision rather than something to hard-code. Admin unblock resets the count.
+ */
+async function recordRejection(helperId) {
+  const settings = await getSettings();
+  const threshold = Number(settings.rejection_block_threshold) || 0;
+  if (threshold <= 0) return;
+
+  const user = await User.findOneAndUpdate(
+    { _id: helperId, status: 'active' },
+    { $inc: { rejectionCount: 1 } },
+    { new: true },
+  );
+  if (!user || user.rejectionCount < threshold) return;
+
+  const reason = `Automatically blocked after ${user.rejectionCount} declined requests. Contact support to restore your account.`;
+  user.status = 'blocked';
+  user.blockReason = reason;
+  user.blockedAt = new Date();
+  await user.save();
+
+  // Blocked means blocked immediately — offline, and no alert left standing.
+  await HelperProfile.updateOne({ userId: user._id }, { $set: { isOnline: false, dnd: false } });
+  await JobRequest.updateMany(
+    { helperId: user._id, status: 'SENT' },
+    { $set: { status: 'CANCELLED' } },
+  );
+
+  await notify(user._id, 'ACCOUNT_BLOCKED', 'Account blocked', reason);
+
+  const admins = await User.find({ role: ROLES.ADMIN, status: 'active' }).select('_id').lean();
+  await notifyMany(
+    admins.map((a) => a._id),
+    'HELPER_AUTO_BLOCKED',
+    'Helper auto-blocked',
+    `${user.name || user.phone} was blocked after ${user.rejectionCount} declines.`,
+    { helperId: String(user._id) },
+  );
+
+  console.log(`[block] ${user.name || user.phone} auto-blocked after ${user.rejectionCount} declines`);
 }
 
 /**

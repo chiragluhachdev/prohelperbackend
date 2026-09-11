@@ -28,13 +28,41 @@ const SERVICES = [
     code: 'full_home', name: 'Full Home Cleaning', category: 'Cleaning', icon: '🏠',
     description: 'Dusting, floors, bathrooms and kitchen — the whole house in one visit.',
     basePrice: 249, durationLabel: '2 - 4 hours', defaultDurationMins: 180, sortOrder: 1,
-    options: [],
+    /*
+     * UC-C05 — the questions are data, not screens. Priced options default to
+     * zero so the advertised "from ₹249" stays true until the customer adds
+     * something.
+     */
+    options: [
+      {
+        key: 'home_size', label: 'Home size', type: 'select',
+        choices: ['1 BHK', '2 BHK', '3 BHK', '4 BHK+'],
+        required: true, defaultValue: '2 BHK',
+      },
+      {
+        key: 'extra_bathrooms', label: 'Extra bathrooms', type: 'number',
+        unit: 'bathrooms', pricePerUnit: 80, defaultValue: 0,
+      },
+      {
+        key: 'balcony', label: 'Include balcony', type: 'boolean',
+        pricePerUnit: 60, defaultValue: false,
+      },
+    ],
   },
   {
     code: 'kitchen', name: 'Kitchen Cleaning', category: 'Cleaning', icon: '🍲',
     description: 'Slabs, stove, chimney, sink and cabinet fronts scrubbed down.',
     basePrice: 149, durationLabel: '1 - 2 hours', defaultDurationMins: 90, sortOrder: 2,
-    options: [],
+    options: [
+      {
+        key: 'load', label: 'How much is there?', type: 'select',
+        choices: ['Light', 'Medium', 'Heavy'], required: true, defaultValue: 'Medium',
+      },
+      {
+        key: 'chimney', label: 'Deep-clean the chimney', type: 'boolean',
+        pricePerUnit: 99, defaultValue: false,
+      },
+    ],
   },
   {
     code: 'bathroom', name: 'Bathroom Cleaning', category: 'Cleaning', icon: '🚿',
