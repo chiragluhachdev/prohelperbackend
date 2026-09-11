@@ -9,6 +9,8 @@ const addressSchema = new mongoose.Schema(
   {
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     label: { type: String, default: 'Home' },
+    /** Which serviced society this address sits in — what matching keys off. */
+    society: { type: String, default: '', index: true },
     line1: { type: String, required: true },
     line2: { type: String, default: '' },
     landmark: { type: String, default: '' },

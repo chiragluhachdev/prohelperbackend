@@ -36,9 +36,20 @@ export async function findEligibleHelpers(task, { radiusKm, excludeHelperIds = [
     workDays: weekday,
     userId: { $nin: excludeHelperIds },
   };
+  /*
+   * Location, when it is switched on, means "works in this society" rather
+   * than "is within N km" — the MVP serves a handful of named estates, so an
+   * overlap is both more accurate and easier to reason about than a radius.
+   * Falls back to the bounding box for any helper who predates societies.
+   */
+  const society = task.address?.society;
   if (!ignoreLocation) {
-    query['serviceArea.lat'] = { $gte: box.minLat, $lte: box.maxLat };
-    query['serviceArea.lng'] = { $gte: box.minLng, $lte: box.maxLng };
+    if (society) {
+      query.societies = society;
+    } else {
+      query['serviceArea.lat'] = { $gte: box.minLat, $lte: box.maxLat };
+      query['serviceArea.lng'] = { $gte: box.minLng, $lte: box.maxLng };
+    }
   }
 
   const profiles = await HelperProfile.find(query)
@@ -62,8 +73,8 @@ export async function findEligibleHelpers(task, { radiusKm, excludeHelperIds = [
     // Distance is still reported so the helper sees how far the job is; in
     // ignore-location mode it simply stops being a reason to exclude anyone.
     const km = distanceKm(profile.serviceArea, point);
-    if (!ignoreLocation) {
-      const reach = Math.min(radiusKm, profile.serviceArea.radiusKm ?? radiusKm);
+    if (!ignoreLocation && !society) {
+      const reach = Math.min(radiusKm, profile.serviceArea?.radiusKm ?? radiusKm);
       if (km > reach) continue;
     }
 

@@ -10,6 +10,7 @@ import { startSearch } from '../matching.js';
 import { notify } from '../lib/notify.js';
 import { upload, uploadBuffer } from '../lib/cloudinary.js';
 import { publicUser } from './auth.js';
+import { SOCIETIES, societyByCode } from '../constants/societies.js';
 
 const router = Router();
 router.use(authenticate, requireRole(ROLES.CUSTOMER));
@@ -61,12 +62,23 @@ router.get(
 );
 
 /** POST /api/customer/addresses — UC-C03. The first one saved becomes default. */
+/** The societies a customer can book in. */
+router.get('/societies', wrap(async (_req, res) => res.json({ societies: SOCIETIES })));
+
 router.post(
   '/addresses',
   wrap(async (req, res) => {
-    const { label = 'Home', line1, line2 = '', landmark = '', city = '', pincode = '', lat, lng } = req.body;
-    if (!String(line1 || '').trim()) throw badRequest('Enter the address.', 'LINE1_REQUIRED');
-    if (lat == null || lng == null) throw badRequest('Pick the location on the map.', 'LOCATION_REQUIRED');
+    const { label = 'Home', line1, line2 = '', landmark = '' } = req.body;
+    if (!String(line1 || '').trim()) throw badRequest('Enter your flat or house number.', 'LINE1_REQUIRED');
+
+    // The society supplies city, pincode and coordinates — the customer only
+    // picks which one they live in.
+    const society = societyByCode(req.body.society);
+    if (!society) throw badRequest('Choose your society.', 'SOCIETY_REQUIRED');
+    const city = society.city;
+    const pincode = society.pincode;
+    const lat = society.lat;
+    const lng = society.lng;
 
     const count = await Address.countDocuments({ userId: req.user._id, active: true });
     const isDefault = count === 0 || Boolean(req.body.isDefault);
@@ -74,8 +86,15 @@ router.post(
 
     const address = await Address.create({
       userId: req.user._id,
-      label, line1, line2, landmark, city, pincode,
-      lat: Number(lat), lng: Number(lng),
+      label,
+      line1,
+      line2: line2 || `${society.name}, ${society.area}`,
+      landmark,
+      city,
+      pincode,
+      society: society.code,
+      lat,
+      lng,
       isDefault,
     });
     res.status(201).json({ address });
@@ -181,6 +200,7 @@ router.post(
         services: lines,
         address: {
           addressId: address._id,
+          society: address.society,
           label: address.label, line1: address.line1, line2: address.line2,
           landmark: address.landmark, city: address.city, pincode: address.pincode,
           lat: address.lat, lng: address.lng,

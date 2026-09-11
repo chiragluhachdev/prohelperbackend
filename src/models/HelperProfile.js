@@ -39,6 +39,13 @@ const helperProfileSchema = new mongoose.Schema(
 
     // --- capability & reach ---
     services: [{ type: String, index: true }], // Service.code
+    /**
+     * Societies this helper will work in. The MVP matches on society overlap
+     * rather than distance, so this is the field that matters; serviceArea
+     * below is kept as the centre of the first one for the distance helper.
+     */
+    societies: [{ type: String, index: true }],
+
     serviceArea: {
       label: { type: String, default: '' },
       lat: { type: Number },
@@ -47,9 +54,9 @@ const helperProfileSchema = new mongoose.Schema(
     },
 
     // --- availability (UC-C14) ---
-    workDays: { type: [Number], default: [1, 2, 3, 4, 5, 6] }, // 0=Sun
-    workStart: { type: String, default: '07:00' },
-    workEnd: { type: String, default: '20:00' },
+    workDays: { type: [Number], default: [0, 1, 2, 3, 4, 5, 6] }, // 0=Sun
+    workStart: { type: String, default: '00:00' },
+    workEnd: { type: String, default: '23:59' },
     isOnline: { type: Boolean, default: false, index: true },
     dnd: { type: Boolean, default: false },
 
@@ -78,7 +85,7 @@ helperProfileSchema.methods.checklist = function checklist(docCount) {
     identity: this.kycStatus === 'VERIFIED',
     documents: docCount > 0,
     services: (this.services || []).length > 0,
-    serviceArea: Boolean(this.serviceArea?.lat && this.serviceArea?.lng),
+    serviceArea: (this.societies || []).length > 0,
   };
 };
 

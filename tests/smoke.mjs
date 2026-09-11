@@ -31,6 +31,33 @@ async function login(phone, role) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/*
+ * The seed ships only the catalog and the admin, so this suite registers the
+ * people it needs. Phone numbers are unique per run, which keeps repeat runs
+ * from colliding on an account that is mid-booking.
+ */
+const RUN = String(Date.now()).slice(-5);
+const PHONE = {
+  customer: `7${RUN}0001`.slice(0, 10),
+  helperA: `7${RUN}0002`.slice(0, 10),
+  helperB: `7${RUN}0003`.slice(0, 10),
+  helperC: `7${RUN}0004`.slice(0, 10),
+};
+
+/** Registers a helper and walks them all the way to approved. */
+async function makeApprovedHelper(phone, name, adminToken) {
+  const token = await login(phone, 'helper');
+  await api('/api/helper/profile', { method: 'PATCH', token, body: { name, gender: 'female', bio: 'Test helper.' } });
+  await api('/api/helper/kyc/aadhaar/request', { method: 'POST', token, body: { aadhaar: '123456789012' } });
+  await api('/api/helper/kyc/aadhaar/verify', { method: 'POST', token, body: { code: '123456', name } });
+  await api('/api/helper/services', { method: 'PUT', token, body: { codes: ['full_home', 'kitchen', 'bathroom', 'sofa'] } });
+  await api('/api/helper/service-area', { method: 'PUT', token, body: { societies: ['rps_savana', 'rps_auria', 'rps_palms'] } });
+  await api('/api/helper/submit', { method: 'POST', token });
+  const me = await api('/api/auth/me', { token });
+  await api(`/api/admin/helpers/${me.user.id}/approve`, { method: 'POST', token: adminToken });
+  return { token, id: me.user.id };
+}
+
 console.log('\nPro Helper — end-to-end smoke test\n');
 
 // ---------------------------------------------------------------- health
@@ -39,17 +66,27 @@ ok('API is up and connected to Mongo', health.ok && health.db === 'connected', J
 
 // ---------------------------------------------------------------- auth
 console.log('\n1. Authentication');
-const customerToken = await login('9876500001', 'customer');
+const adminBootstrap = await api('/api/auth/admin/login', { method: 'POST', body: { email: 'admin@prohelper.in', password: 'admin@123' } });
+const adminToken = adminBootstrap.token;
+
+const customerToken = await login(PHONE.customer, 'customer');
+await api('/api/customer/profile', { method: 'PATCH', token: customerToken, body: { name: 'Test Customer' } });
+await api('/api/customer/addresses', {
+  method: 'POST', token: customerToken,
+  body: { label: 'Home', line1: 'Tower C, Flat 1204', society: 'rps_savana' },
+});
 ok('customer signs in with a 6-digit OTP', Boolean(customerToken));
 
-const badOtp = await api('/api/auth/otp/verify', { method: 'POST', body: { phone: '9876500001', code: '12' } });
+const badOtp = await api('/api/auth/otp/verify', { method: 'POST', body: { phone: PHONE.customer, code: '12' } });
 ok('a short code is rejected', badOtp.status === 400, JSON.stringify(badOtp.error));
 
 const me = await api('/api/auth/me', { token: customerToken });
 ok('customer profile loads with an address', me.user?.role === 'customer' && me.addresses?.length > 0);
 
-const helperA = await login('9876511001', 'helper');
-const helperB = await login('9876511002', 'helper');
+const a = await makeApprovedHelper(PHONE.helperA, 'Helper A', adminToken);
+const b = await makeApprovedHelper(PHONE.helperB, 'Helper B', adminToken);
+const helperA = a.token;
+const helperB = b.token;
 ok('both helpers sign in', Boolean(helperA && helperB));
 
 // ---------------------------------------------------------------- catalog + quote
@@ -211,15 +248,21 @@ await api(`/api/customer/tasks/${quiet.task.id}/cancel`, { method: 'POST', token
 
 // ---------------------------------------------------------------- admin
 console.log('\n10. Admin dashboard');
-const adminLogin = await api('/api/auth/admin/login', { method: 'POST', body: { email: 'admin@prohelper.in', password: 'admin@123' } });
-ok('admin signs in with email + password', Boolean(adminLogin.token));
-const adminToken = adminLogin.token;
+ok('admin signs in with email + password', Boolean(adminToken));
 
 const dash = await api('/api/admin/dashboard', { token: adminToken });
 ok('dashboard reports counts', dash.stats?.customers >= 1 && dash.stats?.helpers >= 3, JSON.stringify(dash.stats));
 
 // Reject then approve the same helper, so the test is the same on every run.
-const found = await api('/api/admin/helpers?q=9876511003', { token: adminToken });
+const pendingToken = await login(PHONE.helperC, 'helper');
+await api('/api/helper/profile', { method: 'PATCH', token: pendingToken, body: { name: 'Helper C', gender: 'female', bio: 'Pending.' } });
+await api('/api/helper/kyc/aadhaar/request', { method: 'POST', token: pendingToken, body: { aadhaar: '123456789012' } });
+await api('/api/helper/kyc/aadhaar/verify', { method: 'POST', token: pendingToken, body: { code: '123456', name: 'Helper C' } });
+await api('/api/helper/services', { method: 'PUT', token: pendingToken, body: { codes: ['kitchen'] } });
+await api('/api/helper/service-area', { method: 'PUT', token: pendingToken, body: { societies: ['rps_auria'] } });
+await api('/api/helper/submit', { method: 'POST', token: pendingToken });
+
+const found = await api(`/api/admin/helpers?q=${PHONE.helperC}`, { token: adminToken });
 const sunita = found.helpers?.[0];
 ok('admin can look a helper up', Boolean(sunita), JSON.stringify(found.helpers?.length));
 
@@ -234,7 +277,7 @@ ok('admin rejects with a reason the helper can act on',
   JSON.stringify(rejected.error));
 
 // The rejected helper fixes things and re-submits — back into the queue.
-const sunitaToken = await login('9876511003', 'helper');
+const sunitaToken = pendingToken;
 const offlineAttempt = await api('/api/helper/online', { method: 'POST', token: sunitaToken, body: { isOnline: true } });
 ok('an unapproved helper cannot go online', offlineAttempt.status === 403, JSON.stringify(offlineAttempt.error));
 

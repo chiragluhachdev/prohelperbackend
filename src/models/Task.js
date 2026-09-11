@@ -6,6 +6,7 @@ const addressSnapshotSchema = new mongoose.Schema(
   {
     addressId: { type: mongoose.Schema.Types.ObjectId, ref: 'Address' },
     label: String,
+    society: String,
     line1: String,
     line2: String,
     landmark: String,

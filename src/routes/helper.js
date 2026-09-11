@@ -16,6 +16,7 @@ import { postEntry, earningsSummary } from '../lib/ledger.js';
 import { upload, uploadBuffer, destroyAsset } from '../lib/cloudinary.js';
 import { issueOtp, verifyOtp } from '../lib/otp.js';
 import { publicUser } from './auth.js';
+import { SOCIETIES, societyByCode } from '../constants/societies.js';
 
 const router = Router();
 router.use(authenticate, requireRole(ROLES.HELPER));
@@ -235,19 +236,41 @@ router.put(
   }),
 );
 
+/**
+ * Where a helper will work, as one or more serviced societies.
+ *
+ * `serviceArea` is still written — set to the centre of the first society —
+ * because the distance helper and the admin dashboard read it, but `societies`
+ * is what matching actually uses.
+ */
 router.put(
   '/service-area',
   wrap(async (req, res) => {
-    const { label = '', lat, lng, radiusKm } = req.body;
-    if (lat == null || lng == null) throw badRequest('Pick your working area on the map.', 'LOCATION_REQUIRED');
-    const radius = Number(radiusKm) || 5;
-    if (radius <= 0 || radius > 50) throw badRequest('Radius must be between 1 and 50 km.', 'INVALID_RADIUS');
+    const codes = Array.isArray(req.body.societies) ? req.body.societies : [];
+    const chosen = codes.map(societyByCode).filter(Boolean);
 
-    req.profile.serviceArea = { label, lat: Number(lat), lng: Number(lng), radiusKm: radius };
+    if (chosen.length === 0) {
+      throw badRequest('Choose at least one society you can work in.', 'NO_SOCIETY');
+    }
+    if (chosen.length !== codes.length) {
+      throw badRequest('One of those societies is not served yet.', 'UNKNOWN_SOCIETY');
+    }
+
+    req.profile.societies = chosen.map((c) => c.code);
+    req.profile.serviceArea = {
+      label: chosen.map((c) => c.name).join(', '),
+      lat: chosen[0].lat,
+      lng: chosen[0].lng,
+      // Society-level matching, so the radius only needs to cover the estate.
+      radiusKm: 3,
+    };
     await req.profile.save();
     res.json({ profile: req.profile.toObject() });
   }),
 );
+
+/** The societies a helper can pick from. */
+router.get('/societies', wrap(async (_req, res) => res.json({ societies: SOCIETIES })));
 
 /** UC-C14 — outside these hours the matcher will not alert this helper. */
 router.put(
