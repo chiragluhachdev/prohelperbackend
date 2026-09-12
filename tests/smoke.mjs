@@ -252,6 +252,13 @@ ok('customer can retry the search', retried.task?.status === 'SEARCHING', JSON.s
 console.log('\n9b. Instant booking');
 await api('/api/helper/online', { method: 'POST', token: helperB, body: { isOnline: true } });
 
+/* A device token that FCM will refuse. Every push below therefore travels all
+   the way to Google and back, which proves the payload itself is valid — FCM
+   checks the payload before it ever looks at the token. */
+const fakeToken = `smoke-fake-token-${RUN}`;
+const tokenSaved = await api('/api/auth/fcm-token', { method: 'PUT', token: helperB, body: { token: fakeToken } });
+ok('a helper device can register for push', tokenSaved.success === true, JSON.stringify(tokenSaved.error));
+
 const inst = await api('/api/customer/tasks', {
   method: 'POST', token: customerToken,
   body: {
@@ -283,6 +290,15 @@ ok('the helper sees it as instant',
 await api(`/api/customer/tasks/${inst.task.id}/cancel`, {
   method: 'POST', token: customerToken, body: { reason: 'Smoke test cleanup' },
 });
+
+// A cancelled search stops counting as a live offer on anyone's phone.
+const cancelledRecord = await api(`/api/admin/bookings/${inst.task.id}`, { token: adminToken });
+ok('cancelling withdraws every open job alert',
+  (cancelledRecord.requests ?? []).length > 0 &&
+  !(cancelledRecord.requests ?? []).some((r) => r.status === 'SENT'),
+  JSON.stringify((cancelledRecord.requests ?? []).map((r) => r.status)));
+
+await api('/api/auth/fcm-token', { method: 'PUT', token: helperB, body: { token: `retired-${RUN}` } });
 await api('/api/helper/online', { method: 'POST', token: helperB, body: { isOnline: false } });
 
 // -------------------------------------------------- cancellation (UC-C22)

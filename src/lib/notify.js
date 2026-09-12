@@ -1,4 +1,4 @@
-import { Notification, User } from '../models/index.js';
+import { JobRequest, Notification, User } from '../models/index.js';
 import { sendDataPush } from './fcm.js';
 
 /**
@@ -49,5 +49,30 @@ export async function notifyMany(userIds, type, title, body = '', data = {}) {
   } catch (err) {
     console.error('[notify] bulk failed', type, err.message);
     return [];
+  }
+}
+
+/**
+ * Stop a job ringing on every phone it was sent to.
+ *
+ * The alert loops until answered, so "the job is gone" has to reach the phone
+ * as well as the database — otherwise a helper's phone keeps ringing for a job
+ * someone else has already taken, and Accept only tells them so after the fact.
+ * It is a silent data push: the app cancels the notification and shows nothing.
+ *
+ * @param taskId the job
+ * @param except a helper whose phone should be left alone (the one who won it)
+ */
+export async function closeJobAlerts(taskId, { except } = {}) {
+  try {
+    const alerted = await JobRequest.find({ taskId }).distinct('helperId');
+    const ids = alerted.filter((id) => !except || String(id) !== String(except));
+    if (!ids.length) return 0;
+
+    const users = await User.find({ _id: { $in: ids }, fcmToken: { $ne: null } }).select('fcmToken').lean();
+    return await sendDataPush(users.map((u) => u.fcmToken), { type: 'JOB_CLOSED', taskId: String(taskId) });
+  } catch (err) {
+    console.error('[notify] closing job alerts failed', err.message);
+    return 0;
   }
 }

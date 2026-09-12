@@ -3,7 +3,7 @@ import { HelperProfile, JobRequest, Task, User } from './models/index.js';
 import { TASK_STATUS, HELPER_APPROVAL, ROLES } from './config.js';
 import { getSettings } from './lib/settings.js';
 import { distanceKm, boundingBox } from './lib/geo.js';
-import { notify, notifyMany } from './lib/notify.js';
+import { closeJobAlerts, notify, notifyMany } from './lib/notify.js';
 import { transition } from './lib/taskflow.js';
 import { conflict } from './lib/http.js';
 
@@ -294,6 +294,8 @@ export async function acceptJob(taskId, helperId) {
       taskId: String(taskId),
     });
   }
+  // Every other phone this job is ringing on stops now, not when its timer runs out.
+  await closeJobAlerts(taskId, { except: helperId });
 
   const helper = await User.findById(helperId).select('name phone photoUrl').lean();
   await notify(

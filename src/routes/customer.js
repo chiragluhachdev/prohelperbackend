@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { Address, HelperProfile, Rating, Service, Task, TaskEvent } from '../models/index.js';
+import { Address, HelperProfile, JobRequest, Rating, Service, Task, TaskEvent } from '../models/index.js';
 import { ROLES, TASK_STATUS } from '../config.js';
 import { authenticate, requireRole } from '../lib/auth.js';
 import { wrap, badRequest, notFound, conflict } from '../lib/http.js';
@@ -7,7 +7,7 @@ import { quote } from '../lib/pricing.js';
 import { serializeTask, TASK_TABS } from '../lib/views.js';
 import { newTaskCode, mustTransition, transition } from '../lib/taskflow.js';
 import { startSearch } from '../matching.js';
-import { notify } from '../lib/notify.js';
+import { closeJobAlerts, notify } from '../lib/notify.js';
 import { upload, uploadBuffer } from '../lib/cloudinary.js';
 import { publicUser } from './auth.js';
 import { SOCIETIES, societyByCode } from '../constants/societies.js';
@@ -353,6 +353,11 @@ router.post(
       },
       actorType: 'customer', actorId: req.user._id, reason,
     });
+
+    /* A cancelled search must stop ringing on every helper it reached, and
+       its open alerts must stop counting as live offers. */
+    await JobRequest.updateMany({ taskId: task._id, status: 'SENT' }, { $set: { status: 'CANCELLED' } });
+    await closeJobAlerts(task._id);
 
     if (updated.helperId) {
       await notify(

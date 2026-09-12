@@ -8,7 +8,7 @@ import { authenticate, requireAdmin } from '../lib/auth.js';
 import { wrap, badRequest, notFound, conflict } from '../lib/http.js';
 import { serializeTask, STATUS_LABELS } from '../lib/views.js';
 import { getSettings, updateSettings } from '../lib/settings.js';
-import { notify } from '../lib/notify.js';
+import { closeJobAlerts, notify } from '../lib/notify.js';
 import { audit } from '../lib/audit.js';
 import { mustTransition } from '../lib/taskflow.js';
 
@@ -511,6 +511,7 @@ router.post(
     });
 
     await JobRequest.updateMany({ taskId: task._id, status: 'SENT' }, { $set: { status: 'CANCELLED' } });
+    await closeJobAlerts(task._id);
     await notify(updated.customerId, 'BOOKING_CANCELLED', 'Booking cancelled', reason, { taskId: String(updated._id) });
     if (updated.helperId) await notify(updated.helperId, 'BOOKING_CANCELLED', 'Booking cancelled', reason, { taskId: String(updated._id) });
     await audit(req, { action: 'BOOKING_CANCELLED', entity: 'Task', entityId: task._id, before: { status: task.status }, after: { status: 'CANCELLED' }, reason });
