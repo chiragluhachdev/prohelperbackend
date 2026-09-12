@@ -10,16 +10,13 @@ export async function notify(userId, type, title, body = '', data = {}) {
   try {
     const doc = await Notification.create({ userId, type, title, body, data });
     
-    // Only dispatch data push for urgent job requests
+    // Only job requests ring the phone.
     if (type === 'JOB_REQUEST') {
       const user = await User.findById(userId).select('fcmToken').lean();
       if (user?.fcmToken) {
-        await sendDataPush(user.fcmToken, {
-          type,
-          title,
-          body,
-          ...data,
-        });
+        await sendDataPush(user.fcmToken, { type, title, body, ...data }).catch((err) =>
+          console.error('[notify] push failed', err.message),
+        );
       }
     }
     
@@ -40,15 +37,12 @@ export async function notifyMany(userIds, type, title, body = '', data = {}) {
       const users = await User.find({ _id: { $in: userIds }, fcmToken: { $ne: null } })
         .select('fcmToken')
         .lean();
-        
-      for (const user of users) {
-        await sendDataPush(user.fcmToken, {
-          type,
-          title,
-          body,
-          ...data,
-        });
-      }
+      /* One batched call for the whole wave. Awaiting each helper in turn
+         delayed the last helper's alert by every send before it — eating into
+         their 60-second window before their phone had even rung. */
+      await sendDataPush(users.map((u) => u.fcmToken), { type, title, body, ...data }).catch((err) =>
+        console.error('[notify] push failed', err.message),
+      );
     }
     
     return result;

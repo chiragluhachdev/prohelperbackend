@@ -104,3 +104,18 @@ export const DEFAULT_SETTINGS = {
   // --- overdue monitoring (UC-C18) ---
   overdue_reminder_minutes: 90,
 };
+
+/**
+ * The day boundaries charts are drawn on. Mongo buckets dates in UTC unless
+ * told otherwise, while the zero-fill used the server's local calendar — so
+ * between midnight and 05:30 IST today's bookings landed on yesterday's bar.
+ * Railway runs in UTC and a laptop in IST; naming the zone makes them agree.
+ */
+export const BUSINESS_TZ = process.env.BUSINESS_TZ || 'Asia/Kolkata';
+
+/** 'YYYY-MM-DD' for a moment, as a calendar day in BUSINESS_TZ. */
+export function dayKey(date) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: BUSINESS_TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(date);
+}

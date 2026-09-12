@@ -87,6 +87,7 @@ const a = await makeApprovedHelper(PHONE.helperA, 'Helper A', adminToken);
 const b = await makeApprovedHelper(PHONE.helperB, 'Helper B', adminToken);
 const helperA = a.token;
 const helperAId = a.id;
+const helperBId = b.id;
 const helperB = b.token;
 ok('both helpers sign in', Boolean(helperA && helperB));
 
@@ -175,6 +176,9 @@ ok('exactly ONE helper wins', winners.length === 1, `winners=${winners.length}`)
 ok('the loser is told the job is gone', losers.length === 1 && losers[0].status === 409, JSON.stringify(losers[0]?.error));
 
 const winnerToken = accA.status === 200 ? helperA : helperB;
+// Which helper wins the race is random, so everything downstream that is
+// about *the* helper who did the job has to follow the winner, not assume A.
+const winnerId = accA.status === 200 ? helperAId : helperBId;
 const loserToken = accA.status === 200 ? helperB : helperA;
 
 const loserJobs = await api('/api/helper/jobs?tab=upcoming', { token: loserToken });
@@ -575,23 +579,23 @@ ok('and the app stops being sent them',
 console.log('\n12. Payout details and finance');
 
 const badUpi = await api('/api/helper/profile', {
-  method: 'PATCH', token: helperA, body: { paymentDetails: { method: 'UPI', upiId: 'not-a-upi' } },
+  method: 'PATCH', token: winnerToken, body: { paymentDetails: { method: 'UPI', upiId: 'not-a-upi' } },
 });
 ok('a malformed UPI ID is refused', badUpi.status === 400, JSON.stringify(badUpi.error));
 
 const badIfsc = await api('/api/helper/profile', {
-  method: 'PATCH', token: helperA,
+  method: 'PATCH', token: winnerToken,
   body: { paymentDetails: { method: 'BANK', accountNo: '123456789012', ifsc: 'NOPE1' } },
 });
 ok('a malformed IFSC is refused', badIfsc.status === 400, JSON.stringify(badIfsc.error));
 
 const halfBank = await api('/api/helper/profile', {
-  method: 'PATCH', token: helperA, body: { paymentDetails: { method: 'BANK', accountNo: '123456789012' } },
+  method: 'PATCH', token: winnerToken, body: { paymentDetails: { method: 'BANK', accountNo: '123456789012' } },
 });
 ok('half a bank account is refused', halfBank.status === 400, JSON.stringify(halfBank.error));
 
 const goodUpi = await api('/api/helper/profile', {
-  method: 'PATCH', token: helperA, body: { paymentDetails: { method: 'UPI', upiId: 'sunita.devi@okaxis' } },
+  method: 'PATCH', token: winnerToken, body: { paymentDetails: { method: 'UPI', upiId: 'sunita.devi@okaxis' } },
 });
 ok('a valid UPI ID is stored',
   goodUpi.profile?.paymentDetails?.upiId === 'sunita.devi@okaxis' &&
@@ -599,14 +603,14 @@ ok('a valid UPI ID is stored',
   JSON.stringify(goodUpi.profile?.paymentDetails ?? goodUpi.error));
 
 const goodBank = await api('/api/helper/profile', {
-  method: 'PATCH', token: helperA,
+  method: 'PATCH', token: winnerToken,
   body: { paymentDetails: { method: 'BANK', accountNo: '123456789012', ifsc: 'hdfc0001234' } },
 });
 ok('an IFSC is stored upper-case', goodBank.profile?.paymentDetails?.ifsc === 'HDFC0001234',
   JSON.stringify(goodBank.profile?.paymentDetails));
 
 // Payout details are optional: nothing above should have blocked anything.
-const stillFine = await api('/api/helper/home', { token: helperA });
+const stillFine = await api('/api/helper/home', { token: winnerToken });
 ok('payout details stay optional', stillFine.approvalStatus === 'APPROVED', JSON.stringify(stillFine.error));
 
 const finance = await api('/api/admin/finance', { token: adminToken });
@@ -619,28 +623,28 @@ ok('the per-booking bill is listed',
   JSON.stringify(finance.bookings?.[0]?.code));
 ok('the daily series is there', Array.isArray(finance.byDay));
 
-const owed = finance.commissionOwed?.find((h) => h.helperId === helperAId);
+const owed = finance.commissionOwed?.find((h) => h.helperId === winnerId);
 ok('commission owed is attributed to the helper who owes it',
   Boolean(owed) && owed.amount > 0, JSON.stringify(finance.commissionOwed));
 ok('with the payout details the admin would pay it to',
   owed?.paymentDetails?.ifsc === 'HDFC0001234', JSON.stringify(owed?.paymentDetails));
 
-const settled = await api(`/api/admin/finance/settle/${helperAId}`, {
+const settled = await api(`/api/admin/finance/settle/${winnerId}`, {
   method: 'POST', token: adminToken, body: { reason: 'Collected in cash' },
 });
 ok('settling clears what is owed', settled.settled >= 1 && settled.amount > 0, JSON.stringify(settled.error));
 
-const twice = await api(`/api/admin/finance/settle/${helperAId}`, {
+const twice = await api(`/api/admin/finance/settle/${winnerId}`, {
   method: 'POST', token: adminToken, body: { reason: 'Again' },
 });
 ok('and cannot be done twice', twice.status === 409, JSON.stringify(twice.error));
 
 const after = await api('/api/admin/finance', { token: adminToken });
 ok('the outstanding list drops them',
-  !after.commissionOwed?.some((h) => h.helperId === helperAId),
+  !after.commissionOwed?.some((h) => h.helperId === winnerId),
   JSON.stringify(after.commissionOwed?.map((h) => h.name)));
 
-const helperView = await api(`/api/admin/helpers/${helperAId}`, { token: adminToken });
+const helperView = await api(`/api/admin/helpers/${winnerId}`, { token: adminToken });
 ok('and the admin sees the payout details on the helper',
   helperView.profile?.paymentDetails?.accountNo === '123456789012',
   JSON.stringify(helperView.profile?.paymentDetails));

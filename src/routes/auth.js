@@ -146,13 +146,16 @@ router.put(
   '/fcm-token',
   authenticate,
   wrap(async (req, res) => {
-    const { token } = req.body;
+    const token = String(req.body.token || '').trim();
     if (!token) throw badRequest('Token is required.', 'MISSING_TOKEN');
 
-    const user = req.user;
-    user.fcmToken = token;
-    await user.save();
-    
+    /* A token identifies a device, not a person. If this phone was signed in
+       as another helper before, that account must stop receiving its alerts —
+       otherwise one phone rings for two people's jobs. */
+    await User.updateMany({ fcmToken: token, _id: { $ne: req.user._id } }, { $set: { fcmToken: null } });
+
+    req.user.fcmToken = token;
+    await req.user.save();
     res.json({ success: true });
   }),
 );

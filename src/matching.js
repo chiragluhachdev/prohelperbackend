@@ -192,7 +192,19 @@ export async function dispatchTask(taskId) {
     'JOB_REQUEST',
     'New job request',
     `${serviceNames} · ${task.address?.label || task.address?.city || 'Nearby'}`,
-    { taskId: String(task._id), code: task.code, expiresAt },
+    {
+      taskId: String(task._id),
+      code: task.code,
+      expiresAt,
+      // What the ringing notification draws. The helper sees their payout,
+      // never the customer's bill — the same rule as every helper screen.
+      serviceName: serviceNames,
+      location: task.address?.society
+        ? `${task.address.label || 'Home'} · ${task.address.line2 || ''}`.trim()
+        : task.address?.label || task.address?.city || 'Nearby',
+      price: task.pricing?.helperPayout ?? '',
+      bookingType: task.bookingType || 'scheduled',
+    },
   );
 
   // Wake up just after this wave lapses to run the next one.

@@ -3,7 +3,7 @@ import {
   Address, AuditLog, HelperDocument, HelperProfile, JobRequest,
   LedgerEntry, Rating, Service, Task, TaskEvent, User,
 } from '../models/index.js';
-import { ROLES, TASK_STATUS, HELPER_APPROVAL } from '../config.js';
+import { ROLES, TASK_STATUS, HELPER_APPROVAL, BUSINESS_TZ, dayKey } from '../config.js';
 import { authenticate, requireAdmin } from '../lib/auth.js';
 import { wrap, badRequest, notFound, conflict } from '../lib/http.js';
 import { serializeTask, STATUS_LABELS } from '../lib/views.js';
@@ -29,8 +29,7 @@ router.get(
     const endOfDay = new Date(startOfDay); endOfDay.setDate(endOfDay.getDate() + 1);
 
     // Midnight seven days ago, so "the last 7 days" means seven whole days.
-    const weekStart = new Date(startOfDay);
-    weekStart.setDate(weekStart.getDate() - 6);
+    const weekStart = new Date(Date.now() - 8 * 86_400_000);
 
     const [
       customers, helpers, pendingApprovals, activeHelpers, onlineHelpers,
@@ -74,7 +73,7 @@ router.get(
         { $match: { createdAt: { $gte: weekStart } } },
         {
           $group: {
-            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: BUSINESS_TZ } },
             bookings: { $sum: 1 },
             completed: {
               $sum: { $cond: [{ $in: ['$status', [TASK_STATUS.COMPLETED, TASK_STATUS.SETTLED]] }, 1, 0] },
@@ -94,12 +93,11 @@ router.get(
     ]);
 
     // Days with no bookings still need a bar, or the chart lies about the shape.
+    // Keys walk back from now in the same zone the database grouped in.
     const byDay = new Map(trendAgg.map((d) => [d._id, d]));
     const trend = [];
-    for (let i = 0; i < 7; i += 1) {
-      const day = new Date(weekStart);
-      day.setDate(weekStart.getDate() + i);
-      const key = `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
+    for (let i = 6; i >= 0; i -= 1) {
+      const key = dayKey(new Date(Date.now() - i * 86_400_000));
       const row = byDay.get(key);
       trend.push({
         date: key,
@@ -741,7 +739,7 @@ router.get(
         { $match: { status: earned, completedAt: { $gte: since } } },
         {
           $group: {
-            _id: { $dateToString: { format: '%Y-%m-%d', date: '$completedAt' } },
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$completedAt', timezone: BUSINESS_TZ } },
             bookings: { $sum: 1 },
             gross: { $sum: '$pricing.total' },
             platformEarned: { $sum: { $add: ['$pricing.platformFee', '$pricing.helperCommission'] } },
