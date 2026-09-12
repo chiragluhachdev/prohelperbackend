@@ -71,6 +71,13 @@ const taskSchema = new mongoose.Schema(
     services: { type: [taskServiceSchema], required: true },
     address: { type: addressSnapshotSchema, required: true },
 
+    /**
+     * 'instant' means "as soon as a helper accepts" — scheduledAt is stamped
+     * with the moment the request was made, not a slot the customer chose, so
+     * every screen can say "now" instead of showing a time that reads like an
+     * appointment.
+     */
+    bookingType: { type: String, enum: ['instant', 'scheduled'], default: 'scheduled', index: true },
     scheduledAt: { type: Date, required: true, index: true },
     scheduledDate: String, // 'YYYY-MM-DD', as the customer picked it
     scheduledTime: String, // 'HH:mm'

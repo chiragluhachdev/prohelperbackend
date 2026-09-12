@@ -7,33 +7,25 @@ import { notify, notifyMany } from './lib/notify.js';
 import { transition } from './lib/taskflow.js';
 import { conflict } from './lib/http.js';
 
-const toMinutes = (hhmm) => {
-  const [h, m] = String(hhmm || '00:00').split(':').map(Number);
-  return h * 60 + (m || 0);
-};
-
 /**
  * UC-C08 — who is allowed to be alerted for this task.
  *
  * Every one of these is a hard gate: approved, not blocked, online, not on DND,
- * working that day and hour, covers the address, and offers at least one of the
- * requested services. Helpers already alerted for this task are skipped so a
- * later round never spams the same person twice.
+ * covers the address, and offers at least one of the requested services.
+ * Availability is the online switch alone — there are no working days or
+ * hours. Helpers already alerted for this task are skipped so a later round
+ * never spams the same person twice.
  */
 export async function findEligibleHelpers(task, { radiusKm, excludeHelperIds = [], ignoreLocation = false }) {
   const point = { lat: task.address.lat, lng: task.address.lng };
   const box = boundingBox(point, radiusKm);
   const requestedCodes = task.services.map((s) => s.code);
 
-  const weekday = new Date(task.scheduledAt).getDay();
-  const scheduledMinutes = toMinutes(task.scheduledTime);
-
   const query = {
     approvalStatus: HELPER_APPROVAL.APPROVED,
     isOnline: true,
     dnd: false,
     services: { $in: requestedCodes },
-    workDays: weekday,
     userId: { $nin: excludeHelperIds },
   };
   /*
@@ -64,11 +56,6 @@ export async function findEligibleHelpers(task, { radiusKm, excludeHelperIds = [
     const user = profile.userId;
     if (!user || user.status !== 'active') continue;
     if (busyIds.has(String(user._id))) continue;
-
-    // Working hours (UC-C14).
-    if (scheduledMinutes < toMinutes(profile.workStart) || scheduledMinutes > toMinutes(profile.workEnd)) {
-      continue;
-    }
 
     // Distance is still reported so the helper sees how far the job is; in
     // ignore-location mode it simply stops being a reason to exclude anyone.

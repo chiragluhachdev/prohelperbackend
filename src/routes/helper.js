@@ -18,6 +18,50 @@ import { issueOtp, verifyOtp } from '../lib/otp.js';
 import { publicUser } from './auth.js';
 import { SOCIETIES, societyByCode } from '../constants/societies.js';
 
+/**
+ * Payout details are optional — money changes hands directly today — but if a
+ * helper does give them they have to be usable, so they are validated on the
+ * way in rather than discovered to be wrong on payout day.
+ */
+function parsePaymentDetails(input, current = {}) {
+  const next = { ...(current.toObject?.() ?? current) };
+  const method = input.method === 'BANK' ? 'BANK' : input.method === 'UPI' ? 'UPI' : next.method || 'UPI';
+  next.method = method;
+
+  if (input.upiId !== undefined) {
+    const upi = String(input.upiId).trim();
+    // handle@bank — the only shape NPCI accepts.
+    if (upi && !/^[a-zA-Z0-9._-]{2,64}@[a-zA-Z][a-zA-Z0-9.-]{1,32}$/.test(upi)) {
+      throw badRequest('That does not look like a UPI ID. It should read like name@bank.', 'INVALID_UPI');
+    }
+    next.upiId = upi;
+  }
+
+  if (input.accountNo !== undefined) {
+    const acc = String(input.accountNo).replace(/\s/g, '');
+    if (acc && !/^\d{9,18}$/.test(acc)) {
+      throw badRequest('An account number is 9 to 18 digits.', 'INVALID_ACCOUNT');
+    }
+    next.accountNo = acc;
+  }
+
+  if (input.ifsc !== undefined) {
+    const ifsc = String(input.ifsc).trim().toUpperCase();
+    // Four letters, a zero, then six alphanumerics — the RBI format.
+    if (ifsc && !/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifsc)) {
+      throw badRequest('That IFSC code is not valid. It looks like HDFC0001234.', 'INVALID_IFSC');
+    }
+    next.ifsc = ifsc;
+  }
+
+  // Half a bank account is worse than none: it would fail silently at payout.
+  if (method === 'BANK' && (next.accountNo || next.ifsc) && !(next.accountNo && next.ifsc)) {
+    throw badRequest('A bank payout needs both the account number and the IFSC code.', 'INCOMPLETE_BANK');
+  }
+
+  return next;
+}
+
 const router = Router();
 router.use(authenticate, requireRole(ROLES.HELPER));
 
@@ -67,10 +111,7 @@ router.patch(
     if (experienceYears !== undefined) req.profile.experienceYears = Number(experienceYears) || 0;
     if (bio !== undefined) req.profile.bio = String(bio);
     if (req.body.paymentDetails !== undefined) {
-      req.profile.paymentDetails = {
-        ...req.profile.paymentDetails,
-        ...req.body.paymentDetails,
-      };
+      req.profile.paymentDetails = parsePaymentDetails(req.body.paymentDetails, req.profile.paymentDetails);
     }
     await req.profile.save();
     res.json({ user: publicUser(req.user), profile: req.profile.toObject() });
@@ -219,7 +260,7 @@ router.delete(
   }),
 );
 
-/* --------------------------------------------------- services / area / hours */
+/* --------------------------------------------------------- services / area */
 
 router.put(
   '/services',
@@ -271,23 +312,6 @@ router.put(
 
 /** The societies a helper can pick from. */
 router.get('/societies', wrap(async (_req, res) => res.json({ societies: SOCIETIES })));
-
-/** UC-C14 — outside these hours the matcher will not alert this helper. */
-router.put(
-  '/availability',
-  wrap(async (req, res) => {
-    const { workDays, workStart, workEnd } = req.body;
-    if (Array.isArray(workDays)) {
-      const days = workDays.map(Number).filter((d) => d >= 0 && d <= 6);
-      if (!days.length) throw badRequest('Choose at least one working day.', 'NO_WORK_DAYS');
-      req.profile.workDays = [...new Set(days)];
-    }
-    if (workStart) req.profile.workStart = workStart;
-    if (workEnd) req.profile.workEnd = workEnd;
-    await req.profile.save();
-    res.json({ profile: req.profile.toObject() });
-  }),
-);
 
 /** POST /api/helper/submit — hands the profile to the admin queue. */
 router.post(

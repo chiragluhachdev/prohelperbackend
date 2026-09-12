@@ -3,7 +3,7 @@ import { HELPER_APPROVAL } from '../config.js';
 
 /**
  * Everything the matcher needs to decide whether a helper may be alerted:
- * approval, block status, online/DND, working hours, services and service area.
+ * approval, block status, online/DND, services and service area.
  */
 const helperProfileSchema = new mongoose.Schema(
   {
@@ -53,10 +53,11 @@ const helperProfileSchema = new mongoose.Schema(
       radiusKm: { type: Number, default: 5 },
     },
 
-    // --- availability (UC-C14) ---
-    workDays: { type: [Number], default: [0, 1, 2, 3, 4, 5, 6] }, // 0=Sun
-    workStart: { type: String, default: '00:00' },
-    workEnd: { type: String, default: '23:59' },
+    /*
+     * Availability is the online switch and nothing else: a helper is
+     * reachable when isOnline is true and DND is off. There are deliberately
+     * no working days or hours — the toggle is the whole story.
+     */
     isOnline: { type: Boolean, default: false, index: true },
     dnd: { type: Boolean, default: false },
 

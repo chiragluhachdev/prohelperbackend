@@ -107,11 +107,25 @@ router.patch(
     const address = await Address.findOne({ _id: req.params.id, userId: req.user._id, active: true });
     if (!address) throw notFound('Address not found.');
 
-    for (const field of ['label', 'line1', 'line2', 'landmark', 'city', 'pincode']) {
+    for (const field of ['label', 'line1', 'line2', 'landmark']) {
       if (req.body[field] !== undefined) address[field] = req.body[field];
     }
-    if (req.body.lat != null) address.lat = Number(req.body.lat);
-    if (req.body.lng != null) address.lng = Number(req.body.lng);
+
+    /*
+     * Changing society has to carry its city, pincode and coordinates with it,
+     * exactly as creating one does — otherwise an edited address keeps the old
+     * estate's location and matching sends the helper to the wrong gate.
+     */
+    if (req.body.society !== undefined) {
+      const society = societyByCode(req.body.society);
+      if (!society) throw badRequest('Choose your society.', 'SOCIETY_REQUIRED');
+      address.society = society.code;
+      address.line2 = req.body.line2 || `${society.name}, ${society.area}`;
+      address.city = society.city;
+      address.pincode = society.pincode;
+      address.lat = society.lat;
+      address.lng = society.lng;
+    }
     if (req.body.isDefault) {
       await Address.updateMany({ userId: req.user._id }, { $set: { isDefault: false } });
       address.isDefault = true;
@@ -165,9 +179,10 @@ router.post(
   '/tasks',
   wrap(async (req, res) => {
     const {
-      services, addressId, date, time,
+      services, addressId, date, time, bookingType,
       durationMins, instructions = '', idempotencyKey,
     } = req.body;
+    const instant = bookingType === 'instant';
 
     if (!req.user.name) throw badRequest('Complete your profile before booking.', 'PROFILE_INCOMPLETE');
     if (!idempotencyKey) throw badRequest('Missing idempotency key.', 'IDEMPOTENCY_KEY_REQUIRED');
@@ -178,13 +193,31 @@ router.post(
     const address = await Address.findOne({ _id: addressId, userId: req.user._id, active: true }).lean();
     if (!address) throw badRequest('Choose a valid address.', 'ADDRESS_REQUIRED');
 
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date || ''))) throw badRequest('Choose a date.', 'DATE_REQUIRED');
-    if (!/^\d{2}:\d{2}$/.test(String(time || ''))) throw badRequest('Choose a time.', 'TIME_REQUIRED');
+    /*
+     * An instant booking is timed by the server, not the phone. Trusting a
+     * client clock here would put "now" a few minutes in the past on a device
+     * that is running slow, and the past-time guard below would reject it.
+     */
+    let scheduledAt;
+    let scheduledDate;
+    let scheduledTime;
 
-    const scheduledAt = new Date(`${date}T${time}:00`);
-    if (Number.isNaN(scheduledAt.getTime())) throw badRequest('That date and time is not valid.', 'INVALID_SCHEDULE');
-    if (scheduledAt.getTime() < Date.now() - 5 * 60_000) {
-      throw badRequest('Pick a time in the future.', 'SCHEDULE_IN_PAST');
+    if (instant) {
+      scheduledAt = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      scheduledDate = `${scheduledAt.getFullYear()}-${pad(scheduledAt.getMonth() + 1)}-${pad(scheduledAt.getDate())}`;
+      scheduledTime = `${pad(scheduledAt.getHours())}:${pad(scheduledAt.getMinutes())}`;
+    } else {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date || ''))) throw badRequest('Choose a date.', 'DATE_REQUIRED');
+      if (!/^\d{2}:\d{2}$/.test(String(time || ''))) throw badRequest('Choose a time.', 'TIME_REQUIRED');
+
+      scheduledAt = new Date(`${date}T${time}:00`);
+      if (Number.isNaN(scheduledAt.getTime())) throw badRequest('That date and time is not valid.', 'INVALID_SCHEDULE');
+      if (scheduledAt.getTime() < Date.now() - 5 * 60_000) {
+        throw badRequest('Pick a time in the future.', 'SCHEDULE_IN_PAST');
+      }
+      scheduledDate = date;
+      scheduledTime = time;
     }
 
     const { lines, pricing } = await quote(services, { durationMins });
@@ -205,9 +238,10 @@ router.post(
           landmark: address.landmark, city: address.city, pincode: address.pincode,
           lat: address.lat, lng: address.lng,
         },
+        bookingType: instant ? 'instant' : 'scheduled',
         scheduledAt,
-        scheduledDate: date,
-        scheduledTime: time,
+        scheduledDate,
+        scheduledTime,
         durationMins: Number(durationMins) || fallbackDuration,
         instructions,
         pricing,
@@ -229,7 +263,10 @@ router.post(
 
     const searching = await startSearch(task._id, req.user._id);
     await notify(req.user._id, 'BOOKING_CREATED', 'Request created',
-      `We are finding a helper for ${task.code}.`, { taskId: String(task._id), code: task.code });
+      instant
+        ? `We are finding a helper for ${task.code} right now.`
+        : `We are finding a helper for ${task.code}.`,
+      { taskId: String(task._id), code: task.code });
 
     res.status(201).json({ task: serializeTask(searching || task) });
   }),
@@ -272,33 +309,61 @@ router.get(
   }),
 );
 
-/** POST /api/customer/tasks/:id/cancel — UC-C22. */
+/**
+ * POST /api/customer/tasks/:id/cancel — UC-C22.
+ *
+ * A job already under way can still be called off: the customer is in the
+ * house and things change. Once the completion OTP has been issued the work is
+ * finished and only payment is left, so that is where the door closes.
+ *
+ * The reason is mandatory. It is the only record of why a helper lost a job,
+ * so the admin can tell an unlucky helper from a repeatedly cancelled one.
+ */
 router.post(
   '/tasks/:id/cancel',
   wrap(async (req, res) => {
     const task = await Task.findOne({ _id: req.params.id, customerId: req.user._id });
     if (!task) throw notFound('Booking not found.');
 
-    const cancellable = [TASK_STATUS.CREATED, TASK_STATUS.SEARCHING, TASK_STATUS.ACCEPTED];
+    const reason = String(req.body.reason || '').trim();
+    if (reason.length < 3) {
+      throw badRequest('Please tell us why you are cancelling.', 'REASON_REQUIRED');
+    }
+
+    const cancellable = [
+      TASK_STATUS.CREATED,
+      TASK_STATUS.SEARCHING,
+      TASK_STATUS.NO_HELPER_AVAILABLE,
+      TASK_STATUS.ACCEPTED,
+      TASK_STATUS.IN_PROGRESS,
+    ];
     if (!cancellable.includes(task.status)) {
       throw conflict('This booking can no longer be cancelled.', 'NOT_CANCELLABLE');
     }
+    const wasUnderWay = task.status === TASK_STATUS.IN_PROGRESS;
 
     const updated = await mustTransition(task._id, cancellable, TASK_STATUS.CANCELLED, {
       set: {
         nextDispatchAt: null,
         cancellation: {
           by: 'customer', byUserId: req.user._id,
-          reason: req.body.reason || 'Cancelled by customer',
+          reason,
           previousStatus: task.status, at: new Date(),
         },
       },
-      actorType: 'customer', actorId: req.user._id, reason: req.body.reason || '',
+      actorType: 'customer', actorId: req.user._id, reason,
     });
 
     if (updated.helperId) {
-      await notify(updated.helperId, 'BOOKING_CANCELLED', 'Booking cancelled',
-        `${updated.code} was cancelled by the customer.`, { taskId: String(updated._id) });
+      await notify(
+        updated.helperId,
+        'BOOKING_CANCELLED',
+        wasUnderWay ? 'Job stopped' : 'Booking cancelled',
+        wasUnderWay
+          ? `The customer has stopped ${updated.code}: ${reason}`
+          : `${updated.code} was cancelled by the customer. Reason: ${reason}`,
+        { taskId: String(updated._id) },
+      );
     }
     res.json({ task: serializeTask(updated) });
   }),

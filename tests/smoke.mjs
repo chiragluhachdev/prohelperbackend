@@ -86,6 +86,7 @@ ok('customer profile loads with an address', me.user?.role === 'customer' && me.
 const a = await makeApprovedHelper(PHONE.helperA, 'Helper A', adminToken);
 const b = await makeApprovedHelper(PHONE.helperB, 'Helper B', adminToken);
 const helperA = a.token;
+const helperAId = a.id;
 const helperB = b.token;
 ok('both helpers sign in', Boolean(helperA && helperB));
 
@@ -115,20 +116,19 @@ const addressId = me.addresses[0]._id;
 const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 
 /**
- * A random Mon-Sat slot inside both demo helpers' working hours (07:00-20:00).
- * Randomised so a re-run never lands on a slot a previous run already booked —
- * the matcher deliberately skips helpers who are busy at that hour.
+ * Deliberately the worst slot there is: 4am on the coming Sunday. Availability
+ * is the online switch and nothing else — there are no working days or hours —
+ * so this has to reach an online helper exactly like a Tuesday morning would.
+ * The minute is randomised so a re-run never lands on a slot a previous run
+ * already booked: the matcher still skips helpers who are busy at that hour.
  */
-function nextWorkingSlot() {
+function outOfHoursSlot() {
   const d = new Date();
-  d.setDate(d.getDate() + 1 + Math.floor(Math.random() * 5));
-  while (d.getDay() === 0) d.setDate(d.getDate() + 1);
-  const hour = 9 + Math.floor(Math.random() * 8);
-  const minute = Math.floor(Math.random() * 60);
-  return { date: ymd(d), time: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}` };
+  d.setDate(d.getDate() + ((7 - d.getDay()) % 7 || 7)); // the next Sunday
+  return { date: ymd(d), time: `04:${String(Math.floor(Math.random() * 60)).padStart(2, '0')}` };
 }
 
-const { date, time } = nextWorkingSlot();
+const { date, time } = outOfHoursSlot();
 const idem = `smoke-${Date.now()}`;
 
 const bookingBody = {
@@ -155,7 +155,7 @@ for (let i = 0; i < 12 && !reqA.requests.length; i += 1) {
   reqA = await api('/api/helper/requests', { token: helperA });
   reqB = await api('/api/helper/requests', { token: helperB });
 }
-ok('helper A was alerted', reqA.requests?.length > 0);
+ok('helper A was alerted (4am Sunday — hours no longer gate)', reqA.requests?.length > 0);
 ok('helper B was alerted', reqB.requests?.length > 0);
 const alert = reqA.requests[0];
 ok('alert carries distance and a live countdown',
@@ -225,7 +225,7 @@ console.log('\n9. Nobody available');
 await api('/api/helper/online', { method: 'POST', token: helperA, body: { isOnline: false } });
 await api('/api/helper/online', { method: 'POST', token: helperB, body: { isOnline: false } });
 
-const quietSlot = nextWorkingSlot();
+const quietSlot = outOfHoursSlot();
 const quiet = await api('/api/customer/tasks', {
   method: 'POST', token: customerToken,
   body: {
@@ -244,14 +244,106 @@ ok('with nobody online the search ends as NO_HELPER_AVAILABLE',
 
 const retried = await api(`/api/customer/tasks/${quiet.task.id}/retry`, { method: 'POST', token: customerToken });
 ok('customer can retry the search', retried.task?.status === 'SEARCHING', JSON.stringify(retried.error));
-await api(`/api/customer/tasks/${quiet.task.id}/cancel`, { method: 'POST', token: customerToken, body: { reason: 'Smoke test cleanup' } });
+// ------------------------------------------------- instant booking (now)
+console.log('\n9b. Instant booking');
+await api('/api/helper/online', { method: 'POST', token: helperB, body: { isOnline: true } });
+
+const inst = await api('/api/customer/tasks', {
+  method: 'POST', token: customerToken,
+  body: {
+    services: [{ code: 'kitchen', options: {} }],
+    addressId,
+    bookingType: 'instant',
+    // Deliberately wrong, and deliberately in the past: the server must time
+    // an instant booking off its own clock, not the phone's.
+    date: '2020-01-01', time: '00:00',
+    idempotencyKey: `smoke-instant-${Date.now()}`,
+  },
+});
+ok('an instant booking is accepted without a slot', inst.task?.id !== undefined, JSON.stringify(inst.error));
+ok('it is marked instant', inst.task?.bookingType === 'instant', String(inst.task?.bookingType));
+ok('the server times it, not the client',
+  Math.abs(new Date(inst.task?.scheduledAt).getTime() - Date.now()) < 60_000,
+  String(inst.task?.scheduledAt));
+
+let instAlert = { requests: [] };
+for (let i = 0; i < 12 && !instAlert.requests.length; i += 1) {
+  await sleep(400);
+  instAlert = await api('/api/helper/requests', { token: helperB });
+}
+ok('an instant booking reaches an online helper',
+  instAlert.requests?.some((r) => r.task?.id === inst.task?.id), String(instAlert.requests?.length));
+ok('the helper sees it as instant',
+  instAlert.requests?.find((r) => r.task?.id === inst.task?.id)?.task?.bookingType === 'instant');
+
+await api(`/api/customer/tasks/${inst.task.id}/cancel`, {
+  method: 'POST', token: customerToken, body: { reason: 'Smoke test cleanup' },
+});
+await api('/api/helper/online', { method: 'POST', token: helperB, body: { isOnline: false } });
+
+// -------------------------------------------------- cancellation (UC-C22)
+console.log('\n10. Cancelling, including mid-job');
+
+const reasonless = await api(`/api/customer/tasks/${quiet.task.id}/cancel`, {
+  method: 'POST', token: customerToken, body: {},
+});
+ok('a cancellation without a reason is refused', reasonless.status === 400, JSON.stringify(reasonless.error));
+
+const quietCancel = await api(`/api/customer/tasks/${quiet.task.id}/cancel`, {
+  method: 'POST', token: customerToken, body: { reason: 'Nobody was available' },
+});
+ok('a search with no helper can be cancelled', quietCancel.task?.status === 'CANCELLED', JSON.stringify(quietCancel.error));
+
+const lateCancel = await api(`/api/customer/tasks/${taskId}/cancel`, {
+  method: 'POST', token: customerToken, body: { reason: 'Changed my mind' },
+});
+ok('a finished job can no longer be cancelled', lateCancel.status === 409, JSON.stringify(lateCancel.error));
+
+// Now the real case: work under way, customer calls it off.
+await api('/api/helper/online', { method: 'POST', token: helperA, body: { isOnline: true } });
+const liveSlot = outOfHoursSlot();
+const live = await api('/api/customer/tasks', {
+  method: 'POST', token: customerToken,
+  body: {
+    services: [{ code: 'sofa', options: {} }],
+    addressId, date: liveSlot.date, time: liveSlot.time,
+    idempotencyKey: `smoke-live-${Date.now()}`,
+  },
+});
+const liveId = live.task?.id;
+
+let liveAlert = { requests: [] };
+for (let i = 0; i < 12 && !liveAlert.requests.length; i += 1) {
+  await sleep(400);
+  liveAlert = await api('/api/helper/requests', { token: helperA });
+}
+await api(`/api/helper/requests/${liveId}/accept`, { method: 'POST', token: helperA });
+const underWay = await api(`/api/helper/jobs/${liveId}/start`, { method: 'POST', token: helperA });
+ok('the job is under way', underWay.task?.status === 'IN_PROGRESS', JSON.stringify(underWay.error));
+
+const midCancel = await api(`/api/customer/tasks/${liveId}/cancel`, {
+  method: 'POST', token: customerToken, body: { reason: 'Had to leave the house' },
+});
+ok('a job in progress can be cancelled with a reason',
+  midCancel.task?.status === 'CANCELLED', JSON.stringify(midCancel.error));
+
+const cancelled = await api(`/api/customer/tasks/${liveId}`, { token: customerToken });
+ok('the cancellation records who, why and from what state',
+  cancelled.task?.cancellation?.by === 'customer' &&
+  cancelled.task?.cancellation?.reason === 'Had to leave the house' &&
+  cancelled.task?.cancellation?.previousStatus === 'IN_PROGRESS',
+  JSON.stringify(cancelled.task?.cancellation));
+
+const helperNotes = await api('/api/notifications', { token: helperA });
+ok('the helper is told to stop, with the reason',
+  helperNotes.notifications?.some((n) => n.type === 'BOOKING_CANCELLED' && n.body?.includes('Had to leave the house')),
+  JSON.stringify(helperNotes.notifications?.[0]));
+
+await api('/api/helper/online', { method: 'POST', token: helperA, body: { isOnline: false } });
 
 // ---------------------------------------------------------------- admin
-console.log('\n10. Admin dashboard');
+console.log('\n11. Admin dashboard');
 ok('admin signs in with email + password', Boolean(adminToken));
-
-const dash = await api('/api/admin/dashboard', { token: adminToken });
-ok('dashboard reports counts', dash.stats?.customers >= 1 && dash.stats?.helpers >= 3, JSON.stringify(dash.stats));
 
 // Reject then approve the same helper, so the test is the same on every run.
 const pendingToken = await login(PHONE.helperC, 'helper');
@@ -261,6 +353,22 @@ await api('/api/helper/kyc/aadhaar/verify', { method: 'POST', token: pendingToke
 await api('/api/helper/services', { method: 'PUT', token: pendingToken, body: { codes: ['kitchen'] } });
 await api('/api/helper/service-area', { method: 'PUT', token: pendingToken, body: { societies: ['rps_auria'] } });
 await api('/api/helper/submit', { method: 'POST', token: pendingToken });
+
+// Counted after the third helper submits, so the pending queue has something
+// in it — the dashboard is only interesting when it has to reflect a change.
+const dash = await api('/api/admin/dashboard', { token: adminToken });
+ok(
+  'the dashboard carries a 7-day trend',
+  Array.isArray(dash.trend) && dash.trend.length === 7 &&
+  dash.trend.every((d) => typeof d.bookings === 'number' && typeof d.revenue === 'number') &&
+  dash.trend[6].bookings >= 1,
+  JSON.stringify(dash.trend),
+);
+ok(
+  'dashboard reports counts',
+  dash.stats?.customers >= 1 && dash.stats?.helpers >= 3 && dash.stats?.pendingApprovals >= 1,
+  JSON.stringify(dash.stats),
+);
 
 const found = await api(`/api/admin/helpers?q=${PHONE.helperC}`, { token: adminToken });
 const sunita = found.helpers?.[0];
@@ -283,6 +391,23 @@ ok('an unapproved helper cannot go online', offlineAttempt.status === 403, JSON.
 
 const resubmit = await api('/api/helper/submit', { method: 'POST', token: sunitaToken });
 ok('helper re-submits for verification', resubmit.profile?.approvalStatus === 'PENDING_VERIFICATION', JSON.stringify(resubmit.error));
+
+/*
+ * Submitting now drops the helper straight into their dashboard rather than a
+ * waiting-room screen, so everything that screen loads has to work while they
+ * are still PENDING_VERIFICATION — only taking work stays closed.
+ */
+const [pendHome, pendJobs, pendEarn] = await Promise.all([
+  api('/api/helper/home', { token: sunitaToken }),
+  api('/api/helper/jobs', { token: sunitaToken }),
+  api('/api/helper/earnings', { token: sunitaToken }),
+]);
+ok(
+  'a pending helper can still open their dashboard',
+  pendHome.approvalStatus === 'PENDING_VERIFICATION' && Array.isArray(pendJobs.tasks) && Boolean(pendEarn.summary),
+  JSON.stringify({ home: pendHome.error, jobs: pendJobs.error, earnings: pendEarn.error }),
+);
+ok('a pending helper is shown as offline', pendHome.isOnline === false && pendHome.dnd === false);
 
 const dash2 = await api('/api/admin/dashboard', { token: adminToken });
 ok('the re-submission shows in the pending queue', dash2.stats?.pendingApprovals >= 1, String(dash2.stats?.pendingApprovals));
@@ -308,6 +433,218 @@ ok('admin can block an account', blocked.status === 'blocked');
 await api(`/api/admin/users/${sunita?.id}/unblock`, { method: 'POST', token: adminToken });
 
 const audit = await api('/api/admin/audit', { token: adminToken });
+/*
+ * Settings are typed. A boolean arriving from a form as the string "false"
+ * used to be stored as a string, and every `if (setting)` in the codebase
+ * would have read it as true — the location filter would have stayed off.
+ */
+const boolOff = await api('/api/admin/settings', {
+  method: 'PUT', token: adminToken, body: { match_ignore_location: 'false' },
+});
+ok('a boolean setting stays a boolean', boolOff.settings?.match_ignore_location === false,
+  JSON.stringify(boolOff.settings?.match_ignore_location));
+
+const numBad = await api('/api/admin/settings', {
+  method: 'PUT', token: adminToken, body: { accept_window_seconds: 'soon' },
+});
+ok('a number setting refuses nonsense', numBad.status === 400, JSON.stringify(numBad.error));
+
+await api('/api/admin/settings', { method: 'PUT', token: adminToken, body: { match_ignore_location: true } });
+const restored = await api('/api/admin/settings', { token: adminToken });
+ok('settings can be put back', restored.settings?.match_ignore_location === true);
+
+// Editing an address has to carry the new society's city and coordinates.
+const addr = me.addresses[0];
+const moved = await api(`/api/customer/addresses/${addr._id}`, {
+  method: 'PATCH', token: customerToken, body: { society: 'rps_palms', line1: 'A-1201' },
+});
+ok('an edited address moves society, city and coordinates',
+  moved.address?.society === 'rps_palms' && moved.address?.line1 === 'A-1201' &&
+  typeof moved.address?.lat === 'number' && String(moved.address?.line2 || '').includes('Palms'),
+  JSON.stringify(moved.address ?? moved.error));
+await api(`/api/customer/addresses/${addr._id}`, {
+  method: 'PATCH', token: customerToken, body: { society: addr.society, line1: addr.line1 },
+});
+
+/*
+ * The service copy a customer reads is the admin's, not the app's: change the
+ * checklist here and the catalog the phone fetches has to change with it.
+ */
+const editedService = await api('/api/admin/services/sofa', {
+  method: 'PATCH', token: adminToken,
+  body: { inclusions: ['Vacuum every cushion', '  ', 'Treat stains by hand'], basePrice: 219 },
+});
+ok('an admin can rewrite what a service includes',
+  editedService.service?.inclusions?.length === 2 &&
+  editedService.service.inclusions[0] === 'Vacuum every cushion',
+  JSON.stringify(editedService.service?.inclusions ?? editedService.error));
+
+const appCatalog = await api('/api/services', { token: customerToken });
+const sofa = appCatalog.services?.find((sv) => sv.code === 'sofa');
+ok('the customer app sees the edit immediately',
+  sofa?.inclusions?.length === 2 && sofa?.basePrice === 219,
+  JSON.stringify({ inclusions: sofa?.inclusions, price: sofa?.basePrice }));
+
+const editedQuote = await api('/api/customer/quote', {
+  method: 'POST', token: customerToken, body: { services: [{ code: 'sofa', options: {} }] },
+});
+ok('and the new price is what the bill uses',
+  editedQuote.pricing?.servicesAmount === 219, JSON.stringify(editedQuote.pricing));
+
+/*
+ * Per-service questions (UC-C05). They ship switched off: a question nobody
+ * has reviewed should not interrogate customers, and a priced one left on by
+ * accident would quietly change the bill.
+ */
+const freshCatalog = await api('/api/services', { token: customerToken });
+const bathroom = freshCatalog.services?.find((sv) => sv.code === 'bathroom');
+ok('questions are off until an admin turns them on',
+  bathroom?.optionsEnabled === false && (bathroom?.options ?? []).length === 0,
+  JSON.stringify({ on: bathroom?.optionsEnabled, count: bathroom?.options?.length }));
+
+const emptyOn = await api('/api/admin/services/bathroom', {
+  method: 'PATCH', token: adminToken, body: { optionsEnabled: true },
+});
+ok('they cannot be switched on with nothing to ask', emptyOn.status === 400, JSON.stringify(emptyOn.error));
+
+const badChoices = await api('/api/admin/services/bathroom', {
+  method: 'PATCH', token: adminToken,
+  body: { options: [{ key: 'size', label: 'Size', type: 'select', choices: ['Only one'] }] },
+});
+ok('a choice question needs real choices', badChoices.status === 400, JSON.stringify(badChoices.error));
+
+const dupes = await api('/api/admin/services/bathroom', {
+  method: 'PATCH', token: adminToken,
+  body: [
+    { key: 'extra', label: 'One', type: 'number' },
+    { key: 'extra', label: 'Two', type: 'number' },
+  ].reduce((acc, o, idx) => ({ options: [...(acc.options || []), o] }), {}),
+});
+ok('two questions cannot share a key', dupes.status === 400, JSON.stringify(dupes.error));
+
+const configured = await api('/api/admin/services/bathroom', {
+  method: 'PATCH', token: adminToken,
+  body: {
+    optionsEnabled: true,
+    options: [
+      { key: 'Extra Bathrooms!', label: 'Extra bathrooms', type: 'number', unit: 'bathrooms', pricePerUnit: 80, defaultValue: 0 },
+      { key: 'deep', label: 'Deep scrub', type: 'boolean', pricePerUnit: 50, defaultValue: false },
+    ],
+  },
+});
+ok('an admin can define questions, keys slugified',
+  configured.service?.optionsEnabled === true &&
+  configured.service.options?.[0]?.key === 'extra_bathrooms' &&
+  configured.service.options[0].pricePerUnit === 80,
+  JSON.stringify(configured.service?.options ?? configured.error));
+
+const withOptions = await api('/api/services', { token: customerToken });
+const bath2 = withOptions.services?.find((sv) => sv.code === 'bathroom');
+ok('the app is now asked to show them',
+  bath2?.optionsEnabled === true && bath2?.options?.length === 2,
+  JSON.stringify(bath2?.options?.length));
+
+const plain = await api('/api/customer/quote', {
+  method: 'POST', token: customerToken, body: { services: [{ code: 'bathroom', options: {} }] },
+});
+ok('the defaults add nothing', plain.pricing?.servicesAmount === 149, JSON.stringify(plain.pricing));
+
+const answered = await api('/api/customer/quote', {
+  method: 'POST', token: customerToken,
+  body: { services: [{ code: 'bathroom', options: { extra_bathrooms: 2, deep: true } }] },
+});
+ok('answering a priced question changes the bill',
+  answered.pricing?.servicesAmount === 149 + 160 + 50, JSON.stringify(answered.pricing));
+
+// Switched off, the same answers must not be charged for.
+await api('/api/admin/services/bathroom', {
+  method: 'PATCH', token: adminToken, body: { optionsEnabled: false },
+});
+const ignored = await api('/api/customer/quote', {
+  method: 'POST', token: customerToken,
+  body: { services: [{ code: 'bathroom', options: { extra_bathrooms: 2, deep: true } }] },
+});
+ok('a disabled question is never charged for',
+  ignored.pricing?.servicesAmount === 149, JSON.stringify(ignored.pricing));
+
+const hidden = await api('/api/services', { token: customerToken });
+ok('and the app stops being sent them',
+  (hidden.services?.find((sv) => sv.code === 'bathroom')?.options ?? []).length === 0);
+
+/* ------------------------------------------------------------ money side */
+console.log('\n12. Payout details and finance');
+
+const badUpi = await api('/api/helper/profile', {
+  method: 'PATCH', token: helperA, body: { paymentDetails: { method: 'UPI', upiId: 'not-a-upi' } },
+});
+ok('a malformed UPI ID is refused', badUpi.status === 400, JSON.stringify(badUpi.error));
+
+const badIfsc = await api('/api/helper/profile', {
+  method: 'PATCH', token: helperA,
+  body: { paymentDetails: { method: 'BANK', accountNo: '123456789012', ifsc: 'NOPE1' } },
+});
+ok('a malformed IFSC is refused', badIfsc.status === 400, JSON.stringify(badIfsc.error));
+
+const halfBank = await api('/api/helper/profile', {
+  method: 'PATCH', token: helperA, body: { paymentDetails: { method: 'BANK', accountNo: '123456789012' } },
+});
+ok('half a bank account is refused', halfBank.status === 400, JSON.stringify(halfBank.error));
+
+const goodUpi = await api('/api/helper/profile', {
+  method: 'PATCH', token: helperA, body: { paymentDetails: { method: 'UPI', upiId: 'sunita.devi@okaxis' } },
+});
+ok('a valid UPI ID is stored',
+  goodUpi.profile?.paymentDetails?.upiId === 'sunita.devi@okaxis' &&
+  goodUpi.profile?.paymentDetails?.method === 'UPI',
+  JSON.stringify(goodUpi.profile?.paymentDetails ?? goodUpi.error));
+
+const goodBank = await api('/api/helper/profile', {
+  method: 'PATCH', token: helperA,
+  body: { paymentDetails: { method: 'BANK', accountNo: '123456789012', ifsc: 'hdfc0001234' } },
+});
+ok('an IFSC is stored upper-case', goodBank.profile?.paymentDetails?.ifsc === 'HDFC0001234',
+  JSON.stringify(goodBank.profile?.paymentDetails));
+
+// Payout details are optional: nothing above should have blocked anything.
+const stillFine = await api('/api/helper/home', { token: helperA });
+ok('payout details stay optional', stillFine.approvalStatus === 'APPROVED', JSON.stringify(stillFine.error));
+
+const finance = await api('/api/admin/finance', { token: adminToken });
+ok('finance totals come off completed bookings',
+  finance.totals?.bookings >= 1 && finance.totals.gross > 0 &&
+  finance.totals.platformEarned === Math.round((finance.totals.platformFee + finance.totals.commission) * 100) / 100,
+  JSON.stringify(finance.totals));
+ok('the per-booking bill is listed',
+  Array.isArray(finance.bookings) && finance.bookings[0]?.pricing?.total > 0,
+  JSON.stringify(finance.bookings?.[0]?.code));
+ok('the daily series is there', Array.isArray(finance.byDay));
+
+const owed = finance.commissionOwed?.find((h) => h.helperId === helperAId);
+ok('commission owed is attributed to the helper who owes it',
+  Boolean(owed) && owed.amount > 0, JSON.stringify(finance.commissionOwed));
+ok('with the payout details the admin would pay it to',
+  owed?.paymentDetails?.ifsc === 'HDFC0001234', JSON.stringify(owed?.paymentDetails));
+
+const settled = await api(`/api/admin/finance/settle/${helperAId}`, {
+  method: 'POST', token: adminToken, body: { reason: 'Collected in cash' },
+});
+ok('settling clears what is owed', settled.settled >= 1 && settled.amount > 0, JSON.stringify(settled.error));
+
+const twice = await api(`/api/admin/finance/settle/${helperAId}`, {
+  method: 'POST', token: adminToken, body: { reason: 'Again' },
+});
+ok('and cannot be done twice', twice.status === 409, JSON.stringify(twice.error));
+
+const after = await api('/api/admin/finance', { token: adminToken });
+ok('the outstanding list drops them',
+  !after.commissionOwed?.some((h) => h.helperId === helperAId),
+  JSON.stringify(after.commissionOwed?.map((h) => h.name)));
+
+const helperView = await api(`/api/admin/helpers/${helperAId}`, { token: adminToken });
+ok('and the admin sees the payout details on the helper',
+  helperView.profile?.paymentDetails?.accountNo === '123456789012',
+  JSON.stringify(helperView.profile?.paymentDetails));
+
 ok('admin actions are audited', audit.logs?.length >= 3, String(audit.logs?.length));
 
 // ---------------------------------------------------------------- teardown

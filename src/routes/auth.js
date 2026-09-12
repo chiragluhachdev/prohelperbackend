@@ -141,6 +141,22 @@ router.get(
   }),
 );
 
+/** PUT /api/auth/fcm-token — update the push token for the current device. */
+router.put(
+  '/fcm-token',
+  authenticate,
+  wrap(async (req, res) => {
+    const { token } = req.body;
+    if (!token) throw badRequest('Token is required.', 'MISSING_TOKEN');
+
+    const user = req.user;
+    user.fcmToken = token;
+    await user.save();
+    
+    res.json({ success: true });
+  }),
+);
+
 export function publicUser(user) {
   return {
     id: String(user._id),

@@ -26,6 +26,13 @@ const SERVICES = [
     code: 'full_home', name: 'Full Home Cleaning', category: 'Cleaning', icon: '🏠',
     description: 'Dusting, floors, bathrooms and kitchen — the whole house in one visit.',
     basePrice: 249, durationLabel: '2 - 4 hours', defaultDurationMins: 180, sortOrder: 1,
+    inclusions: [
+      'Dusting all rooms and surfaces',
+      'Sweeping and mopping all floors',
+      'Bathroom deep cleaning',
+      'Kitchen cleaning and organising',
+      'Trash removal and disposal',
+    ],
     /*
      * UC-C05 — the questions are data, not screens. Priced options default to
      * zero so the advertised "from ₹249" stays true until the customer adds
@@ -51,6 +58,13 @@ const SERVICES = [
     code: 'kitchen', name: 'Kitchen Cleaning', category: 'Cleaning', icon: '🍲',
     description: 'Slabs, stove, chimney, sink and cabinet fronts scrubbed down.',
     basePrice: 149, durationLabel: '1 - 2 hours', defaultDurationMins: 90, sortOrder: 2,
+    inclusions: [
+      'Cleaning kitchen slabs and countertops',
+      'Stove, hob and chimney cleaning',
+      'Sink cleaning and descaling',
+      'Outside cleaning of cabinets and drawers',
+      'Floor cleaning and trash removal',
+    ],
     options: [
       {
         key: 'load', label: 'How much is there?', type: 'select',
@@ -66,12 +80,26 @@ const SERVICES = [
     code: 'bathroom', name: 'Bathroom Cleaning', category: 'Cleaning', icon: '🚿',
     description: 'Commode, shower area, tiles, grout and fixtures disinfected.',
     basePrice: 149, durationLabel: '1 - 2 hours', defaultDurationMins: 90, sortOrder: 3,
+    inclusions: [
+      'Toilet and commode deep cleaning',
+      'Shower area and glass cleaning',
+      'Tile and grout scrubbing',
+      'Mirror and fixture polishing',
+      'Floor cleaning and disinfecting',
+    ],
     options: [],
   },
   {
     code: 'sofa', name: 'Sofa & Upholstery Cleaning', category: 'Cleaning', icon: '🛋️',
     description: 'Vacuum, shampoo and stain treatment for sofas and upholstery.',
     basePrice: 199, durationLabel: '1 - 2 hours', defaultDurationMins: 90, sortOrder: 4,
+    inclusions: [
+      'Vacuuming sofa and cushions',
+      'Stain removal treatment',
+      'Deep fabric cleaning',
+      'Deodorising and sanitising',
+      'Drying and fluffing cushions',
+    ],
     options: [],
   },
 ];

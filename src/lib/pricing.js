@@ -28,13 +28,19 @@ export async function quote(selections, ctx = {}) {
       throw badRequest(`"${selection.code}" is not available right now.`, 'SERVICE_UNAVAILABLE');
     }
 
-    // Base price plus whatever the configured per-unit options add.
+    /*
+     * Base price plus whatever the configured per-unit options add — but only
+     * while the service's options are switched on. A disabled question is not
+     * asked, so it must not be charged for either, whatever default it carries.
+     */
     let amount = service.basePrice;
-    const answers = selection.options || {};
-    for (const option of service.options || []) {
-      if (!option.pricePerUnit) continue;
-      const value = Number(answers[option.key] ?? option.defaultValue ?? 0);
-      if (Number.isFinite(value) && value > 0) amount += option.pricePerUnit * value;
+    const answers = service.optionsEnabled ? selection.options || {} : {};
+    if (service.optionsEnabled) {
+      for (const option of service.options || []) {
+        if (!option.pricePerUnit) continue;
+        const value = Number(answers[option.key] ?? option.defaultValue ?? 0);
+        if (Number.isFinite(value) && value > 0) amount += option.pricePerUnit * value;
+      }
     }
 
     lines.push({

@@ -21,7 +21,9 @@ router.get(
         basePrice: s.basePrice,
         durationLabel: s.durationLabel,
         defaultDurationMins: s.defaultDurationMins,
-        options: s.options || [],
+        inclusions: s.inclusions || [],
+        optionsEnabled: Boolean(s.optionsEnabled),
+        options: s.optionsEnabled ? s.options || [] : [],
       })),
     });
   }),

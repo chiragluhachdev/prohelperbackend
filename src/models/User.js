@@ -25,6 +25,8 @@ const userSchema = new mongoose.Schema(
     // UC-C23 — rejection tracking feeds the auto-block rule
     rejectionCount: { type: Number, default: 0 },
 
+    fcmToken: { type: String, default: null },
+
     lastLoginAt: { type: Date },
   },
   { timestamps: true },

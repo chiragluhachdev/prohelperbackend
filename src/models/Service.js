@@ -25,8 +25,16 @@ const serviceSchema = new mongoose.Schema(
     icon: { type: String, default: '🧹' },
     basePrice: { type: Number, required: true },
     durationLabel: { type: String, default: '1 - 2 hours' },
+    /** The "what's included" checklist the app shows. Data, not app copy. */
+    inclusions: { type: [String], default: [] },
     defaultDurationMins: { type: Number, default: 60 },
     options: [serviceOptionSchema],
+    /**
+     * Off unless an admin turns it on. A service with questions nobody has
+     * reviewed should not start interrogating customers at checkout, and a
+     * priced option left on by accident would quietly change the bill.
+     */
+    optionsEnabled: { type: Boolean, default: false },
     active: { type: Boolean, default: true, index: true },
     sortOrder: { type: Number, default: 0 },
   },

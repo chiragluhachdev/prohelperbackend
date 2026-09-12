@@ -28,10 +28,15 @@ router.get(
     const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
     const endOfDay = new Date(startOfDay); endOfDay.setDate(endOfDay.getDate() + 1);
 
+    // Midnight seven days ago, so "the last 7 days" means seven whole days.
+    const weekStart = new Date(startOfDay);
+    weekStart.setDate(weekStart.getDate() - 6);
+
     const [
       customers, helpers, pendingApprovals, activeHelpers, onlineHelpers,
       todayBookings, activeTasks, completedTasks, cancelledTasks, noHelperTasks,
       blockedAccounts, revenueAgg, commissionAgg, recentTasks, pendingHelpers,
+      trendAgg,
     ] = await Promise.all([
       User.countDocuments({ role: ROLES.CUSTOMER }),
       User.countDocuments({ role: ROLES.HELPER }),
@@ -63,7 +68,46 @@ router.get(
         .sort({ submittedAt: 1 })
         .limit(6)
         .lean(),
+      /* Bookings per day for the last week. Grouped in the database rather
+         than by pulling every task back and counting them here. */
+      Task.aggregate([
+        { $match: { createdAt: { $gte: weekStart } } },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+            bookings: { $sum: 1 },
+            completed: {
+              $sum: { $cond: [{ $in: ['$status', [TASK_STATUS.COMPLETED, TASK_STATUS.SETTLED]] }, 1, 0] },
+            },
+            revenue: {
+              $sum: {
+                $cond: [
+                  { $in: ['$status', [TASK_STATUS.COMPLETED, TASK_STATUS.SETTLED]] },
+                  '$pricing.total',
+                  0,
+                ],
+              },
+            },
+          },
+        },
+      ]),
     ]);
+
+    // Days with no bookings still need a bar, or the chart lies about the shape.
+    const byDay = new Map(trendAgg.map((d) => [d._id, d]));
+    const trend = [];
+    for (let i = 0; i < 7; i += 1) {
+      const day = new Date(weekStart);
+      day.setDate(weekStart.getDate() + i);
+      const key = `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
+      const row = byDay.get(key);
+      trend.push({
+        date: key,
+        bookings: row?.bookings || 0,
+        completed: row?.completed || 0,
+        revenue: Math.round((row?.revenue || 0) * 100) / 100,
+      });
+    }
 
     res.json({
       stats: {
@@ -73,6 +117,7 @@ router.get(
         revenue: Math.round((revenueAgg[0]?.total || 0) * 100) / 100,
         outstandingCommission: Math.round((commissionAgg[0]?.total || 0) * 100) / 100,
       },
+      trend,
       recentTasks: recentTasks.map(adminTask),
       pendingHelpers: pendingHelpers.map((p) => ({
         id: String(p.userId?._id),
@@ -95,6 +140,7 @@ function adminTask(t) {
     statusLabel: STATUS_LABELS[t.status] || t.status,
     services: (t.services || []).map((s) => s.name),
     total: t.pricing?.total ?? 0,
+    bookingType: t.bookingType || 'scheduled',
     scheduledAt: t.scheduledAt,
     createdAt: t.createdAt,
     customer: t.customerId ? { id: String(t.customerId._id), name: t.customerId.name, phone: t.customerId.phone } : null,
@@ -500,7 +546,8 @@ router.patch(
       name: service.name, basePrice: service.basePrice, active: service.active,
       durationLabel: service.durationLabel, defaultDurationMins: service.defaultDurationMins,
       description: service.description, category: service.category, icon: service.icon,
-      sortOrder: service.sortOrder,
+      inclusions: service.inclusions, sortOrder: service.sortOrder,
+      optionsEnabled: service.optionsEnabled, options: service.options,
     };
 
     if (req.body.name != null) {
@@ -523,7 +570,21 @@ router.patch(
     if (req.body.durationLabel != null) service.durationLabel = String(req.body.durationLabel);
     if (req.body.category != null) service.category = String(req.body.category);
     if (req.body.icon != null) service.icon = String(req.body.icon);
+    if (req.body.inclusions != null) {
+      const list = Array.isArray(req.body.inclusions)
+        ? req.body.inclusions
+        : String(req.body.inclusions).split('\n');
+      service.inclusions = list.map((line) => String(line).trim()).filter(Boolean).slice(0, 12);
+    }
     if (req.body.sortOrder != null) service.sortOrder = Number(req.body.sortOrder) || 0;
+    if (req.body.options != null) service.options = parseOptions(req.body.options);
+    if (req.body.optionsEnabled != null) service.optionsEnabled = Boolean(req.body.optionsEnabled);
+
+    /* Turning questions on with nothing to ask would show the customer an
+       empty section, so say so rather than saving a broken state. */
+    if (service.optionsEnabled && (service.options || []).length === 0) {
+      throw badRequest('Add at least one question before switching them on.', 'NO_OPTIONS');
+    }
 
     await service.save();
 
@@ -544,11 +605,72 @@ router.patch(
   }),
 );
 
+/**
+ * UC-C05 — the per-service questions are data. They are also the only thing in
+ * the catalog that can change a bill, so they are validated here rather than
+ * trusted: a bad key or a negative price would reach the quote engine.
+ */
+const OPTION_TYPES = ['number', 'text', 'select', 'boolean'];
+
+/** "Extra Bathrooms!" -> "extra_bathrooms": no runs, no edges, no surprises. */
+const slug = (raw) =>
+  String(raw || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+
+function parseOptions(raw) {
+  if (!Array.isArray(raw)) throw badRequest('Options must be a list.', 'INVALID_OPTIONS');
+  if (raw.length > 10) throw badRequest('Ten questions per service is plenty.', 'TOO_MANY_OPTIONS');
+
+  const seen = new Set();
+  return raw.map((o, i) => {
+    const key = slug(o?.key);
+    const label = String(o?.label || '').trim();
+    const type = OPTION_TYPES.includes(o?.type) ? o.type : 'text';
+
+    if (!key) throw badRequest(`Question ${i + 1} needs a key.`, 'OPTION_KEY_REQUIRED');
+    if (!label) throw badRequest(`Question ${i + 1} needs a label.`, 'OPTION_LABEL_REQUIRED');
+    if (seen.has(key)) throw badRequest(`Two questions share the key "${key}".`, 'DUPLICATE_OPTION_KEY');
+    seen.add(key);
+
+    const choices = type === 'select'
+      ? (Array.isArray(o.choices) ? o.choices : String(o.choices || '').split(','))
+          .map((c) => String(c).trim()).filter(Boolean)
+      : [];
+    if (type === 'select' && choices.length < 2) {
+      throw badRequest(`"${label}" needs at least two choices.`, 'OPTION_CHOICES_REQUIRED');
+    }
+
+    const pricePerUnit = Number(o.pricePerUnit || 0);
+    if (!Number.isFinite(pricePerUnit) || pricePerUnit < 0) {
+      throw badRequest(`"${label}" has an invalid price.`, 'INVALID_OPTION_PRICE');
+    }
+
+    // The default has to be the shape the question asks for, or the quote
+    // engine will do arithmetic on a string.
+    let defaultValue = o.defaultValue;
+    if (type === 'number') defaultValue = Number(defaultValue) || 0;
+    else if (type === 'boolean') defaultValue = defaultValue === true || defaultValue === 'true';
+    else if (type === 'select') defaultValue = choices.includes(defaultValue) ? defaultValue : choices[0];
+    else defaultValue = defaultValue == null ? '' : String(defaultValue);
+
+    return {
+      key, label, type, choices,
+      unit: String(o.unit || '').trim(),
+      required: Boolean(o.required),
+      defaultValue,
+      pricePerUnit: Math.round(pricePerUnit * 100) / 100,
+    };
+  });
+}
+
 /** Add a service to the catalog. It appears in both apps immediately. */
 router.post(
   '/services',
   wrap(async (req, res) => {
-    const code = String(req.body.code || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '_');
+    const code = slug(req.body.code);
     const name = String(req.body.name || '').trim();
     const basePrice = Number(req.body.basePrice);
 
@@ -565,12 +687,176 @@ router.post(
       durationLabel: req.body.durationLabel || '1 - 2 hours',
       defaultDurationMins: Number(req.body.defaultDurationMins) || 90,
       sortOrder: Number(req.body.sortOrder) || 99,
+      inclusions: (Array.isArray(req.body.inclusions) ? req.body.inclusions : [])
+        .map((line) => String(line).trim())
+        .filter(Boolean)
+        .slice(0, 12),
       active: true,
       options: [],
     });
 
     await audit(req, { action: 'SERVICE_CREATED', entity: 'Service', entityId: code, after: service.toObject() });
     res.status(201).json({ service });
+  }),
+);
+
+/* ------------------------------------------------------------------ finance */
+
+/**
+ * GET /api/admin/finance — where the money is, from the ledger and the
+ * bookings themselves rather than any running total.
+ *
+ * Payment is settled directly between customer and helper, so "revenue" here
+ * is what the platform is owed: the service fee on the customer's bill plus
+ * the commission deducted from the helper's gross.
+ */
+router.get(
+  '/finance',
+  wrap(async (req, res) => {
+    const days = Math.min(Math.max(Number(req.query.days) || 30, 1), 365);
+    const since = new Date();
+    since.setHours(0, 0, 0, 0);
+    since.setDate(since.getDate() - (days - 1));
+
+    const earned = { $in: [TASK_STATUS.COMPLETED, TASK_STATUS.SETTLED] };
+
+    const [totals, byDay, ledgerByType, outstanding, recent, unpaid] = await Promise.all([
+      Task.aggregate([
+        { $match: { status: earned } },
+        {
+          $group: {
+            _id: null,
+            bookings: { $sum: 1 },
+            gross: { $sum: '$pricing.total' },
+            services: { $sum: '$pricing.servicesAmount' },
+            platformFee: { $sum: '$pricing.platformFee' },
+            surcharge: { $sum: '$pricing.surcharge' },
+            gst: { $sum: '$pricing.gst' },
+            commission: { $sum: '$pricing.helperCommission' },
+            payout: { $sum: '$pricing.helperPayout' },
+          },
+        },
+      ]),
+      Task.aggregate([
+        { $match: { status: earned, completedAt: { $gte: since } } },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$completedAt' } },
+            bookings: { $sum: 1 },
+            gross: { $sum: '$pricing.total' },
+            platformEarned: { $sum: { $add: ['$pricing.platformFee', '$pricing.helperCommission'] } },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
+      LedgerEntry.aggregate([
+        { $group: { _id: '$type', total: { $sum: '$amount' }, rows: { $sum: 1 } } },
+      ]),
+      LedgerEntry.aggregate([
+        { $match: { type: 'PLATFORM_COMMISSION', settled: false } },
+        { $group: { _id: '$userId', total: { $sum: '$amount' }, jobs: { $sum: 1 } } },
+        { $sort: { total: -1 } },
+        { $limit: 25 },
+      ]),
+      Task.find({ status: earned })
+        .populate('customerId', 'name phone')
+        .populate('helperId', 'name phone')
+        .sort({ completedAt: -1 })
+        .limit(40)
+        .lean(),
+      Task.countDocuments({ status: earned, paymentStatus: { $ne: 'PAID' } }),
+    ]);
+
+    const owedIds = outstanding.map((o) => o._id);
+    const owedHelpers = await User.find({ _id: { $in: owedIds } }).select('name phone').lean();
+    const owedProfiles = await HelperProfile.find({ userId: { $in: owedIds } })
+      .select('userId paymentDetails')
+      .lean();
+    const nameById = new Map(owedHelpers.map((u) => [String(u._id), u]));
+    const payById = new Map(owedProfiles.map((p) => [String(p.userId), p.paymentDetails]));
+
+    const t = totals[0] || {};
+    res.json({
+      totals: {
+        bookings: t.bookings || 0,
+        gross: round(t.gross),
+        services: round(t.services),
+        platformFee: round(t.platformFee),
+        surcharge: round(t.surcharge),
+        gst: round(t.gst),
+        commission: round(t.commission),
+        helperPayout: round(t.payout),
+        platformEarned: round((t.platformFee || 0) + (t.commission || 0)),
+        awaitingPayment: unpaid,
+      },
+      byDay: byDay.map((d) => ({
+        date: d._id,
+        bookings: d.bookings,
+        gross: round(d.gross),
+        platformEarned: round(d.platformEarned),
+      })),
+      ledger: Object.fromEntries(
+        ledgerByType.map((l) => [l._id, { total: round(l.total), rows: l.rows }]),
+      ),
+      commissionOwed: outstanding.map((o) => ({
+        helperId: String(o._id),
+        name: nameById.get(String(o._id))?.name || 'Unknown',
+        phone: nameById.get(String(o._id))?.phone || '',
+        jobs: o.jobs,
+        amount: round(o.total),
+        paymentDetails: payById.get(String(o._id)) || null,
+      })),
+      bookings: recent.map((task) => ({
+        id: String(task._id),
+        code: task.code,
+        completedAt: task.completedAt,
+        paymentStatus: task.paymentStatus,
+        paymentMode: task.paymentMode,
+        customer: task.customerId?.name || '—',
+        helper: task.helperId?.name || '—',
+        services: (task.services || []).map((sv) => sv.name),
+        pricing: task.pricing,
+      })),
+    });
+  }),
+);
+
+const round = (n) => Math.round((n || 0) * 100) / 100;
+
+/**
+ * POST /api/admin/finance/settle/:helperId — the commission a helper owes has
+ * been collected. Writes one ledger row per outstanding entry rather than
+ * editing a balance, so the history stays readable.
+ */
+router.post(
+  '/finance/settle/:helperId',
+  wrap(async (req, res) => {
+    const helper = await User.findOne({ _id: req.params.helperId, role: ROLES.HELPER }).lean();
+    if (!helper) throw notFound('Helper not found.');
+
+    const open = await LedgerEntry.find({
+      userId: helper._id, type: 'PLATFORM_COMMISSION', settled: false,
+    }).lean();
+    if (!open.length) throw conflict('Nothing is outstanding for this helper.', 'NOTHING_OWED');
+
+    const total = round(open.reduce((sum, e) => sum + e.amount, 0));
+    await LedgerEntry.updateMany(
+      { _id: { $in: open.map((e) => e._id) } },
+      { $set: { settled: true } },
+    );
+
+    await audit(req, {
+      action: 'COMMISSION_SETTLED',
+      entity: 'LedgerEntry',
+      entityId: helper._id,
+      after: { amount: total, entries: open.length },
+      reason: req.body.reason || 'Commission collected',
+    });
+
+    await notify(helper._id, 'COMMISSION_SETTLED', 'Commission cleared',
+      `₹${total} of platform commission has been marked as settled.`);
+
+    res.json({ settled: open.length, amount: total });
   }),
 );
 
@@ -584,7 +870,19 @@ router.put(
     const patch = {};
     for (const [key, value] of Object.entries(req.body || {})) {
       if (!(key in before)) throw badRequest(`Unknown setting "${key}".`, 'UNKNOWN_SETTING');
-      patch[key] = typeof before[key] === 'number' ? Number(value) : value;
+
+      // Coerce to the shape the setting already has. A boolean arriving as the
+      // string "false" would otherwise be stored as a string, and every
+      // `if (setting)` in the codebase would read it as true.
+      if (typeof before[key] === 'number') {
+        const n = Number(value);
+        if (!Number.isFinite(n)) throw badRequest(`"${key}" must be a number.`, 'INVALID_SETTING');
+        patch[key] = n;
+      } else if (typeof before[key] === 'boolean') {
+        patch[key] = value === true || value === 'true' || value === 1 || value === '1';
+      } else {
+        patch[key] = String(value);
+      }
     }
     const settings = await updateSettings(patch, req.user._id);
     await audit(req, { action: 'SETTINGS_UPDATED', entity: 'Setting', before, after: settings, reason: req.body.reason || '' });

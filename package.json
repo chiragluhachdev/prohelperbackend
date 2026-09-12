@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Pro Helper MVP API \u2014 the source of truth for tasks, matching, assignment and money",
+  "description": "Pro Helper MVP API — the source of truth for tasks, matching, assignment and money",
   "engines": {
     "node": ">=20.11"
   },
@@ -18,6 +18,7 @@
     "cloudinary": "^2.5.1",
     "cors": "^2.8.5",
     "express": "^4.21.2",
+    "firebase-admin": "^14.4.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.9.5",
     "morgan": "^1.10.0",
