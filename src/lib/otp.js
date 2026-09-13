@@ -38,8 +38,36 @@ export async function issueOtp(phone, { role = '', purpose = 'login' } = {}) {
     expiresAt: new Date(Date.now() + OTP_TTL_SECONDS * 1000),
   });
 
-  // Stand-in for the SMS provider.
   console.log(`[otp] ${purpose} code for ${phone} → ${code}${DUMMY_AUTH ? ' (any 6 digits will pass)' : ''}`);
+
+  if (process.env.FAST2SMS_API_KEY) {
+    try {
+      // Fast2SMS requires 10-digit Indian numbers without +91
+      const cleanPhone = phone.replace(/\D/g, '').slice(-10);
+      
+      const response = await fetch('https://www.fast2sms.com/dev/bulkV2', {
+        method: 'POST',
+        headers: {
+          'authorization': process.env.FAST2SMS_API_KEY,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          route: 'q',
+          message: `Your GetHelper verification code is ${code}. Do not share this with anyone.`,
+          numbers: cleanPhone
+        })
+      });
+      
+      const data = await response.json();
+      if (data.return === false) {
+        console.error('[otp] Fast2SMS Error:', data.message);
+      } else {
+        console.log(`[otp] SMS sent successfully to ${cleanPhone}`);
+      }
+    } catch (err) {
+      console.error('[otp] Failed to send SMS via Fast2SMS:', err.message);
+    }
+  }
 
   return {
     sent: true,
