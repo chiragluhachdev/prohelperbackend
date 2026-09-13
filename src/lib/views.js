@@ -21,6 +21,19 @@ export const STATUS_LABELS = {
   NO_HELPER_AVAILABLE: 'No helper available',
 };
 
+export const DEFAULT_JOBS_SHOWN = 50;
+
+/**
+ * "50+" while the admin-set figure is higher than the real count, the real
+ * number once the helper has actually done more. Setting it to 0 shows only
+ * the true count.
+ */
+export function jobsLabel(profile) {
+  const real = profile?.completedJobs ?? 0;
+  const shown = profile?.jobsShown ?? DEFAULT_JOBS_SHOWN;
+  return real >= shown ? String(real) : `${shown}+`;
+}
+
 const person = (u) =>
   u && typeof u === 'object' && u._id
     ? { id: String(u._id), name: u.name || '', phone: u.phone || '', photoUrl: u.photoUrl || '' }
@@ -41,6 +54,7 @@ export function serializeTask(task, { audience = 'customer', helperProfile = nul
     services: (t.services || []).map((s) => ({
       code: s.code,
       name: s.name,
+      nameHi: s.nameHi || '',
       icon: s.icon,
       options: s.options || {},
       amount: s.amount,
@@ -71,6 +85,8 @@ export function serializeTask(task, { audience = 'customer', helperProfile = nul
             ...person(t.helperId),
             rating: helperProfile?.ratingAvg ?? null,
             completedJobs: helperProfile?.completedJobs ?? null,
+            jobsLabel: helperProfile ? jobsLabel(helperProfile) : null,
+            experienceYears: helperProfile?.experienceYears ?? null,
           }
         : null,
       rated: Boolean(t.ratedByCustomer),

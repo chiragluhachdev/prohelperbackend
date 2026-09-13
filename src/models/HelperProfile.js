@@ -65,6 +65,13 @@ const helperProfileSchema = new mongoose.Schema(
     ratingAvg: { type: Number, default: 0 },
     ratingCount: { type: Number, default: 0 },
     completedJobs: { type: Number, default: 0 },
+    /*
+     * The job count customers are shown, set by an admin — e.g. to include work
+     * a helper did before joining. Kept apart from completedJobs, which only the
+     * platform increments and which earnings and admin reporting rely on. The
+     * customer sees whichever is higher, so real work always shows through.
+     */
+    jobsShown: { type: Number, default: 50, min: 0 },
 
     // --- payment details ---
     paymentDetails: {

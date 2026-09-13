@@ -27,6 +27,19 @@ const userSchema = new mongoose.Schema(
 
     fcmToken: { type: String, default: null },
 
+    /*
+     * Numbers this account used before, newest last. Support needs this when
+     * someone says "that is not my number" — a silent overwrite would leave no
+     * trace of what it was changed from.
+     */
+    previousPhones: [
+      {
+        _id: false,
+        phone: String,
+        changedAt: Date,
+      },
+    ],
+
     lastLoginAt: { type: Date },
   },
   { timestamps: true },

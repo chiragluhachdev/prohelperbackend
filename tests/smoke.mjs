@@ -665,6 +665,152 @@ ok('and the admin sees the payout details on the helper',
   helperView.profile?.paymentDetails?.accountNo === '123456789012',
   JSON.stringify(helperView.profile?.paymentDetails));
 
+/* --------------------------------------------------------------- Hindi */
+console.log('\n13. Hindi');
+
+// A fresh catalog ships Hindi copy for every service.
+const hiCatalog = await api('/api/services');
+const hiKitchen = hiCatalog.services?.find((sv) => sv.code === 'kitchen');
+ok('the catalog carries Hindi names, durations and checklists',
+  hiKitchen?.nameHi === 'किचन की सफ़ाई' && hiKitchen?.durationLabelHi && hiKitchen?.inclusionsHi?.length === 5,
+  JSON.stringify({ nameHi: hiKitchen?.nameHi, dur: hiKitchen?.durationLabelHi, n: hiKitchen?.inclusionsHi?.length }));
+
+const hiEdit = await api('/api/admin/services/bathroom', {
+  method: 'PATCH', token: adminToken,
+  body: { nameHi: 'बाथरूम की गहरी सफ़ाई', inclusionsHi: ['कमोड की सफ़ाई', '', 'टाइल्स'] },
+});
+ok('an admin can edit the Hindi copy', hiEdit.service?.nameHi === 'बाथरूम की गहरी सफ़ाई' && hiEdit.service?.inclusionsHi?.length === 2,
+  JSON.stringify(hiEdit.error ?? hiEdit.service?.inclusionsHi));
+
+// A booking keeps the Hindi name it was made with.
+const hiBooking = await api(`/api/customer/tasks/${taskId}`, { token: customerToken });
+ok('a booking snapshot carries the Hindi service name',
+  typeof hiBooking.task?.services?.[0]?.nameHi === 'string' && hiBooking.task.services[0].nameHi.length > 0,
+  JSON.stringify(hiBooking.task?.services?.[0]));
+
+// Notifications are stored with the values the app rebuilds sentences from.
+const custNotes = await api('/api/notifications', { token: customerToken });
+const acceptedNote = custNotes.notifications?.find((n) => n.type === 'BOOKING_ACCEPTED');
+ok('a notification stores the values its sentence needs',
+  Boolean(acceptedNote?.data?.code && acceptedNote?.data?.helperName), JSON.stringify(acceptedNote?.data));
+
+const winnerNotes = await api('/api/notifications', { token: winnerToken });
+const jobReq = winnerNotes.notifications?.find((n) => n.type === 'JOB_REQUEST');
+ok('a job request stores the service name in Hindi too',
+  Boolean(jobReq?.data?.serviceNameHi), JSON.stringify(jobReq?.data));
+
+const hiEarnings = await api('/api/helper/earnings', { token: winnerToken });
+const earnRow = hiEarnings.entries?.find((e) => e.type === 'JOB_EARNING');
+ok('earnings rows carry service objects with the Hindi name',
+  earnRow?.task?.services?.[0]?.code && 'nameHi' in earnRow.task.services[0],
+  JSON.stringify(earnRow?.task));
+
+// An error the app shows in Hindi is keyed by a stable code.
+const noLine = await api('/api/customer/addresses', { method: 'POST', token: customerToken, body: { society: 'rps_savana' } });
+ok('errors carry a code the app can translate', noLine.status === 400 && noLine.error?.code === 'LINE1_REQUIRED',
+  JSON.stringify(noLine.error));
+
+/* ------------------------------------------------------- change number */
+console.log('\n14. Changing a phone number');
+
+const newCustomerPhone = `8${RUN}1001`.slice(0, 10);
+
+const sameNumber = await api('/api/auth/phone/request', {
+  method: 'POST', token: customerToken, body: { phone: me.user.phone },
+});
+ok('asking for your current number is refused', sameNumber.status === 400 && sameNumber.error?.code === 'SAME_PHONE',
+  JSON.stringify(sameNumber.error));
+
+const badNumber = await api('/api/auth/phone/request', {
+  method: 'POST', token: customerToken, body: { phone: '12345' },
+});
+ok('a malformed number is refused', badNumber.status === 400 && badNumber.error?.code === 'INVALID_PHONE',
+  JSON.stringify(badNumber.error));
+
+// Another helper's number, for a helper: taken. For a customer: allowed.
+const helperTaken = await api('/api/auth/phone/request', {
+  method: 'POST', token: helperA, body: { phone: PHONE.helperB },
+});
+ok('a helper cannot take another helper\'s number', helperTaken.status === 409 && helperTaken.error?.code === 'PHONE_TAKEN',
+  JSON.stringify(helperTaken.error));
+
+const crossRole = await api('/api/auth/phone/request', {
+  method: 'POST', token: customerToken, body: { phone: PHONE.helperB },
+});
+ok('a customer may use a number that belongs to a helper account', crossRole.sent === true, JSON.stringify(crossRole.error));
+
+const sent = await api('/api/auth/phone/request', {
+  method: 'POST', token: customerToken, body: { phone: newCustomerPhone },
+});
+ok('a code is sent to the new number', sent.sent === true && sent.length === 6, JSON.stringify(sent.error ?? sent));
+
+// A code issued for the customer's change cannot complete the helper's.
+const stolen = await api('/api/auth/phone/verify', {
+  method: 'POST', token: helperA, body: { phone: newCustomerPhone, code: sent.devCode || '123456' },
+});
+ok('the code only works for the account that asked', stolen.status >= 400, JSON.stringify(stolen.status));
+
+const changed = await api('/api/auth/phone/verify', {
+  method: 'POST', token: customerToken, body: { phone: newCustomerPhone, code: sent.devCode || '123456' },
+});
+ok('the verified number replaces the old one', changed.user?.phone === newCustomerPhone, JSON.stringify(changed.error ?? changed.user));
+
+const meAfter = await api('/api/auth/me', { token: customerToken });
+ok('the same session keeps working after the change', meAfter.user?.phone === newCustomerPhone, JSON.stringify(meAfter.error));
+
+// And the new number is the one that signs in from now on.
+const signIn = await api('/api/auth/otp/request', { method: 'POST', body: { phone: newCustomerPhone } });
+const signInVerify = await api('/api/auth/otp/verify', { method: 'POST', body: { phone: newCustomerPhone, code: '123456' } });
+ok('the new number signs in to the same account',
+  signInVerify.accounts?.some((a) => a.role === 'customer'), JSON.stringify(signInVerify.accounts ?? signInVerify.error));
+
+const phoneNote = (await api('/api/notifications', { token: customerToken })).notifications?.find((n) => n.type === 'PHONE_CHANGED');
+ok('the customer is told their number changed', Boolean(phoneNote?.data?.phone), JSON.stringify(phoneNote?.data));
+
+const adminCustomer = await api(`/api/admin/customers/${meAfter.user.id}`, { token: adminToken });
+ok('the admin sees the new number and the one it replaced',
+  adminCustomer.customer?.phone === newCustomerPhone &&
+  adminCustomer.customer?.previousPhones?.some((p) => p.phone === PHONE.customer),
+  JSON.stringify({ phone: adminCustomer.customer?.phone, previous: adminCustomer.customer?.previousPhones }));
+
+/* --------------------------------------------- customer-facing helper stats */
+console.log('\n15. Helper experience and job count');
+
+// The completed booking from section 7 belongs to the race winner.
+const shownBefore = await api(`/api/customer/tasks/${taskId}`, { token: customerToken });
+ok('a helper shows 50+ jobs by default',
+  shownBefore.task?.helper?.jobsLabel === '50+', JSON.stringify(shownBefore.task?.helper));
+
+const badYears = await api(`/api/admin/helpers/${winnerId}/profile`, {
+  method: 'PATCH', token: adminToken, body: { experienceYears: 99 },
+});
+ok('an impossible experience is refused', badYears.status === 400, JSON.stringify(badYears.error));
+
+const badJobs = await api(`/api/admin/helpers/${winnerId}/profile`, {
+  method: 'PATCH', token: adminToken, body: { jobsShown: -5 },
+});
+ok('a negative job count is refused', badJobs.status === 400, JSON.stringify(badJobs.error));
+
+const edited = await api(`/api/admin/helpers/${winnerId}/profile`, {
+  method: 'PATCH', token: adminToken, body: { experienceYears: 4, jobsShown: 120 },
+});
+ok('an admin can set experience and jobs shown',
+  edited.profile?.experienceYears === 4 && edited.profile?.jobsShown === 120 && edited.profile?.jobsLabel === '120+',
+  JSON.stringify(edited.error ?? edited.profile));
+
+const shownAfter = await api(`/api/customer/tasks/${taskId}`, { token: customerToken });
+ok('the customer sees the new figures',
+  shownAfter.task?.helper?.jobsLabel === '120+' && shownAfter.task?.helper?.experienceYears === 4,
+  JSON.stringify(shownAfter.task?.helper));
+
+// Zero means "show only what really happened".
+await api(`/api/admin/helpers/${winnerId}/profile`, { method: 'PATCH', token: adminToken, body: { jobsShown: 0 } });
+const honest = await api(`/api/customer/tasks/${taskId}`, { token: customerToken });
+const realCount = (await api(`/api/admin/helpers/${winnerId}`, { token: adminToken })).profile?.completedJobs;
+ok('set to 0, the real completed count shows through',
+  honest.task?.helper?.jobsLabel === String(realCount), JSON.stringify({ label: honest.task?.helper?.jobsLabel, realCount }));
+ok('and the real counter was never touched by the edits', realCount >= 1, String(realCount));
+
 ok('admin actions are audited', audit.logs?.length >= 3, String(audit.logs?.length));
 
 // ---------------------------------------------------------------- teardown

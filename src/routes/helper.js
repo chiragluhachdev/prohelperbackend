@@ -511,7 +511,7 @@ router.post(
       actorType: 'helper', actorId: req.user._id, reason: 'Helper started the job',
     });
     await notify(task.customerId, 'TASK_STARTED', 'Work started',
-      `Your helper has started ${task.code}.`, { taskId: String(task._id) });
+      `Your helper has started ${task.code}.`, { taskId: String(task._id), code: task.code });
     res.json({ task: serializeTask(task, { audience: 'helper' }) });
   }),
 );
@@ -550,7 +550,7 @@ router.post(
 
     await notify(task.customerId, 'COMPLETION_OTP', 'Confirm job completion',
       `Share code ${code} with your helper to close ${task.code}.`,
-      { taskId: String(task._id), code });
+      { taskId: String(task._id), code, taskCode: task.code });
 
     console.log(`[completion] ${task.code} otp → ${code}`);
     res.json({ sent: true, expiresAt, expiresInSeconds: settings.completion_otp_ttl_seconds });
@@ -607,7 +607,7 @@ router.post(
 
     await HelperProfile.updateOne({ userId: req.user._id }, { $inc: { completedJobs: 1 } });
     await notify(completed.customerId, 'TASK_COMPLETED', 'Job completed',
-      `${completed.code} is complete. Rate your helper.`, { taskId: String(completed._id) });
+      `${completed.code} is complete. Rate your helper.`, { taskId: String(completed._id), code: completed.code });
 
     res.json({
       task: serializeTask(completed, { audience: 'helper' }),
@@ -674,7 +674,13 @@ router.get(
         amount: e.amount,
         note: e.note,
         createdAt: e.createdAt,
-        task: e.taskId ? { code: e.taskId.code, services: e.taskId.services?.map((s) => s.name) } : null,
+        task: e.taskId
+          ? {
+              code: e.taskId.code,
+              // Objects, not bare names: the app shows the Hindi name when it has one.
+              services: (e.taskId.services || []).map((s) => ({ code: s.code, name: s.name, nameHi: s.nameHi || '' })),
+            }
+          : null,
       })),
     });
   }),

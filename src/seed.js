@@ -12,6 +12,7 @@ import { connectDb } from './lib/db.js';
 import { ensureSettings } from './lib/settings.js';
 import { hashPassword } from './lib/auth.js';
 import { ADMIN_EMAIL, ADMIN_PASSWORD, ROLES } from './config.js';
+import { HINDI_CATALOG } from './scripts/hindiCatalog.js';
 import {
   Address, HelperProfile, Service, User,
   Task, JobRequest, TaskEvent, Rating, LedgerEntry, Notification, AuditLog, Otp, HelperDocument,
@@ -127,7 +128,7 @@ async function run() {
   console.log('[seed] settings ready');
 
   for (const s of SERVICES) {
-    await Service.updateOne({ code: s.code }, { $set: { ...s, active: true } }, { upsert: true });
+    await Service.updateOne({ code: s.code }, { $set: { ...s, ...(HINDI_CATALOG[s.code] || {}), active: true } }, { upsert: true });
   }
   // Anything no longer offered is retired rather than deleted, so past bookings
   // keep pointing at a real catalog entry (UC-C42).

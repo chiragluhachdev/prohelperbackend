@@ -27,6 +27,15 @@ const serviceSchema = new mongoose.Schema(
     durationLabel: { type: String, default: '1 - 2 hours' },
     /** The "what's included" checklist the app shows. Data, not app copy. */
     inclusions: { type: [String], default: [] },
+
+    /*
+     * Hindi copy. Optional: an empty field falls back to the English one, so a
+     * service added in a hurry still shows *something* to a Hindi reader.
+     */
+    nameHi: { type: String, default: '' },
+    descriptionHi: { type: String, default: '' },
+    durationLabelHi: { type: String, default: '' },
+    inclusionsHi: { type: [String], default: [] },
     defaultDurationMins: { type: Number, default: 60 },
     options: [serviceOptionSchema],
     /**

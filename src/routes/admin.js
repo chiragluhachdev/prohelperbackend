@@ -6,7 +6,7 @@ import {
 import { ROLES, TASK_STATUS, HELPER_APPROVAL, BUSINESS_TZ, dayKey } from '../config.js';
 import { authenticate, requireAdmin } from '../lib/auth.js';
 import { wrap, badRequest, notFound, conflict } from '../lib/http.js';
-import { serializeTask, STATUS_LABELS } from '../lib/views.js';
+import { serializeTask, STATUS_LABELS, jobsLabel, DEFAULT_JOBS_SHOWN } from '../lib/views.js';
 import { getSettings, updateSettings } from '../lib/settings.js';
 import { closeJobAlerts, notify } from '../lib/notify.js';
 import { audit } from '../lib/audit.js';
@@ -180,6 +180,8 @@ router.get(
           rating: p.ratingAvg,
           ratingCount: p.ratingCount,
           completedJobs: p.completedJobs,
+          jobsShown: p.jobsShown ?? DEFAULT_JOBS_SHOWN,
+          jobsLabel: jobsLabel(p),
           submittedAt: p.submittedAt,
           createdAt: u.createdAt,
         };
@@ -207,7 +209,12 @@ router.get(
       HelperProfile.findOne({ userId: user._id }).lean(),
       HelperDocument.find({ helperId: user._id }).sort({ createdAt: -1 }).lean(),
       Task.find({ helperId: user._id }).populate('customerId', 'name phone').sort({ createdAt: -1 }).limit(20).lean(),
-      Rating.find({ toUserId: user._id }).sort({ createdAt: -1 }).limit(10).lean(),
+      Rating.find({ toUserId: user._id })
+        .populate('fromUserId', 'name role')
+        .populate('taskId', 'shortId')
+        .sort({ createdAt: -1 })
+        .limit(50)
+        .lean(),
       LedgerEntry.aggregate([
         { $match: { userId: user._id } },
         { $group: { _id: '$type', total: { $sum: '$amount' } } },
@@ -218,6 +225,7 @@ router.get(
       helper: {
         id: String(user._id),
         name: user.name, phone: user.phone, email: user.email,
+        previousPhones: user.previousPhones || [],
         photoUrl: user.photoUrl, accountStatus: user.status,
         blockReason: user.blockReason, createdAt: user.createdAt,
       },
@@ -226,6 +234,57 @@ router.get(
       tasks: tasks.map(adminTask),
       ratings,
       earnings: Object.fromEntries(ledger.map((l) => [l._id, Math.round(l.total * 100) / 100])),
+    });
+  }),
+);
+
+/**
+ * PATCH /api/admin/helpers/:id/profile — the figures customers see on a helper:
+ * years of experience, and the job count shown alongside their name.
+ *
+ * The real completed-jobs counter is deliberately not editable here: earnings
+ * and reporting depend on it matching the bookings that actually happened.
+ */
+router.patch(
+  '/helpers/:id/profile',
+  wrap(async (req, res) => {
+    const profile = await HelperProfile.findOne({ userId: req.params.id });
+    if (!profile) throw notFound('Helper not found.');
+
+    const before = { experienceYears: profile.experienceYears, jobsShown: profile.jobsShown };
+
+    if (req.body.experienceYears !== undefined) {
+      const years = Number(req.body.experienceYears);
+      if (!Number.isFinite(years) || years < 0 || years > 60) {
+        throw badRequest('Experience must be between 0 and 60 years.', 'INVALID_EXPERIENCE');
+      }
+      profile.experienceYears = Math.round(years * 2) / 2; // half-years are fine
+    }
+    if (req.body.jobsShown !== undefined) {
+      const jobs = Number(req.body.jobsShown);
+      if (!Number.isInteger(jobs) || jobs < 0 || jobs > 100000) {
+        throw badRequest('Jobs shown must be a whole number, 0 or more.', 'INVALID_JOBS');
+      }
+      profile.jobsShown = jobs;
+    }
+    await profile.save();
+
+    await audit(req, {
+      action: 'HELPER_PROFILE_EDITED',
+      entity: 'HelperProfile',
+      entityId: profile.userId,
+      before,
+      after: { experienceYears: profile.experienceYears, jobsShown: profile.jobsShown },
+      reason: req.body.reason || '',
+    });
+
+    res.json({
+      profile: {
+        experienceYears: profile.experienceYears,
+        jobsShown: profile.jobsShown,
+        completedJobs: profile.completedJobs,
+        jobsLabel: jobsLabel(profile),
+      },
     });
   }),
 );
@@ -280,7 +339,7 @@ router.post(
     profile.isOnline = false;
     await profile.save();
 
-    await notify(profile.userId, 'ACCOUNT_REJECTED', 'Verification needs attention', reason);
+    await notify(profile.userId, 'ACCOUNT_REJECTED', 'Verification needs attention', reason, { reason });
     await audit(req, {
       action: 'HELPER_REJECTED', entity: 'HelperProfile', entityId: profile.userId,
       before, after: { approvalStatus: profile.approvalStatus }, reason,
@@ -308,7 +367,8 @@ router.post(
     await doc.save();
 
     await notify(doc.helperId, 'DOCUMENT_REVIEWED', `Document ${status.toLowerCase()}`,
-      remark || `Your ${doc.type.replace(/_/g, ' ')} was ${status.toLowerCase()}.`);
+      remark || `Your ${doc.type.replace(/_/g, ' ')} was ${status.toLowerCase()}.`,
+      { status, docType: doc.type, remark: remark || '' });
     await audit(req, {
       action: 'DOCUMENT_REVIEWED', entity: 'HelperDocument', entityId: doc._id,
       before, after: { status }, reason: remark,
@@ -358,12 +418,18 @@ router.get(
     const [addresses, tasks, ratings] = await Promise.all([
       Address.find({ userId: user._id, active: true }).lean(),
       Task.find({ customerId: user._id }).populate('helperId', 'name phone').sort({ createdAt: -1 }).limit(20).lean(),
-      Rating.find({ toUserId: user._id }).sort({ createdAt: -1 }).limit(10).lean(),
+      Rating.find({ toUserId: user._id })
+        .populate('fromUserId', 'name role')
+        .populate('taskId', 'shortId')
+        .sort({ createdAt: -1 })
+        .limit(50)
+        .lean(),
     ]);
 
     res.json({
       customer: {
         id: String(user._id), name: user.name, phone: user.phone, email: user.email,
+        previousPhones: user.previousPhones || [],
         photoUrl: user.photoUrl, accountStatus: user.status, blockReason: user.blockReason,
         createdAt: user.createdAt,
       },
@@ -398,7 +464,7 @@ router.post(
       await JobRequest.updateMany({ helperId: user._id, status: 'SENT' }, { $set: { status: 'CANCELLED' } });
     }
 
-    await notify(user._id, 'ACCOUNT_BLOCKED', 'Account blocked', reason);
+    await notify(user._id, 'ACCOUNT_BLOCKED', 'Account blocked', reason, { reason });
     await audit(req, { action: 'USER_BLOCKED', entity: 'User', entityId: user._id, before, after: { status: 'blocked' }, reason });
 
     res.json({ ok: true, status: user.status });
@@ -512,8 +578,9 @@ router.post(
 
     await JobRequest.updateMany({ taskId: task._id, status: 'SENT' }, { $set: { status: 'CANCELLED' } });
     await closeJobAlerts(task._id);
-    await notify(updated.customerId, 'BOOKING_CANCELLED', 'Booking cancelled', reason, { taskId: String(updated._id) });
-    if (updated.helperId) await notify(updated.helperId, 'BOOKING_CANCELLED', 'Booking cancelled', reason, { taskId: String(updated._id) });
+    const cancelData = { taskId: String(updated._id), code: updated.code, reason, by: 'admin' };
+    await notify(updated.customerId, 'BOOKING_CANCELLED', 'Booking cancelled', reason, cancelData);
+    if (updated.helperId) await notify(updated.helperId, 'BOOKING_CANCELLED', 'Booking cancelled', reason, cancelData);
     await audit(req, { action: 'BOOKING_CANCELLED', entity: 'Task', entityId: task._id, before: { status: task.status }, after: { status: 'CANCELLED' }, reason });
 
     res.json({ task: serializeTask(updated) });
@@ -569,6 +636,15 @@ router.patch(
     if (req.body.durationLabel != null) service.durationLabel = String(req.body.durationLabel);
     if (req.body.category != null) service.category = String(req.body.category);
     if (req.body.icon != null) service.icon = String(req.body.icon);
+    for (const field of ['nameHi', 'descriptionHi', 'durationLabelHi']) {
+      if (req.body[field] != null) service[field] = String(req.body[field]).trim();
+    }
+    if (req.body.inclusionsHi != null) {
+      const list = Array.isArray(req.body.inclusionsHi)
+        ? req.body.inclusionsHi
+        : String(req.body.inclusionsHi).split('\n');
+      service.inclusionsHi = list.map((line) => String(line).trim()).filter(Boolean).slice(0, 12);
+    }
     if (req.body.inclusions != null) {
       const list = Array.isArray(req.body.inclusions)
         ? req.body.inclusions
@@ -686,6 +762,13 @@ router.post(
       durationLabel: req.body.durationLabel || '1 - 2 hours',
       defaultDurationMins: Number(req.body.defaultDurationMins) || 90,
       sortOrder: Number(req.body.sortOrder) || 99,
+      nameHi: String(req.body.nameHi || '').trim(),
+      descriptionHi: String(req.body.descriptionHi || '').trim(),
+      durationLabelHi: String(req.body.durationLabelHi || '').trim(),
+      inclusionsHi: (Array.isArray(req.body.inclusionsHi) ? req.body.inclusionsHi : [])
+        .map((line) => String(line).trim())
+        .filter(Boolean)
+        .slice(0, 12),
       inclusions: (Array.isArray(req.body.inclusions) ? req.body.inclusions : [])
         .map((line) => String(line).trim())
         .filter(Boolean)
@@ -853,7 +936,7 @@ router.post(
     });
 
     await notify(helper._id, 'COMMISSION_SETTLED', 'Commission cleared',
-      `₹${total} of platform commission has been marked as settled.`);
+      `₹${total} of platform commission has been marked as settled.`, { amount: total });
 
     res.json({ settled: open.length, amount: total });
   }),

@@ -23,6 +23,9 @@ const taskServiceSchema = new mongoose.Schema(
   {
     code: { type: String, required: true },
     name: { type: String, required: true },
+    // Snapshotted with the English name, so a booking reads the same in Hindi
+    // even if the catalog's Hindi copy is later changed or removed.
+    nameHi: { type: String, default: '' },
     icon: String,
     basePrice: Number,
     options: { type: mongoose.Schema.Types.Mixed, default: {} },

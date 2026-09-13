@@ -199,6 +199,7 @@ export async function dispatchTask(taskId) {
       // What the ringing notification draws. The helper sees their payout,
       // never the customer's bill — the same rule as every helper screen.
       serviceName: serviceNames,
+      serviceNameHi: task.services.map((s) => s.nameHi || s.name).join(', '),
       location: task.address?.society
         ? `${task.address.label || 'Home'} · ${task.address.line2 || ''}`.trim()
         : task.address?.label || task.address?.city || 'Nearby',
@@ -303,7 +304,7 @@ export async function acceptJob(taskId, helperId) {
     'BOOKING_ACCEPTED',
     'Helper assigned',
     `${helper?.name || 'A helper'} accepted your booking ${task.code}.`,
-    { taskId: String(task._id), code: task.code },
+    { taskId: String(task._id), code: task.code, helperName: helper?.name || '' },
   );
 
   console.log(`[match] ${task.code} accepted by ${helper?.name}`);
@@ -370,7 +371,7 @@ async function recordRejection(helperId) {
     { $set: { status: 'CANCELLED' } },
   );
 
-  await notify(user._id, 'ACCOUNT_BLOCKED', 'Account blocked', reason);
+  await notify(user._id, 'ACCOUNT_BLOCKED', 'Account blocked', reason, { reason });
 
   const admins = await User.find({ role: ROLES.ADMIN, status: 'active' }).select('_id').lean();
   await notifyMany(
@@ -444,10 +445,10 @@ async function flagOverdueTasks(now) {
   for (const task of overdue) {
     await Task.updateOne({ _id: task._id }, { $set: { overdueNotifiedAt: now } });
     await notify(task.customerId, 'TASK_OVERDUE', 'Booking still open', `${task.code} has not been closed yet.`, {
-      taskId: String(task._id),
+      taskId: String(task._id), code: task.code, role: 'customer',
     });
     await notify(task.helperId, 'TASK_OVERDUE', 'Please close this job', `${task.code} is still marked in progress.`, {
-      taskId: String(task._id),
+      taskId: String(task._id), code: task.code, role: 'helper',
     });
   }
 }

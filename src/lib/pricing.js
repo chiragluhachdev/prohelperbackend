@@ -46,6 +46,7 @@ export async function quote(selections, ctx = {}) {
     lines.push({
       code: service.code,
       name: service.name,
+      nameHi: service.nameHi || '',
       icon: service.icon,
       basePrice: service.basePrice,
       options: answers,

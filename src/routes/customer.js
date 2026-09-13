@@ -266,7 +266,7 @@ router.post(
       instant
         ? `We are finding a helper for ${task.code} right now.`
         : `We are finding a helper for ${task.code}.`,
-      { taskId: String(task._id), code: task.code });
+      { taskId: String(task._id), code: task.code, bookingType: task.bookingType });
 
     res.status(201).json({ task: serializeTask(searching || task) });
   }),
@@ -301,7 +301,7 @@ router.get(
     if (!task) throw notFound('Booking not found.');
 
     const helperProfile = task.helperId
-      ? await HelperProfile.findOne({ userId: task.helperId._id }).select('ratingAvg completedJobs').lean()
+      ? await HelperProfile.findOne({ userId: task.helperId._id }).select('ratingAvg completedJobs jobsShown experienceYears').lean()
       : null;
     const timeline = await TaskEvent.find({ taskId: task._id }).sort({ at: 1 }).lean();
 
@@ -367,7 +367,7 @@ router.post(
         wasUnderWay
           ? `The customer has stopped ${updated.code}: ${reason}`
           : `${updated.code} was cancelled by the customer. Reason: ${reason}`,
-        { taskId: String(updated._id) },
+        { taskId: String(updated._id), code: updated.code, reason, by: 'customer', stopped: wasUnderWay ? '1' : '' },
       );
     }
     res.json({ task: serializeTask(updated) });
@@ -421,7 +421,7 @@ router.post(
     await recomputeHelperRating(task.helperId);
 
     await notify(task.helperId, 'RATING_RECEIVED', 'You received a rating',
-      `${stars}★ for ${task.code}.`, { taskId: String(task._id) });
+      `${stars}★ for ${task.code}.`, { taskId: String(task._id), code: task.code, stars });
 
     res.status(201).json({ ok: true, stars });
   }),
