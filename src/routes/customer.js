@@ -6,7 +6,7 @@ import { wrap, badRequest, notFound, conflict } from '../lib/http.js';
 import { quote } from '../lib/pricing.js';
 import { serializeTask, TASK_TABS } from '../lib/views.js';
 import { newTaskCode, mustTransition, transition } from '../lib/taskflow.js';
-import { searchTimings, startSearch } from '../matching.js';
+import { searchFields, startSearch } from '../matching.js';
 import { closeJobAlerts, notify } from '../lib/notify.js';
 import { getSettings } from '../lib/settings.js';
 import { upload, uploadBuffer } from '../lib/cloudinary.js';
@@ -382,16 +382,10 @@ router.post(
     const task = await Task.findOne({ _id: req.params.id, customerId: req.user._id });
     if (!task) throw notFound('Booking not found.');
 
-    // A fresh window: helpers who declined last time may say yes now.
-    const now = new Date();
-    const { duration } = searchTimings(await getSettings());
+    // A fresh search, planned for how far away the slot now is: helpers who
+    // declined last time may say yes now.
     const updated = await transition(task._id, [TASK_STATUS.NO_HELPER_AVAILABLE], TASK_STATUS.SEARCHING, {
-      set: {
-        dispatchRound: 0,
-        searchStartedAt: now,
-        searchExpiresAt: new Date(now.getTime() + duration * 1000),
-        nextDispatchAt: now,
-      },
+      set: searchFields(task, await getSettings()),
       actorType: 'customer', actorId: req.user._id, reason: 'Customer retried the search',
     });
     if (!updated) throw conflict('This booking is not waiting for a helper.', 'INVALID_STATE');

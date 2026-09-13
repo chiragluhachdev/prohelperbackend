@@ -4,6 +4,8 @@
  *
  *   node tests/smoke.mjs
  */
+import { planSearch, waveDueAt } from '../src/lib/searchPlan.js';
+
 const BASE = process.env.API || 'http://localhost:4100';
 let pass = 0, fail = 0;
 
@@ -235,12 +237,12 @@ await api('/api/admin/settings', {
 await api('/api/helper/online', { method: 'POST', token: helperA, body: { isOnline: false } });
 await api('/api/helper/online', { method: 'POST', token: helperB, body: { isOnline: false } });
 
-const quietSlot = outOfHoursSlot();
+// Instant: a booking for later has no quick close — it searches in waves.
 const quiet = await api('/api/customer/tasks', {
   method: 'POST', token: customerToken,
   body: {
     services: [{ code: 'bathroom', options: {} }],
-    addressId, date: quietSlot.date, time: quietSlot.time,
+    addressId, bookingType: 'instant',
     idempotencyKey: `smoke-quiet-${Date.now()}`,
   },
 });
@@ -323,6 +325,65 @@ await api('/api/admin/settings', {
   method: 'PUT', token: adminToken,
   body: {
     search_duration_seconds: liveMatching.search_duration_seconds,
+    renotify_interval_seconds: liveMatching.renotify_interval_seconds,
+    accept_window_seconds: liveMatching.accept_window_seconds,
+  },
+});
+
+// ------------------------------------------ bookings for later: waves, no timer
+console.log('\n9c. Bookings for later');
+
+const planSettings = {
+  search_duration_seconds: 300, renotify_interval_seconds: 90, accept_window_seconds: 60,
+  scheduled_notify_waves: 5, scheduled_close_minutes_before: 30,
+};
+const t0 = Date.parse('2026-09-14T10:00:00');
+const far = planSearch({ now: t0, bookingType: 'scheduled', scheduledAt: '2026-09-14T18:00:00', settings: planSettings });
+ok('a booking hours away searches in waves, not on a timer', far.mode === 'scheduled' && far.waves === 5, JSON.stringify(far));
+ok('its search closes 30 minutes before the slot',
+  far.expiresAt.getTime() === Date.parse('2026-09-14T17:30:00'), far.expiresAt.toISOString());
+const waveTimes = [0, 1, 2, 3, 4].map((i) => new Date(waveDueAt(t0, far.expiresAt, 5, i)).toTimeString().slice(0, 5));
+ok('the waves are spread evenly across that time',
+  waveTimes.join(' ') === '10:00 11:30 13:00 14:30 16:00', waveTimes.join(' '));
+
+const soon = planSearch({ now: t0, bookingType: 'scheduled', scheduledAt: '2026-09-14T10:35:00', settings: planSettings });
+ok('a "later" slot too close for waves is searched the instant way', soon.mode === 'instant', JSON.stringify(soon));
+const now1 = planSearch({ now: t0, bookingType: 'instant', scheduledAt: '2026-09-14T10:00:00', settings: planSettings });
+ok('an instant booking keeps its five-minute window',
+  now1.mode === 'instant' && now1.expiresAt.getTime() - t0 === 300_000, JSON.stringify(now1));
+
+// Live: a slot next Sunday. One wave now, and no reminders between waves even
+// with the reminder interval turned right down.
+await api('/api/admin/settings', {
+  method: 'PUT', token: adminToken, body: { renotify_interval_seconds: 3, accept_window_seconds: 2 },
+});
+await api('/api/helper/online', { method: 'POST', token: helperB, body: { isOnline: true } });
+const laterSlot = outOfHoursSlot();
+const later = (await api('/api/customer/tasks', {
+  method: 'POST', token: customerToken,
+  body: {
+    services: [{ code: 'sofa', options: {} }], addressId, date: laterSlot.date, time: laterSlot.time,
+    idempotencyKey: `smoke-later-${Date.now()}`,
+  },
+})).task;
+ok('a booking for later is marked as a wave search',
+  later?.searchMode === 'scheduled' &&
+  Date.parse(later.searchExpiresAt) === Date.parse(later.scheduledAt) - 30 * 60_000,
+  JSON.stringify({ mode: later?.searchMode, closes: later?.searchExpiresAt, slot: later?.scheduledAt }));
+
+let laterAlerts = [];
+for (let i = 0; i < 20 && laterAlerts.length < 1; i += 1) { await sleep(300); laterAlerts = await alertsFor(later.id); }
+ok('the first wave alerts available helpers straight away', laterAlerts.length === 1, String(laterAlerts.length));
+await sleep(7000);
+ok('and nobody is reminded between waves', (await alertsFor(later.id)).length === 1, String((await alertsFor(later.id)).length));
+ok('the booking is still searching — no countdown closed it',
+  (await api(`/api/customer/tasks/${later.id}`, { token: customerToken })).task?.status === 'SEARCHING');
+
+await api(`/api/customer/tasks/${later.id}/cancel`, { method: 'POST', token: customerToken, body: { reason: 'Smoke test cleanup' } });
+await api('/api/helper/online', { method: 'POST', token: helperB, body: { isOnline: false } });
+await api('/api/admin/settings', {
+  method: 'PUT', token: adminToken,
+  body: {
     renotify_interval_seconds: liveMatching.renotify_interval_seconds,
     accept_window_seconds: liveMatching.accept_window_seconds,
   },

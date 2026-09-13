@@ -86,6 +86,12 @@ export const DEFAULT_SETTINGS = {
    */
   search_duration_seconds: 300,    // 5 minutes
   renotify_interval_seconds: 90,   // an unanswered helper is alerted again this often
+  /*
+   * Bookings for later have no countdown. The time until shortly before the
+   * slot is split into this many evenly spaced alert waves.
+   */
+  scheduled_notify_waves: 5,
+  scheduled_close_minutes_before: 30, // stop searching this long before the slot
   /**
    * MVP: alert every eligible helper regardless of distance.
    *

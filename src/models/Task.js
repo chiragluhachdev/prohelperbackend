@@ -104,6 +104,11 @@ const taskSchema = new mongoose.Schema(
     /** When the current search gives up. Set at the start of each search, so a
         settings change mid-search does not move a customer's deadline. */
     searchExpiresAt: Date,
+    /** 'instant': short window with reminders. 'scheduled': spread-out waves, no countdown. */
+    searchMode: { type: String, enum: ['instant', 'scheduled'], default: 'instant' },
+    /** Scheduled searches only: how many waves were planned, and how many have gone out. */
+    searchWaves: { type: Number, default: 0 },
+    wavesSent: { type: Number, default: 0 },
     dispatchRound: { type: Number, default: 0 },
     nextDispatchAt: { type: Date, index: true },
 

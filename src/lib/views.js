@@ -63,6 +63,7 @@ export function serializeTask(task, { audience = 'customer', helperProfile = nul
     bookingType: t.bookingType || 'scheduled',
     searchStartedAt: t.searchStartedAt,
     searchExpiresAt: t.searchExpiresAt,
+    searchMode: t.searchMode || 'instant',
     scheduledAt: t.scheduledAt,
     scheduledDate: t.scheduledDate,
     scheduledTime: t.scheduledTime,

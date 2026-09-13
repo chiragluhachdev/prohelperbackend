@@ -6,6 +6,9 @@ import { distanceKm, boundingBox } from './lib/geo.js';
 import { closeJobAlerts, notify, notifyMany } from './lib/notify.js';
 import { transition } from './lib/taskflow.js';
 import { conflict } from './lib/http.js';
+import { EMPTY_WAVE_RECHECK_MS, planSearch, searchTimings, waveDueAt } from './lib/searchPlan.js';
+
+export { searchTimings, planSearch };
 
 /**
  * UC-C08 — who is allowed to be alerted for this task.
@@ -115,29 +118,26 @@ async function busyHelperIds(task) {
 }
 
 /** Moves a freshly created task into SEARCHING and asks for an immediate first wave. */
-/**
- * The cadence of a search, from settings, clamped to values that make sense
- * together: an alert never rings longer than the gap before the next one, and
- * the scan runs often enough that a helper coming online is alerted promptly.
- */
-export function searchTimings(settings) {
-  const duration = Math.max(10, Number(settings.search_duration_seconds) || 300);
-  const interval = Math.max(2, Number(settings.renotify_interval_seconds) || 90);
-  const ring = Math.min(Math.max(2, Number(settings.accept_window_seconds) || 60), interval);
-  const scan = Math.min(10, Math.max(2, Math.floor(ring / 3)));
-  return { duration, interval, ring, scan };
+/** The fields that start (or restart) a search, planned for this booking. */
+export function searchFields(booking, settings, now = new Date()) {
+  const plan = planSearch({ now, bookingType: booking.bookingType, scheduledAt: booking.scheduledAt, settings });
+  return {
+    searchStartedAt: now,
+    searchExpiresAt: plan.expiresAt,
+    searchMode: plan.mode,
+    searchWaves: plan.waves,
+    wavesSent: 0,
+    nextDispatchAt: now,
+    dispatchRound: 0,
+  };
 }
 
 export async function startSearch(taskId, actorId) {
   const settings = await getSettings();
-  const now = new Date();
+  const booking = await Task.findById(taskId).select('bookingType scheduledAt').lean();
+  if (!booking) return null;
   const task = await transition(taskId, [TASK_STATUS.CREATED], TASK_STATUS.SEARCHING, {
-    set: {
-      searchStartedAt: now,
-      searchExpiresAt: new Date(now.getTime() + searchTimings(settings).duration * 1000),
-      nextDispatchAt: now,
-      dispatchRound: 0,
-    },
+    set: searchFields(booking, settings),
     actorType: 'customer',
     actorId,
     reason: 'Booking confirmed',
@@ -173,6 +173,7 @@ export async function dispatchTask(taskId) {
   const deadline = task.searchExpiresAt || new Date(startedAt.getTime() + duration * 1000);
   if (now >= deadline) return exhaust(task, 'Nobody accepted within the search window');
 
+  const scheduled = task.searchMode === 'scheduled';
   const ignoreLocation = settings.match_ignore_location !== false;
   // With location on, the net widens a step each re-notify interval.
   const radiusKm =
@@ -198,17 +199,30 @@ export async function dispatchTask(taskId) {
       fresh.push(c); // not yet alerted in this search
     } else if (last.status === 'SENT' && last.expiresAt > now) {
       // still ringing — leave it alone
-    } else if (now - last.sentAt >= interval * 1000) {
-      renotify.push(c); // unanswered, and their interval has passed
+    } else if (scheduled || now - last.sentAt >= interval * 1000) {
+      // Unanswered: reminded when their interval passes — or, for a booking
+      // for later, at every wave.
+      renotify.push(c);
     }
   }
 
+  /*
+   * A scheduled search only alerts on its waves. Between them it does
+   * nothing but wake at the next one; the close still ends it on time.
+   */
+  const wavesPlanned = task.searchWaves || 1;
+  const wavesSent = task.wavesSent || 0;
+  const waveAt = scheduled ? waveDueAt(startedAt, deadline, wavesPlanned, wavesSent) : null;
+  const alertingNow = !scheduled || (wavesSent < wavesPlanned && now >= waveAt);
+
   const newcomers = ignoreLocation ? fresh : fresh.slice(0, settings.dispatch_batch_size);
-  const batch = [...renotify, ...newcomers];
+  const batch = alertingNow ? [...renotify, ...newcomers] : [];
   const remainingMs = deadline - now;
+  let sent = false;
 
   // An alert with only a few seconds left to answer helps nobody.
   if (batch.length && remainingMs >= Math.min(15_000, ring * 1000)) {
+    sent = true;
     const expiresAt = new Date(Math.min(now.getTime() + ring * 1000, deadline.getTime()));
     const ids = batch.map((c) => c.helperId);
 
@@ -260,15 +274,37 @@ export async function dispatchTask(taskId) {
 
     console.log(
       `[match] ${task.code} → ${newcomers.length} new, ${renotify.length} re-notified` +
+        (scheduled ? ` (wave ${wavesSent + 1}/${wavesPlanned})` : '') +
         (ignoreLocation ? ' (all areas)' : ` within ${radiusKm}km`) +
         ` · ${Math.round(remainingMs / 1000)}s left`,
     );
   }
 
-  // Look again shortly — a helper may come online — but never past the deadline.
+  let nextAt;
+  const update = {};
+  if (!scheduled) {
+    // Look again shortly — a helper may come online.
+    nextAt = now.getTime() + scan * 1000;
+  } else if (!alertingNow) {
+    // Between waves: sleep until the next one, or the close.
+    nextAt = wavesSent < wavesPlanned ? waveAt.getTime() : deadline.getTime();
+  } else if (sent) {
+    // A wave went out: the next is on the plan's timetable.
+    update.wavesSent = wavesSent + 1;
+    nextAt = wavesSent + 1 < wavesPlanned
+      ? waveDueAt(startedAt, deadline, wavesPlanned, wavesSent + 1).getTime()
+      : deadline.getTime();
+  } else if (remainingMs < Math.min(15_000, ring * 1000)) {
+    nextAt = deadline.getTime();
+  } else {
+    // Nobody available for this wave. Do not spend it: look again soon, so a
+    // helper who comes online now is not left waiting hours for the next one.
+    nextAt = now.getTime() + EMPTY_WAVE_RECHECK_MS;
+  }
+
   await Task.updateOne(
     { _id: task._id, status: TASK_STATUS.SEARCHING },
-    { $set: { nextDispatchAt: new Date(Math.min(now.getTime() + scan * 1000, deadline.getTime())) } },
+    { $set: { ...update, nextDispatchAt: new Date(Math.min(nextAt, deadline.getTime())) } },
   );
   return batch;
 }
