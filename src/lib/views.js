@@ -61,6 +61,8 @@ export function serializeTask(task, { audience = 'customer', helperProfile = nul
     })),
     address: t.address,
     bookingType: t.bookingType || 'scheduled',
+    searchStartedAt: t.searchStartedAt,
+    searchExpiresAt: t.searchExpiresAt,
     scheduledAt: t.scheduledAt,
     scheduledDate: t.scheduledDate,
     scheduledTime: t.scheduledTime,

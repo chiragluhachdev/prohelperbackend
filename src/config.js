@@ -79,7 +79,13 @@ export const DEFAULT_SETTINGS = {
   // --- matching (UC-C08 / UC-C10 / UC-C12) ---
   search_radius_km: 12,          // covers most of a metro on the first wave
   radius_step_km: 15,            // widen by this much each dispatch round
-  max_dispatch_rounds: 3,
+  /*
+   * The search is a window, not a fixed number of rounds: it stays open this
+   * long, alerting helpers as they become available, then closes as
+   * NO_HELPER_AVAILABLE.
+   */
+  search_duration_seconds: 300,    // 5 minutes
+  renotify_interval_seconds: 90,   // an unanswered helper is alerted again this often
   /**
    * MVP: alert every eligible helper regardless of distance.
    *
@@ -88,8 +94,8 @@ export const DEFAULT_SETTINGS = {
    * service-area checks are skipped. Set to false to switch the radius back on.
    */
   match_ignore_location: true,
-  dispatch_batch_size: 3,         // helpers alerted simultaneously per round
-  accept_window_seconds: 60,      // the 60-second accept window
+  dispatch_batch_size: 3,         // with location on: new helpers alerted at a time, nearest first
+  accept_window_seconds: 60,      // how long each alert rings (never longer than the re-notify interval)
   // --- money (UC-C29 / UC-C30 / UC-C31) ---
   platform_fee_percent: 5,        // customer-side service fee
   helper_commission_percent: 15,  // deducted from the helper's gross

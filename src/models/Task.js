@@ -101,6 +101,9 @@ const taskSchema = new mongoose.Schema(
 
     // --- matching bookkeeping ---
     searchStartedAt: Date,
+    /** When the current search gives up. Set at the start of each search, so a
+        settings change mid-search does not move a customer's deadline. */
+    searchExpiresAt: Date,
     dispatchRound: { type: Number, default: 0 },
     nextDispatchAt: { type: Date, index: true },
 

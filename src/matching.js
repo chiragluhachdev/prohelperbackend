@@ -115,9 +115,29 @@ async function busyHelperIds(task) {
 }
 
 /** Moves a freshly created task into SEARCHING and asks for an immediate first wave. */
+/**
+ * The cadence of a search, from settings, clamped to values that make sense
+ * together: an alert never rings longer than the gap before the next one, and
+ * the scan runs often enough that a helper coming online is alerted promptly.
+ */
+export function searchTimings(settings) {
+  const duration = Math.max(10, Number(settings.search_duration_seconds) || 300);
+  const interval = Math.max(2, Number(settings.renotify_interval_seconds) || 90);
+  const ring = Math.min(Math.max(2, Number(settings.accept_window_seconds) || 60), interval);
+  const scan = Math.min(10, Math.max(2, Math.floor(ring / 3)));
+  return { duration, interval, ring, scan };
+}
+
 export async function startSearch(taskId, actorId) {
+  const settings = await getSettings();
+  const now = new Date();
   const task = await transition(taskId, [TASK_STATUS.CREATED], TASK_STATUS.SEARCHING, {
-    set: { searchStartedAt: new Date(), nextDispatchAt: new Date(), dispatchRound: 0 },
+    set: {
+      searchStartedAt: now,
+      searchExpiresAt: new Date(now.getTime() + searchTimings(settings).duration * 1000),
+      nextDispatchAt: now,
+      dispatchRound: 0,
+    },
     actorType: 'customer',
     actorId,
     reason: 'Booking confirmed',
@@ -132,91 +152,123 @@ export async function startSearch(taskId, actorId) {
  */
 export async function dispatchTask(taskId) {
   const settings = await getSettings();
+  const { duration, interval, ring, scan } = searchTimings(settings);
   const now = new Date();
 
-  // Claim the task for this round so two ticks can never dispatch it at once.
+  // Claim the task for this pass so two ticks can never work on it at once.
   const task = await Task.findOneAndUpdate(
     { _id: taskId, status: TASK_STATUS.SEARCHING, nextDispatchAt: { $lte: now } },
-    { $set: { nextDispatchAt: new Date(now.getTime() + 5 * 60_000) }, $inc: { dispatchRound: 1 } },
+    { $set: { nextDispatchAt: new Date(now.getTime() + 60_000) }, $inc: { dispatchRound: 1 } },
     { new: true },
   );
   if (!task) return null; // already assigned, cancelled, or another tick has it
 
-  const round = task.dispatchRound;
-  if (round > settings.max_dispatch_rounds) {
-    return exhaust(task, 'Searched every nearby helper');
-  }
+  /*
+   * One search is a window of time. Inside it, every pass does two things:
+   * alerts helpers who have just become available, and re-alerts any helper
+   * who was alerted but has neither accepted nor declined, once their own
+   * re-notify interval has passed. When the window closes, the search ends.
+   */
+  const startedAt = task.searchStartedAt || task.createdAt;
+  const deadline = task.searchExpiresAt || new Date(startedAt.getTime() + duration * 1000);
+  if (now >= deadline) return exhaust(task, 'Nobody accepted within the search window');
 
-  // Widen the net each round: the first wave goes to the closest helpers, later
-  // waves reach further out (UC-C08).
   const ignoreLocation = settings.match_ignore_location !== false;
-  const radiusKm = settings.search_radius_km + (round - 1) * settings.radius_step_km;
-  const alreadyTried = await JobRequest.find({ taskId: task._id }).distinct('helperId');
-  const candidates = await findEligibleHelpers(task, {
-    radiusKm,
-    excludeHelperIds: alreadyTried,
-    ignoreLocation,
-  });
+  // With location on, the net widens a step each re-notify interval.
+  const radiusKm =
+    settings.search_radius_km + Math.floor((now - startedAt) / (interval * 1000)) * settings.radius_step_km;
 
-  if (candidates.length === 0) {
-    // Nothing new within this radius — widen next round, or give up.
-    if (round >= settings.max_dispatch_rounds) return exhaust(task, 'No helper accepted the request');
-    await Task.updateOne({ _id: task._id }, { $set: { nextDispatchAt: new Date() } });
-    return null;
+  // Every alert this task has ever sent, newest first per helper.
+  const history = await JobRequest.find({ taskId: task._id }).sort({ round: -1 }).lean();
+  const latest = new Map();
+  for (const r of history) if (!latest.has(String(r.helperId))) latest.set(String(r.helperId), r);
+
+  // A helper who declined during THIS search is never asked again in it.
+  const declined = [...latest.values()]
+    .filter((r) => r.status === 'DECLINED' && r.sentAt >= startedAt)
+    .map((r) => r.helperId);
+
+  const candidates = await findEligibleHelpers(task, { radiusKm, excludeHelperIds: declined, ignoreLocation });
+
+  const fresh = [];
+  const renotify = [];
+  for (const c of candidates) {
+    const last = latest.get(String(c.helperId));
+    if (!last || last.sentAt < startedAt) {
+      fresh.push(c); // not yet alerted in this search
+    } else if (last.status === 'SENT' && last.expiresAt > now) {
+      // still ringing — leave it alone
+    } else if (now - last.sentAt >= interval * 1000) {
+      renotify.push(c); // unanswered, and their interval has passed
+    }
   }
 
-  // Location off means there is no "nearest few" to pick — everyone eligible
-  // gets the alert and the first to accept wins.
-  const batch = ignoreLocation ? candidates : candidates.slice(0, settings.dispatch_batch_size);
+  const newcomers = ignoreLocation ? fresh : fresh.slice(0, settings.dispatch_batch_size);
+  const batch = [...renotify, ...newcomers];
+  const remainingMs = deadline - now;
 
-  const expiresAt = new Date(now.getTime() + settings.accept_window_seconds * 1000);
+  // An alert with only a few seconds left to answer helps nobody.
+  if (batch.length && remainingMs >= Math.min(15_000, ring * 1000)) {
+    const expiresAt = new Date(Math.min(now.getTime() + ring * 1000, deadline.getTime()));
+    const ids = batch.map((c) => c.helperId);
 
-  await JobRequest.insertMany(
-    batch.map((c) => ({
-      taskId: task._id,
-      helperId: c.helperId,
-      round,
-      status: 'SENT',
-      distanceKm: c.distanceKm,
-      matchedAllServices: c.matchedAllServices,
-      sentAt: now,
-      expiresAt,
-      notificationStatus: 'SENT',
-    })),
-    { ordered: false },
-  );
+    // A helper only ever has one live alert per job.
+    await JobRequest.updateMany({ taskId: task._id, helperId: { $in: ids }, status: 'SENT' }, { $set: { status: 'EXPIRED' } });
 
-  const serviceNames = task.services.map((s) => s.name).join(', ');
-  await notifyMany(
-    batch.map((c) => c.helperId),
-    'JOB_REQUEST',
-    'New job request',
-    `${serviceNames} · ${task.address?.label || task.address?.city || 'Nearby'}`,
-    {
+    await JobRequest.insertMany(
+      batch.map((c) => ({
+        taskId: task._id,
+        helperId: c.helperId,
+        // Counts every alert this helper has had for this job, across searches.
+        round: (latest.get(String(c.helperId))?.round || 0) + 1,
+        status: 'SENT',
+        distanceKm: c.distanceKm,
+        matchedAllServices: c.matchedAllServices,
+        sentAt: now,
+        expiresAt,
+        notificationStatus: 'SENT',
+      })),
+      { ordered: false },
+    );
+
+    const serviceNames = task.services.map((sv) => sv.name).join(', ');
+    const pushData = {
       taskId: String(task._id),
       code: task.code,
       expiresAt,
       // What the ringing notification draws. The helper sees their payout,
       // never the customer's bill — the same rule as every helper screen.
       serviceName: serviceNames,
-      serviceNameHi: task.services.map((s) => s.nameHi || s.name).join(', '),
+      serviceNameHi: task.services.map((sv) => sv.nameHi || sv.name).join(', '),
       location: task.address?.society
         ? `${task.address.label || 'Home'} · ${task.address.line2 || ''}`.trim()
         : task.address?.label || task.address?.city || 'Nearby',
       price: task.pricing?.helperPayout ?? '',
       bookingType: task.bookingType || 'scheduled',
-    },
-  );
+    };
+    const title = 'New job request';
+    const body = `${serviceNames} · ${task.address?.label || task.address?.city || 'Nearby'}`;
 
-  // Wake up just after this wave lapses to run the next one.
+    // First alert: an entry in their notifications list, and the phone rings.
+    if (newcomers.length) {
+      await notifyMany(newcomers.map((c) => c.helperId), 'JOB_REQUEST', title, body, pushData);
+    }
+    // Reminders ring the phone again but do not pile duplicates into the list.
+    if (renotify.length) {
+      await notifyMany(renotify.map((c) => c.helperId), 'JOB_REQUEST', title, body, pushData, { store: false });
+    }
+
+    console.log(
+      `[match] ${task.code} → ${newcomers.length} new, ${renotify.length} re-notified` +
+        (ignoreLocation ? ' (all areas)' : ` within ${radiusKm}km`) +
+        ` · ${Math.round(remainingMs / 1000)}s left`,
+    );
+  }
+
+  // Look again shortly — a helper may come online — but never past the deadline.
   await Task.updateOne(
-    { _id: task._id },
-    { $set: { nextDispatchAt: new Date(expiresAt.getTime() + 1000) } },
-  );
-
-  console.log(
-    `[match] ${task.code} round ${round} → ${batch.length} helper(s)` +
-      (ignoreLocation ? ' (all areas)' : ` within ${radiusKm}km`),
+    { _id: task._id, status: TASK_STATUS.SEARCHING },
+    { $set: { nextDispatchAt: new Date(Math.min(now.getTime() + scan * 1000, deadline.getTime())) } },
   );
   return batch;
 }
@@ -230,12 +282,18 @@ async function exhaust(task, reason) {
   });
   if (updated) {
     await JobRequest.updateMany({ taskId: task._id, status: 'SENT' }, { $set: { status: 'CANCELLED' } });
+    await closeJobAlerts(task._id);
     await notify(
       task.customerId,
       'NO_HELPER_AVAILABLE',
       'No helper available',
-      'We could not find a helper for this slot. Try another time or service.',
-      { taskId: String(task._id), code: task.code },
+      'We could not find a helper this time. Tap to search again.',
+      {
+        taskId: String(task._id),
+        code: task.code,
+        serviceName: task.services.map((sv) => sv.name).join(', '),
+        serviceNameHi: task.services.map((sv) => sv.nameHi || sv.name).join(', '),
+      },
     );
     console.log(`[match] ${task.code} → NO_HELPER_AVAILABLE (${reason})`);
   }
@@ -253,18 +311,21 @@ async function exhaust(task, reason) {
 export async function acceptJob(taskId, helperId) {
   const now = new Date();
 
-  const request = await JobRequest.findOneAndUpdate(
-    { taskId, helperId, status: 'SENT', expiresAt: { $gt: now } },
-    { $set: { status: 'ACCEPTED', respondedAt: now } },
-    { new: true, sort: { round: -1 } },
-  );
-  if (!request) {
-    const any = await JobRequest.findOne({ taskId, helperId }).sort({ round: -1 }).lean();
-    if (any?.status === 'EXPIRED' || (any && any.expiresAt <= now)) {
-      throw conflict('That request timed out.', 'REQUEST_EXPIRED');
-    }
+  /*
+   * A helper can take the job at any point while it is still being searched
+   * for, as long as they were alerted and have not declined. A reminder that
+   * has stopped ringing is not a "no" — only Decline is.
+   */
+  const latest = await JobRequest.findOne({ taskId, helperId }).sort({ round: -1 }).lean();
+  if (!latest || !['SENT', 'EXPIRED'].includes(latest.status)) {
     throw conflict('This job is no longer available.', 'REQUEST_NOT_AVAILABLE');
   }
+  const request = await JobRequest.findOneAndUpdate(
+    { _id: latest._id, status: latest.status },
+    { $set: { status: 'ACCEPTED', respondedAt: now } },
+    { new: true },
+  );
+  if (!request) throw conflict('This job is no longer available.', 'REQUEST_NOT_AVAILABLE');
 
   const task = await transition(taskId, [TASK_STATUS.SEARCHING], TASK_STATUS.ACCEPTED, {
     set: { helperId, acceptedAt: now, nextDispatchAt: null },
@@ -275,9 +336,13 @@ export async function acceptJob(taskId, helperId) {
   });
 
   if (!task) {
-    // Someone else won the race in between. Undo our claim on the request.
+    // Undo our claim on the request, then say what actually happened.
     await JobRequest.updateOne({ _id: request._id }, { $set: { status: 'CANCELLED' } });
-    throw conflict('This job has just been taken by another helper.', 'TASK_ALREADY_ASSIGNED');
+    const current = await Task.findById(taskId).select('status helperId').lean();
+    if (current?.helperId) {
+      throw conflict('This job has just been taken by another helper.', 'TASK_ALREADY_ASSIGNED');
+    }
+    throw conflict('This job is no longer available.', 'REQUEST_NOT_AVAILABLE');
   }
 
   // Stand every other outstanding alert down.
@@ -304,7 +369,13 @@ export async function acceptJob(taskId, helperId) {
     'BOOKING_ACCEPTED',
     'Helper assigned',
     `${helper?.name || 'A helper'} accepted your booking ${task.code}.`,
-    { taskId: String(task._id), code: task.code, helperName: helper?.name || '' },
+    {
+      taskId: String(task._id),
+      code: task.code,
+      helperName: helper?.name || '',
+      serviceName: task.services.map((sv) => sv.name).join(', '),
+      serviceNameHi: task.services.map((sv) => sv.nameHi || sv.name).join(', '),
+    },
   );
 
   console.log(`[match] ${task.code} accepted by ${helper?.name}`);
@@ -314,25 +385,21 @@ export async function acceptJob(taskId, helperId) {
 /** UC-C11 — decline. Recorded, then the search moves on straight away. */
 export async function declineJob(taskId, helperId) {
   const now = new Date();
+  /*
+   * Declining is final for this search: the helper is not reminded again. It
+   * no longer brings the next pass forward either — the search is a window of
+   * time, and helpers still ringing, or about to come online, keep their turn.
+   */
+  const latest = await JobRequest.findOne({ taskId, helperId }).sort({ round: -1 }).lean();
+  if (!latest || !['SENT', 'EXPIRED'].includes(latest.status)) {
+    throw conflict('This request is no longer open.', 'REQUEST_NOT_AVAILABLE');
+  }
   const request = await JobRequest.findOneAndUpdate(
-    { taskId, helperId, status: 'SENT' },
+    { _id: latest._id, status: latest.status },
     { $set: { status: 'DECLINED', respondedAt: now } },
-    { new: true, sort: { round: -1 } },
+    { new: true },
   );
   if (!request) throw conflict('This request is no longer open.', 'REQUEST_NOT_AVAILABLE');
-
-  // If that was the last live alert, don't wait out the timer — search again now.
-  const stillWaiting = await JobRequest.countDocuments({
-    taskId,
-    status: 'SENT',
-    expiresAt: { $gt: now },
-  });
-  if (stillWaiting === 0) {
-    await Task.updateOne(
-      { _id: taskId, status: TASK_STATUS.SEARCHING },
-      { $set: { nextDispatchAt: now } },
-    );
-  }
 
   await recordRejection(helperId);
   return request;

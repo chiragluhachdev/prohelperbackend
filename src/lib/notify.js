@@ -2,24 +2,30 @@ import { JobRequest, Notification, User } from '../models/index.js';
 import { sendDataPush } from './fcm.js';
 
 /**
- * Writes an in-app notification. Also pushes high-priority FCM messages
- * to helpers for new job requests.
+ * The notifications that also go to the phone as a push.
+ *
+ * A job request rings a helper. The two moments a customer is waiting on once
+ * they have left the booking screen — a helper taking the job, or the search
+ * ending without one — arrive as ordinary notifications. Everything else
+ * stays in the in-app list.
  */
+const PUSHED = new Set(['JOB_REQUEST', 'BOOKING_ACCEPTED', 'NO_HELPER_AVAILABLE']);
+
+async function pushTo(userIds, type, title, body, data) {
+  if (!PUSHED.has(type)) return;
+  const users = await User.find({ _id: { $in: userIds }, fcmToken: { $ne: null } }).select('fcmToken').lean();
+  // One batched call: sending in turn would delay the last phone by every send before it.
+  await sendDataPush(users.map((u) => u.fcmToken), { type, title, body, ...data }).catch((err) =>
+    console.error('[notify] push failed', err.message),
+  );
+}
+
+/** Writes an in-app notification, and pushes it to the phone when it matters. */
 export async function notify(userId, type, title, body = '', data = {}) {
   if (!userId) return null;
   try {
     const doc = await Notification.create({ userId, type, title, body, data });
-    
-    // Only job requests ring the phone.
-    if (type === 'JOB_REQUEST') {
-      const user = await User.findById(userId).select('fcmToken').lean();
-      if (user?.fcmToken) {
-        await sendDataPush(user.fcmToken, { type, title, body, ...data }).catch((err) =>
-          console.error('[notify] push failed', err.message),
-        );
-      }
-    }
-    
+    await pushTo([userId], type, title, body, data);
     return doc;
   } catch (err) {
     console.error('[notify] failed', type, err.message);
@@ -27,24 +33,21 @@ export async function notify(userId, type, title, body = '', data = {}) {
   }
 }
 
-export async function notifyMany(userIds, type, title, body = '', data = {}) {
-  const docs = userIds.filter(Boolean).map((userId) => ({ userId, type, title, body, data }));
-  if (!docs.length) return [];
+/**
+ * The same, for many people at once.
+ *
+ * `store: false` pushes without adding to anyone's list — for reminders, which
+ * ring the phone again but should not stack up as duplicates of an entry the
+ * helper already has.
+ */
+export async function notifyMany(userIds, type, title, body = '', data = {}, { store = true } = {}) {
+  const ids = userIds.filter(Boolean);
+  if (!ids.length) return [];
   try {
-    const result = await Notification.insertMany(docs, { ordered: false });
-    
-    if (type === 'JOB_REQUEST') {
-      const users = await User.find({ _id: { $in: userIds }, fcmToken: { $ne: null } })
-        .select('fcmToken')
-        .lean();
-      /* One batched call for the whole wave. Awaiting each helper in turn
-         delayed the last helper's alert by every send before it — eating into
-         their 60-second window before their phone had even rung. */
-      await sendDataPush(users.map((u) => u.fcmToken), { type, title, body, ...data }).catch((err) =>
-        console.error('[notify] push failed', err.message),
-      );
-    }
-    
+    const result = store
+      ? await Notification.insertMany(ids.map((userId) => ({ userId, type, title, body, data })), { ordered: false })
+      : [];
+    await pushTo(ids, type, title, body, data);
     return result;
   } catch (err) {
     console.error('[notify] bulk failed', type, err.message);

@@ -223,6 +223,12 @@ ok('a second rating is refused', rate2.status === 409);
 
 // -------------------------------------------------- Test 4: no helper
 console.log('\n9. Nobody available');
+// The real window is five minutes. Shrink it for the test, restore it after.
+const liveMatching = (await api('/api/admin/settings', { token: adminToken })).settings;
+await api('/api/admin/settings', {
+  method: 'PUT', token: adminToken,
+  body: { search_duration_seconds: 8, renotify_interval_seconds: 4, accept_window_seconds: 3 },
+});
 // Working hours no longer create this condition — the demo helpers work around
 // the clock and location filtering is off — so make it real: take everyone
 // offline and confirm the search exhausts rather than hanging.
@@ -248,6 +254,80 @@ ok('with nobody online the search ends as NO_HELPER_AVAILABLE',
 
 const retried = await api(`/api/customer/tasks/${quiet.task.id}/retry`, { method: 'POST', token: customerToken });
 ok('customer can retry the search', retried.task?.status === 'SEARCHING', JSON.stringify(retried.error));
+// ----------------------------------------- the search window and reminders
+console.log('\n9a. Reminders inside the search window');
+await api('/api/admin/settings', {
+  method: 'PUT', token: adminToken,
+  body: { search_duration_seconds: 16, renotify_interval_seconds: 5, accept_window_seconds: 3 },
+});
+await api('/api/helper/online', { method: 'POST', token: helperB, body: { isOnline: true } });
+
+const windowTask = (await api('/api/customer/tasks', {
+  method: 'POST', token: customerToken,
+  body: { services: [{ code: 'kitchen', options: {} }], addressId, bookingType: 'instant', idempotencyKey: `smoke-window-${Date.now()}` },
+})).task;
+ok('a booking records when its search will close',
+  windowTask?.searchExpiresAt && new Date(windowTask.searchExpiresAt) > new Date(), JSON.stringify(windowTask?.searchExpiresAt));
+
+const alertsFor = async (id) =>
+  ((await api(`/api/admin/bookings/${id}`, { token: adminToken })).requests ?? []).filter((r) => r.helper?.id === helperBId);
+
+let bAlerts = [];
+for (let i = 0; i < 20 && bAlerts.length < 1; i += 1) { await sleep(300); bAlerts = await alertsFor(windowTask.id); }
+ok('an available helper is alerted straight away', bAlerts.length === 1, String(bAlerts.length));
+
+// Helper B neither accepts nor declines: after the interval they are reminded.
+for (let i = 0; i < 30 && bAlerts.length < 2; i += 1) { await sleep(400); bAlerts = await alertsFor(windowTask.id); }
+ok('an unanswered helper is reminded after the interval', bAlerts.length >= 2, String(bAlerts.length));
+
+const bNotes = (await api('/api/notifications', { token: helperB })).notifications ?? [];
+ok('a reminder rings again without a duplicate in their list',
+  bNotes.filter((n) => n.type === 'JOB_REQUEST' && n.data?.taskId === windowTask.id).length === 1,
+  String(bNotes.filter((n) => n.data?.taskId === windowTask.id).length));
+
+// Declining ends the reminders for them.
+const declineWindow = await api(`/api/helper/requests/${windowTask.id}/decline`, { method: 'POST', token: helperB });
+ok('an unanswered alert can still be declined', declineWindow.ok === true, JSON.stringify(declineWindow.error));
+const afterDecline = (await alertsFor(windowTask.id)).length;
+await sleep(6500);
+ok('a helper who declined is not reminded again', (await alertsFor(windowTask.id)).length === afterDecline,
+  `${afterDecline} → ${(await alertsFor(windowTask.id)).length}`);
+
+// Nobody took it: it closes when the window does, not before.
+let windowStatus = '';
+for (let i = 0; i < 30 && windowStatus !== 'NO_HELPER_AVAILABLE'; i += 1) {
+  await sleep(500);
+  windowStatus = (await api(`/api/customer/tasks/${windowTask.id}`, { token: customerToken })).task?.status;
+}
+ok('the search closes when the window ends', windowStatus === 'NO_HELPER_AVAILABLE', String(windowStatus));
+
+// A reminder that stopped ringing is not a "no": the helper can still take the job.
+const lateTask = (await api('/api/customer/tasks', {
+  method: 'POST', token: customerToken,
+  body: { services: [{ code: 'kitchen', options: {} }], addressId, bookingType: 'instant', idempotencyKey: `smoke-late-${Date.now()}` },
+})).task;
+let lateAlerts = [];
+for (let i = 0; i < 20 && lateAlerts.length < 1; i += 1) { await sleep(300); lateAlerts = await alertsFor(lateTask.id); }
+await sleep(3500); // the 3-second ring has lapsed; the next reminder is not due yet
+const lateAccept = await api(`/api/helper/requests/${lateTask.id}/accept`, { method: 'POST', token: helperB });
+ok('a helper can accept after the ringing stops, inside the window',
+  lateAccept.task?.status === 'ACCEPTED', JSON.stringify(lateAccept.error ?? lateAccept.task?.status));
+const customerNotes = (await api('/api/notifications', { token: customerToken })).notifications ?? [];
+ok('the customer is told a helper was assigned',
+  customerNotes.some((n) => n.type === 'BOOKING_ACCEPTED' && n.data?.taskId === lateTask.id && n.data?.helperName),
+  JSON.stringify(customerNotes.find((n) => n.data?.taskId === lateTask.id)?.data));
+await api(`/api/customer/tasks/${lateTask.id}/cancel`, { method: 'POST', token: customerToken, body: { reason: 'Smoke test cleanup' } });
+
+await api('/api/helper/online', { method: 'POST', token: helperB, body: { isOnline: false } });
+await api('/api/admin/settings', {
+  method: 'PUT', token: adminToken,
+  body: {
+    search_duration_seconds: liveMatching.search_duration_seconds,
+    renotify_interval_seconds: liveMatching.renotify_interval_seconds,
+    accept_window_seconds: liveMatching.accept_window_seconds,
+  },
+});
+
 // ------------------------------------------------- instant booking (now)
 console.log('\n9b. Instant booking');
 await api('/api/helper/online', { method: 'POST', token: helperB, body: { isOnline: true } });

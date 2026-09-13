@@ -41,6 +41,8 @@ router.get(
     res.json({
       currency: s.currency,
       acceptWindowSeconds: s.accept_window_seconds,
+      searchDurationSeconds: s.search_duration_seconds,
+      renotifyIntervalSeconds: s.renotify_interval_seconds,
       completionOtpTtlSeconds: s.completion_otp_ttl_seconds,
     });
   }),
