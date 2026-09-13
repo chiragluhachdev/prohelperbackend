@@ -56,12 +56,10 @@ export async function quote(selections, ctx = {}) {
 
   const servicesAmount = round2(lines.reduce((sum, l) => sum + l.amount, 0));
   const platformFee = round2((servicesAmount * settings.platform_fee_percent) / 100);
-  const surcharge = round2(settings.surcharge_flat || 0);
   const discount = 0; // promo codes are a post-MVP hook (UC-C32)
 
-  const taxable = Math.max(servicesAmount + platformFee + surcharge - discount, 0);
-  const gst = round2((taxable * settings.gst_percent) / 100);
-  const total = round2(taxable + gst);
+  const taxable = Math.max(servicesAmount + platformFee - discount, 0);
+  const total = round2(taxable);
 
   // What the platform keeps out of the helper's gross (UC-C26).
   const helperCommission = round2((servicesAmount * settings.helper_commission_percent) / 100);
@@ -73,11 +71,8 @@ export async function quote(selections, ctx = {}) {
       servicesAmount,
       platformFeePercent: settings.platform_fee_percent,
       platformFee,
-      surcharge,
       discount,
       promoCode: '',
-      gstPercent: settings.gst_percent,
-      gst,
       total,
       helperCommissionPercent: settings.helper_commission_percent,
       helperCommission,
