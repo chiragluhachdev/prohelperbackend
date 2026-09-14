@@ -71,10 +71,13 @@ export function serializeTask(task, { audience = 'customer', helperProfile = nul
     instructions: t.instructions,
     paymentStatus: t.paymentStatus,
     paymentMode: t.paymentMode,
+    paidAt: t.paidAt,
+    paidByRole: t.paidByRole,
     createdAt: t.createdAt,
     acceptedAt: t.acceptedAt,
     startedAt: t.startedAt,
     completedAt: t.completedAt,
+    settledAt: t.settledAt,
     cancellation: t.cancellation?.at ? t.cancellation : null,
   };
 
@@ -83,6 +86,9 @@ export function serializeTask(task, { audience = 'customer', helperProfile = nul
       ...base,
       pricing: t.pricing,
       total: t.pricing?.total ?? 0,
+      referralCredit: t.pricing?.referralCredit ?? 0,
+      // What the customer actually pays: the bill less any referral balance used.
+      amountDue: Math.round(((t.pricing?.total ?? 0) - (t.pricing?.referralCredit ?? 0)) * 100) / 100,
       helper: person(t.helperId)
         ? {
             ...person(t.helperId),
@@ -93,18 +99,28 @@ export function serializeTask(task, { audience = 'customer', helperProfile = nul
           }
         : null,
       rated: Boolean(t.ratedByCustomer),
+      // Read out to the helper at the door; gone once work has started.
+      startOtp: t.status === 'ACCEPTED' ? t.startOtp?.code ?? null : null,
       // Only meaningful once the helper has asked to close the job (UC-C17).
       completionOtp: t.status === 'COMPLETION_PENDING' ? t.completionOtp?.code ?? null : null,
     };
   }
 
-  // Helper view: the payout, not the customer's bill.
+  // Helper view: the payout, not the customer's bill — except once the job is
+  // done, when a helper collecting cash/UPI needs to know the full amount the
+  // customer owes, not just their own share of it.
   return {
     ...base,
     customer: person(t.customerId),
     earning: t.pricing?.helperPayout ?? 0,
     commission: t.pricing?.helperCommission ?? 0,
     gross: t.pricing?.servicesAmount ?? 0,
+    total: [TASK_STATUS.COMPLETED, TASK_STATUS.SETTLED].includes(t.status) ? t.pricing?.total ?? 0 : undefined,
+    // The cash to collect: the bill less any referral balance the customer used.
+    amountDue: [TASK_STATUS.COMPLETED, TASK_STATUS.SETTLED].includes(t.status)
+      ? Math.round(((t.pricing?.total ?? 0) - (t.pricing?.referralCredit ?? 0)) * 100) / 100
+      : undefined,
+    referralCredit: t.pricing?.referralCredit ?? 0,
     currency: t.pricing?.currency || 'INR',
     rated: Boolean(t.ratedByHelper),
   };

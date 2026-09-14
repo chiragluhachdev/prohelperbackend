@@ -13,6 +13,8 @@ import { acceptJob, declineJob } from '../matching.js';
 import { notify } from '../lib/notify.js';
 import { getSettings } from '../lib/settings.js';
 import { postEntry, earningsSummary } from '../lib/ledger.js';
+import { helperBalances, walletStatement } from '../lib/wallet.js';
+import { ensureStartCode } from '../lib/startCode.js';
 import { upload, uploadBuffer, destroyAsset } from '../lib/cloudinary.js';
 import { issueOtp, verifyOtp } from '../lib/otp.js';
 import { publicUser } from './auth.js';
@@ -495,20 +497,64 @@ router.get(
     const task = await Task.findOne({ _id: req.params.id, helperId: req.user._id })
       .populate('customerId', 'name phone photoUrl');
     if (!task) throw notFound('Job not found.');
-    const timeline = await TaskEvent.find({ taskId: task._id }).sort({ at: 1 }).lean();
-    res.json({ task: serializeTask(task, { audience: 'helper' }), timeline });
+    const [timeline, settings] = await Promise.all([
+      TaskEvent.find({ taskId: task._id }).sort({ at: 1 }).lean(),
+      getSettings(),
+    ]);
+    res.json({
+      task: serializeTask(task, { audience: 'helper' }),
+      timeline,
+      // Whether Start asks for the customer's code — an admin can switch it off.
+      startOtpRequired: settings.start_otp_enabled !== false,
+    });
   }),
 );
 
-/** POST /api/helper/jobs/:id/start — UC-C16. */
+/**
+ * POST /api/helper/jobs/:id/start — UC-C16.
+ *
+ * Work starts only with the code from the customer's app, read out at the
+ * door: it proves the helper is actually there, with the customer, before the
+ * clock starts. Wrong codes are counted, so four digits cannot be guessed; the
+ * customer can issue a new code if the helper runs out of tries.
+ */
 router.post(
   '/jobs/:id/start',
   requireApproved,
   wrap(async (req, res) => {
+    const settings = await getSettings();
+    const required = settings.start_otp_enabled !== false;
+
+    if (required) {
+      const current = await Task.findOne({ _id: req.params.id, helperId: req.user._id }).select('+startOtp.code');
+      if (!current) throw notFound('Job not found.');
+      if (current.status !== TASK_STATUS.ACCEPTED) {
+        throw conflict(`This booking is ${current.status.toLowerCase().replace(/_/g, ' ')}.`, 'INVALID_STATE');
+      }
+
+      const code = current.startOtp?.code || (await ensureStartCode(current._id));
+      const entered = String(req.body.otp || '').trim();
+      if (!entered) throw badRequest('Ask the customer for the start code in their app.', 'START_OTP_REQUIRED');
+
+      const max = Number(settings.completion_otp_max_attempts) || 5;
+      const attempts = current.startOtp?.attempts || 0;
+      if (attempts >= max) {
+        throw badRequest('Too many incorrect codes. Ask the customer to get a new start code.', 'START_OTP_LOCKED');
+      }
+      if (entered !== code) {
+        await Task.updateOne({ _id: current._id }, { $inc: { 'startOtp.attempts': 1 } });
+        const left = max - attempts - 1;
+        if (left <= 0) throw badRequest('Too many incorrect codes. Ask the customer to get a new start code.', 'START_OTP_LOCKED');
+        throw badRequest(`Incorrect start code. ${left} attempt${left === 1 ? '' : 's'} left.`, 'START_OTP_INVALID');
+      }
+    }
+
     const task = await mustTransition(req.params.id, [TASK_STATUS.ACCEPTED], TASK_STATUS.IN_PROGRESS, {
       set: { startedAt: new Date() },
+      unset: { 'startOtp.code': '' },
       extraFilter: { helperId: req.user._id },
-      actorType: 'helper', actorId: req.user._id, reason: 'Helper started the job',
+      actorType: 'helper', actorId: req.user._id,
+      reason: required ? "Started with the customer's code" : 'Helper started the job',
     });
     await notify(task.customerId, 'TASK_STARTED', 'Work started',
       `Your helper has started ${task.code}.`, { taskId: String(task._id), code: task.code });
@@ -584,37 +630,94 @@ router.post(
     }
 
     const completedAt = new Date();
+    // The job is physically done — but nobody has paid yet. That happens next,
+    // either in the app (customer) or confirmed here once cash/UPI changes
+    // hands (helper), and only then does the booking settle.
     const completed = await mustTransition(task._id, [TASK_STATUS.COMPLETION_PENDING], TASK_STATUS.COMPLETED, {
-      set: { completedAt, paymentStatus: 'PAID' },
+      set: { completedAt },
       unset: { 'completionOtp.code': '' },
       extraFilter: { helperId: req.user._id },
       actorType: 'helper', actorId: req.user._id, reason: 'Completed with customer OTP',
     });
 
-    // Money is written as ledger rows, keyed so a retry cannot pay twice.
-    const { helperPayout = 0, helperCommission = 0, currency = 'INR' } = completed.pricing || {};
-    await postEntry({
-      userId: req.user._id, taskId: completed._id, type: 'JOB_EARNING', direction: 'CREDIT',
-      amount: helperPayout, currency, note: `Earning for ${completed.code}`, ref: `earning:${completed._id}`,
-    });
-    if (helperCommission > 0) {
-      await postEntry({
-        userId: req.user._id, taskId: completed._id, type: 'PLATFORM_COMMISSION', direction: 'DEBIT',
-        amount: helperCommission, currency, note: `Platform commission for ${completed.code}`,
-        ref: `commission:${completed._id}`,
-      });
-    }
-
     await HelperProfile.updateOne({ userId: req.user._id }, { $inc: { completedJobs: 1 } });
     await notify(completed.customerId, 'TASK_COMPLETED', 'Job completed',
-      `${completed.code} is complete. Rate your helper.`, { taskId: String(completed._id), code: completed.code });
+      `${completed.code} is complete. Pay your helper to close it out.`, { taskId: String(completed._id), code: completed.code });
 
     res.json({
       task: serializeTask(completed, { audience: 'helper' }),
-      earning: helperPayout,
+      earning: completed.pricing?.helperPayout || 0,
     });
   }),
 );
+
+/**
+ * POST /api/helper/jobs/:id/confirm-payment — the helper says cash or UPI was
+ * paid to them directly. This is the only way that money is recorded, so it
+ * settles the booking and — since it never passed through the app — the
+ * helper now owes the platform everything they were not meant to keep: the
+ * customer's service fee plus their own commission (UC-C26/C27).
+ */
+router.post(
+  '/jobs/:id/confirm-payment',
+  requireApproved,
+  wrap(async (req, res) => {
+    const task = await Task.findOne({ _id: req.params.id, helperId: req.user._id }).lean();
+    if (!task) throw notFound('Job not found.');
+    if (task.status !== TASK_STATUS.COMPLETED) {
+      throw conflict('This job is not awaiting payment.', 'NOT_AWAITING_PAYMENT');
+    }
+    if (task.paymentStatus === 'PAID') throw conflict('This job has already been paid for.', 'ALREADY_PAID');
+
+    const paidAt = new Date();
+    const settled = await mustTransition(task._id, [TASK_STATUS.COMPLETED], TASK_STATUS.SETTLED, {
+      set: { settledAt: paidAt, paymentStatus: 'PAID', paymentMode: 'CASH', paidAt, paidBy: req.user._id, paidByRole: 'helper' },
+      extraFilter: { helperId: req.user._id },
+      actorType: 'helper', actorId: req.user._id, reason: 'Cash/UPI payment confirmed by helper',
+    });
+
+    const {
+      total = 0, helperPayout = 0, platformFee = 0, helperCommission = 0, referralCredit = 0, currency = 'INR',
+    } = settled.pricing || {};
+    // The helper already has this in hand — nothing further to settle on their earning.
+    await postEntry({
+      userId: req.user._id, taskId: settled._id, type: 'JOB_EARNING', direction: 'CREDIT',
+      amount: helperPayout, currency, note: `Earning for ${settled.code} (cash/UPI, paid direct)`,
+      ref: `earning:${settled._id}`,
+    });
+    // What they collected beyond their own payout — the platform's cut — is owed
+    // back. If the customer paid part with referral balance the helper was handed
+    // that much less, so it comes off; should it outweigh the platform's cut, the
+    // platform owes the helper the difference instead.
+    const net = round2((platformFee || 0) + (helperCommission || 0) - (referralCredit || 0));
+    const owed = Math.max(0, net);
+    if (net > 0) {
+      await postEntry({
+        userId: req.user._id, taskId: settled._id, type: 'PLATFORM_COMMISSION', direction: 'DEBIT',
+        amount: net, currency, note: `Collected in cash for ${settled.code} — owed to the platform`,
+        ref: `commission:${settled._id}`,
+      });
+    } else if (net < 0) {
+      await postEntry({
+        userId: req.user._id, taskId: settled._id, type: 'REFERRAL_CREDIT', direction: 'CREDIT',
+        amount: -net, currency, note: `Customer's referral credit on ${settled.code} — paid to you by the platform`,
+        ref: `referral-credit:${settled._id}`,
+      });
+    }
+
+    await notify(settled.customerId, 'PAYMENT_CONFIRMED', 'Payment confirmed',
+      `Your helper confirmed the payment for ${settled.code}.`, { taskId: String(settled._id), code: settled.code });
+
+    res.json({
+      task: serializeTask(settled, { audience: 'helper' }),
+      earning: helperPayout, owed, total,
+      collected: round2(total - (referralCredit || 0)),
+      referralCovered: Math.max(0, -net),
+    });
+  }),
+);
+
+const round2 = (n) => Math.round((n || 0) * 100) / 100;
 
 /** UC-C21 — the helper rates the customer. */
 router.post(
@@ -648,25 +751,41 @@ router.post(
 
 /* ----------------------------------------------------------------- earnings */
 
+/**
+ * GET /api/helper/wallet — the wallet statement: every paid booking as its
+ * lines (money in, commission and fees out), the net of all of them, and the
+ * helper's current balance with the platform.
+ */
+router.get(
+  '/wallet',
+  wrap(async (req, res) => {
+    res.json(await walletStatement(req.user._id));
+  }),
+);
+
 /** GET /api/helper/earnings — UC-C26, straight off the ledger. */
 router.get(
   '/earnings',
   wrap(async (req, res) => {
-    const [summary, entries, outstanding] = await Promise.all([
+    const [summary, entries, balances] = await Promise.all([
       earningsSummary(req.user._id),
       LedgerEntry.find({ userId: req.user._id })
         .populate('taskId', 'code services scheduledAt')
         .sort({ createdAt: -1 })
         .limit(50)
         .lean(),
-      LedgerEntry.aggregate([
-        { $match: { userId: req.user._id, type: 'PLATFORM_COMMISSION', settled: false } },
-        { $group: { _id: null, total: { $sum: '$amount' } } },
-      ]),
+      helperBalances(req.user._id),
     ]);
 
     res.json({
-      summary: { ...summary, commissionOutstanding: Math.round((outstanding[0]?.total || 0) * 100) / 100 },
+      summary: {
+        ...summary,
+        // Kept under its old name too, for app builds already installed.
+        commissionOutstanding: balances.owedToPlatform,
+        owedToPlatform: balances.owedToPlatform,
+        payoutDue: balances.payoutDue,
+        balance: balances.balance,
+      },
       entries: entries.map((e) => ({
         id: String(e._id),
         type: e.type,

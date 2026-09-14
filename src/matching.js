@@ -7,6 +7,7 @@ import { closeJobAlerts, notify, notifyMany } from './lib/notify.js';
 import { transition } from './lib/taskflow.js';
 import { conflict } from './lib/http.js';
 import { EMPTY_WAVE_RECHECK_MS, planSearch, searchTimings, waveDueAt } from './lib/searchPlan.js';
+import { startCodeFields } from './lib/startCode.js';
 
 export { searchTimings, planSearch };
 
@@ -364,7 +365,8 @@ export async function acceptJob(taskId, helperId) {
   if (!request) throw conflict('This job is no longer available.', 'REQUEST_NOT_AVAILABLE');
 
   const task = await transition(taskId, [TASK_STATUS.SEARCHING], TASK_STATUS.ACCEPTED, {
-    set: { helperId, acceptedAt: now, nextDispatchAt: null },
+    // The customer's start code is issued the moment someone takes the job.
+    set: { helperId, acceptedAt: now, nextDispatchAt: null, ...startCodeFields() },
     extraFilter: { helperId: null },
     actorType: 'helper',
     actorId: helperId,
@@ -400,14 +402,18 @@ export async function acceptJob(taskId, helperId) {
   await closeJobAlerts(taskId, { except: helperId });
 
   const helper = await User.findById(helperId).select('name phone photoUrl').lean();
+  const { start_otp_enabled: startCodeOn } = await getSettings();
+  const startCode = startCodeOn ? (await Task.findById(task._id).select('+startOtp.code').lean())?.startOtp?.code : null;
   await notify(
     task.customerId,
     'BOOKING_ACCEPTED',
     'Helper assigned',
-    `${helper?.name || 'A helper'} accepted your booking ${task.code}.`,
+    `${helper?.name || 'A helper'} accepted your booking ${task.code}.` +
+      (startCode ? ` Share start code ${startCode} when they arrive.` : ''),
     {
       taskId: String(task._id),
       code: task.code,
+      startCode: startCode || '',
       helperName: helper?.name || '',
       serviceName: task.services.map((sv) => sv.name).join(', '),
       serviceNameHi: task.services.map((sv) => sv.nameHi || sv.name).join(', '),

@@ -8,6 +8,9 @@ import { serializeTask, TASK_TABS } from '../lib/views.js';
 import { newTaskCode, mustTransition, transition } from '../lib/taskflow.js';
 import { searchFields, startSearch } from '../matching.js';
 import { closeJobAlerts, notify } from '../lib/notify.js';
+import { postEntry } from '../lib/ledger.js';
+import { redeemForBooking, usableForBooking } from '../lib/referral.js';
+import { ensureStartCode, startCodeFields } from '../lib/startCode.js';
 import { getSettings } from '../lib/settings.js';
 import { upload, uploadBuffer } from '../lib/cloudinary.js';
 import { publicUser } from './auth.js';
@@ -164,7 +167,15 @@ router.post(
   '/quote',
   wrap(async (req, res) => {
     const { pricing, lines } = await quote(req.body.services, { durationMins: req.body.durationMins });
-    res.json({ lines, pricing });
+    // Referral balance is offered on every bill and only taken off when asked for.
+    const { balance, usable, cap, percent } = await usableForBooking(req.user, pricing.total);
+    if (req.body.useReferral && usable > 0) pricing.referralCredit = usable;
+    res.json({
+      lines,
+      pricing: { ...pricing, amountDue: Math.round((pricing.total - (pricing.referralCredit || 0)) * 100) / 100 },
+      // `limited`: they have more than this booking allows — the cap, not the balance, set `usable`.
+      referral: { balance, usable, maxPercent: percent, limited: balance > cap },
+    });
   }),
 );
 
@@ -181,7 +192,7 @@ router.post(
   wrap(async (req, res) => {
     const {
       services, addressId, date, time, bookingType,
-      durationMins, instructions = '', idempotencyKey,
+      durationMins, instructions = '', idempotencyKey, useReferral,
     } = req.body;
     const instant = bookingType === 'instant';
 
@@ -222,6 +233,10 @@ router.post(
     }
 
     const { lines, pricing } = await quote(services, { durationMins });
+    if (useReferral) {
+      const { usable } = await usableForBooking(req.user, pricing.total);
+      if (usable > 0) pricing.referralCredit = usable;
+    }
 
     const catalog = await Service.find({ code: { $in: lines.map((l) => l.code) } }).select('code defaultDurationMins').lean();
     const fallbackDuration = catalog.reduce((sum, s) => sum + (s.defaultDurationMins || 60), 0) || 60;
@@ -262,6 +277,13 @@ router.post(
       actorType: 'customer', actorId: req.user._id, reason: 'Request created',
     });
 
+    // Spend the referral balance the bill was priced with. If another booking
+    // spent it in the same instant, this one simply goes ahead at full price.
+    if (pricing.referralCredit > 0 && !(await redeemForBooking(req.user._id, task, pricing.referralCredit))) {
+      await Task.updateOne({ _id: task._id }, { $set: { 'pricing.referralCredit': 0 } });
+      task.pricing.referralCredit = 0;
+    }
+
     const searching = await startSearch(task._id, req.user._id);
     await notify(req.user._id, 'BOOKING_CREATED', 'Request created',
       instant
@@ -284,12 +306,22 @@ router.get(
       filter.status = { $in: TASK_TABS[tab] };
     }
 
-    const tasks = await Task.find(filter)
-      .populate('helperId', 'name phone photoUrl')
-      .sort({ scheduledAt: -1 })
-      .limit(Number(req.query.limit) || 50);
+    const [tasks, settings] = await Promise.all([
+      Task.find(filter)
+        .populate('helperId', 'name phone photoUrl')
+        .select('+startOtp.code')
+        .sort({ scheduledAt: -1 })
+        .limit(Number(req.query.limit) || 50),
+      getSettings(),
+    ]);
 
-    res.json({ tasks: tasks.map((t) => serializeTask(t)) });
+    res.json({
+      tasks: tasks.map((t) => {
+        const view = serializeTask(t);
+        if (settings.start_otp_enabled === false) view.startOtp = null;
+        return view;
+      }),
+    });
   }),
 );
 
@@ -298,15 +330,23 @@ router.get(
   wrap(async (req, res) => {
     const task = await Task.findOne({ _id: req.params.id, customerId: req.user._id })
       .populate('helperId', 'name phone photoUrl')
-      .select('+completionOtp.code');
+      .select('+completionOtp.code +startOtp.code');
     if (!task) throw notFound('Booking not found.');
+
+    // Bookings accepted before start codes existed get one the first time they are opened.
+    const startCodeOn = (await getSettings()).start_otp_enabled !== false;
+    if (startCodeOn && task.status === TASK_STATUS.ACCEPTED && !task.startOtp?.code) {
+      task.set('startOtp.code', await ensureStartCode(task._id));
+    }
 
     const helperProfile = task.helperId
       ? await HelperProfile.findOne({ userId: task.helperId._id }).select('ratingAvg completedJobs jobsShown experienceYears').lean()
       : null;
     const timeline = await TaskEvent.find({ taskId: task._id }).sort({ at: 1 }).lean();
 
-    res.json({ task: serializeTask(task, { audience: 'customer', helperProfile }), timeline });
+    const view = serializeTask(task, { audience: 'customer', helperProfile });
+    if (!startCodeOn) view.startOtp = null;
+    res.json({ task: view, timeline });
   }),
 );
 
@@ -391,6 +431,72 @@ router.post(
     if (!updated) throw conflict('This booking is not waiting for a helper.', 'INVALID_STATE');
 
     res.json({ task: serializeTask(updated) });
+  }),
+);
+
+/**
+ * POST /api/customer/tasks/:id/pay — a dummy in-app UPI payment. There is no
+ * real gateway behind this yet, so it always succeeds once called: it stands
+ * in for the moment a real one would confirm the charge.
+ *
+ * Because the money lands with the platform, not the helper, the helper does
+ * not owe anything back for this job — only their payout is booked.
+ */
+router.post(
+  '/tasks/:id/pay',
+  wrap(async (req, res) => {
+    const task = await Task.findOne({ _id: req.params.id, customerId: req.user._id }).lean();
+    if (!task) throw notFound('Booking not found.');
+    if (task.status !== TASK_STATUS.COMPLETED) {
+      throw conflict('This booking is not awaiting payment.', 'NOT_AWAITING_PAYMENT');
+    }
+    if (task.paymentStatus === 'PAID') throw conflict('This booking has already been paid for.', 'ALREADY_PAID');
+    if (!task.helperId) throw conflict('This booking had no helper.', 'NO_HELPER');
+
+    const paidAt = new Date();
+    const settled = await mustTransition(task._id, [TASK_STATUS.COMPLETED], TASK_STATUS.SETTLED, {
+      set: { settledAt: paidAt, paymentStatus: 'PAID', paymentMode: 'ONLINE', paidAt, paidBy: req.user._id, paidByRole: 'customer' },
+      extraFilter: { customerId: req.user._id },
+      actorType: 'customer', actorId: req.user._id, reason: 'Paid online in the app',
+    });
+
+    const { helperPayout = 0, currency = 'INR' } = settled.pricing || {};
+    if (settled.helperId) {
+      // Collected by the platform, so this is booked as owed *to* the helper —
+      // a payout still pending, not something they owe back (see finance).
+      await postEntry({
+        userId: settled.helperId, taskId: settled._id, type: 'JOB_EARNING', direction: 'CREDIT',
+        amount: helperPayout, currency, note: `Earning for ${settled.code} (paid online)`,
+        ref: `earning:${settled._id}`,
+      });
+      await notify(settled.helperId, 'PAYMENT_RECEIVED', 'Paid online',
+        `The customer paid online for ${settled.code}.`, { taskId: String(settled._id), code: settled.code, amount: String(helperPayout) });
+    }
+
+    const due = Math.round(((settled.pricing?.total || 0) - (settled.pricing?.referralCredit || 0)) * 100) / 100;
+    res.json({ task: serializeTask(settled), receipt: { amount: due, paidAt, method: 'ONLINE' } });
+  }),
+);
+
+/**
+ * POST /api/customer/tasks/:id/start-code — a new start code. For when the
+ * helper has used up their tries, or the customer thinks the code was seen by
+ * someone else; the old code stops working immediately.
+ */
+router.post(
+  '/tasks/:id/start-code',
+  wrap(async (req, res) => {
+    const updated = await Task.findOneAndUpdate(
+      { _id: req.params.id, customerId: req.user._id, status: TASK_STATUS.ACCEPTED },
+      { $set: startCodeFields() },
+      { new: true },
+    ).select('+startOtp.code');
+    if (!updated) {
+      const exists = await Task.exists({ _id: req.params.id, customerId: req.user._id });
+      if (!exists) throw notFound('Booking not found.');
+      throw conflict('A start code is only needed before the job starts.', 'INVALID_STATE');
+    }
+    res.json({ startOtp: updated.startOtp.code });
   }),
 );
 

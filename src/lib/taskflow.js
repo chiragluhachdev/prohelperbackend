@@ -1,6 +1,7 @@
 import { Task, TaskEvent } from '../models/index.js';
 import { ALLOWED_TRANSITIONS } from '../config.js';
 import { conflict } from './http.js';
+import { refundBookingCredit } from './referral.js';
 
 /**
  * The single door through which a task changes status.
@@ -43,6 +44,11 @@ export async function transition(taskId, from, to, options = {}) {
     reason,
     meta,
   });
+
+  // Referral balance spent on a booking comes back if the booking never happens.
+  if (to === 'CANCELLED' || to === 'EXPIRED') {
+    await refundBookingCredit(task).catch((err) => console.error('[referral] refund failed', task.code, err.message));
+  }
   return task;
 }
 

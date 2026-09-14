@@ -33,6 +33,12 @@ async function login(phone, role) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** Starting a job needs the code from the customer's app, read out at the door. */
+async function startJob(taskId, helperToken, customerTok) {
+  const code = (await api(`/api/customer/tasks/${taskId}`, { token: customerTok })).task?.startOtp;
+  return api(`/api/helper/jobs/${taskId}/start`, { method: 'POST', token: helperToken, body: { otp: code } });
+}
+
 /*
  * The seed ships only the catalog and the admin, so this suite registers the
  * people it needs. Phone numbers are unique per run, which keeps repeat runs
@@ -191,9 +197,35 @@ ok('customer sees the assigned helper', custView.task?.status === 'ACCEPTED' && 
   JSON.stringify(custView.task?.status));
 
 // ---------------------------------------------------------------- lifecycle
-console.log('\n7. Start → complete with the customer OTP');
-const started = await api(`/api/helper/jobs/${taskId}/start`, { method: 'POST', token: winnerToken });
-ok('helper starts the job', started.task?.status === 'IN_PROGRESS', JSON.stringify(started.error));
+console.log('\n7. Start with the customer code → complete with the customer OTP');
+const assigned = await api(`/api/customer/tasks/${taskId}`, { token: customerToken });
+const startCode = assigned.task?.startOtp;
+ok('the customer gets a 4-digit start code as soon as a helper is assigned', /^\d{4}$/.test(String(startCode)), String(startCode));
+const helperSees = await api(`/api/helper/jobs/${taskId}`, { token: winnerToken });
+ok('the helper never sees the code, only that one is needed',
+  helperSees.task?.startOtp === undefined && helperSees.startOtpRequired === true, JSON.stringify({ code: helperSees.task?.startOtp, req: helperSees.startOtpRequired }));
+const assignedNote = (await api('/api/notifications', { token: customerToken })).notifications?.find((n) => n.type === 'BOOKING_ACCEPTED' && n.data?.taskId === taskId);
+ok('and the customer is told the code in the "helper assigned" notification', assignedNote?.data?.startCode === startCode,
+  JSON.stringify(assignedNote?.data));
+
+const noCode = await api(`/api/helper/jobs/${taskId}/start`, { method: 'POST', token: winnerToken });
+ok('a job cannot be started without the code', noCode.error?.code === 'START_OTP_REQUIRED', JSON.stringify(noCode.error));
+const wrongStart = await api(`/api/helper/jobs/${taskId}/start`, {
+  method: 'POST', token: winnerToken, body: { otp: startCode === '0000' ? '1111' : '0000' },
+});
+ok('or with the wrong one', wrongStart.error?.code === 'START_OTP_INVALID', JSON.stringify(wrongStart.error));
+
+const refreshedCode = await api(`/api/customer/tasks/${taskId}/start-code`, { method: 'POST', token: customerToken });
+const oldCodeNow = await api(`/api/helper/jobs/${taskId}/start`, { method: 'POST', token: winnerToken, body: { otp: startCode } });
+ok('a new code from the customer replaces the old one',
+  /^\d{4}$/.test(String(refreshedCode.startOtp)) &&
+  (refreshedCode.startOtp === startCode || oldCodeNow.error?.code === 'START_OTP_INVALID'),
+  JSON.stringify({ fresh: refreshedCode.startOtp, old: oldCodeNow.error }));
+
+const started = await startJob(taskId, winnerToken, customerToken);
+ok('helper starts the job with the right code', started.task?.status === 'IN_PROGRESS', JSON.stringify(started.error));
+ok('and the code disappears from the customer app once work begins',
+  (await api(`/api/customer/tasks/${taskId}`, { token: customerToken })).task?.startOtp === null);
 
 const earlyComplete = await api(`/api/helper/jobs/${taskId}/complete`, { method: 'POST', token: winnerToken, body: { otp: '000000' } });
 ok('cannot complete before requesting the OTP', earlyComplete.status === 409);
@@ -210,7 +242,19 @@ ok('wrong OTP is refused', wrongOtp.status === 400, JSON.stringify(wrongOtp.erro
 
 const done = await api(`/api/helper/jobs/${taskId}/complete`, { method: 'POST', token: winnerToken, body: { otp: completionOtp } });
 ok('correct OTP completes the job', done.task?.status === 'COMPLETED', JSON.stringify(done.error));
+ok('the job is done, but nobody has been paid yet', done.task?.paymentStatus === 'PENDING', String(done.task?.paymentStatus));
 ok('the helper is credited', done.earning > 0, String(done.earning));
+
+// The customer paid the helper cash in hand — the helper is the only one who
+// can say so, and confirming it settles the booking.
+const cashConfirm = await api(`/api/helper/jobs/${taskId}/confirm-payment`, { method: 'POST', token: winnerToken });
+ok('helper confirms the cash/UPI payment', cashConfirm.task?.status === 'SETTLED' && cashConfirm.task?.paymentStatus === 'PAID',
+  JSON.stringify(cashConfirm.error));
+ok('paid in cash, the helper owes everything beyond their own payout',
+  Math.abs(cashConfirm.owed - (cashConfirm.total - cashConfirm.earning)) < 0.01, JSON.stringify(cashConfirm));
+
+const cashTwice = await api(`/api/helper/jobs/${taskId}/confirm-payment`, { method: 'POST', token: winnerToken });
+ok('cannot confirm a payment twice', cashTwice.status === 409, JSON.stringify(cashTwice.error));
 
 // ---------------------------------------------------------------- money + rating
 console.log('\n8. Earnings and rating');
@@ -222,6 +266,256 @@ const rate1 = await api(`/api/customer/tasks/${taskId}/rate`, { method: 'POST', 
 const rate2 = await api(`/api/customer/tasks/${taskId}/rate`, { method: 'POST', token: customerToken, body: { stars: 1 } });
 ok('customer can rate once', rate1.status === 201);
 ok('a second rating is refused', rate2.status === 409);
+
+// ----------------------------------------------------------- online payment
+console.log('\n8a. Paying online, instead of cash');
+
+const financeBeforeOnline = await api('/api/admin/finance', { token: adminToken });
+const owedBeforeOnline = financeBeforeOnline.commissionOwed?.find((h) => h.helperId === winnerId)?.amount || 0;
+
+const onlineSlot = outOfHoursSlot();
+const onlineBooking = await api('/api/customer/tasks', {
+  method: 'POST', token: customerToken,
+  body: {
+    services: [{ code: 'kitchen', options: {} }], addressId, date: onlineSlot.date, time: onlineSlot.time,
+    idempotencyKey: `smoke-online-${Date.now()}`,
+  },
+});
+const onlineTaskId = onlineBooking.task?.id;
+ok('a second booking is created for the online-payment case', Boolean(onlineTaskId));
+
+let onlineAccepted = null;
+for (let i = 0; i < 15 && !onlineAccepted; i += 1) {
+  await sleep(400);
+  const attempt = await api(`/api/helper/requests/${onlineTaskId}/accept`, { method: 'POST', token: winnerToken });
+  if (attempt.status === 200) onlineAccepted = attempt;
+}
+ok('the same helper accepts the second job', onlineAccepted?.task?.status === 'ACCEPTED', JSON.stringify(onlineAccepted));
+
+await startJob(onlineTaskId, winnerToken, customerToken);
+await api(`/api/helper/jobs/${onlineTaskId}/completion-otp`, { method: 'POST', token: winnerToken });
+const onlineWithOtp = await api(`/api/customer/tasks/${onlineTaskId}`, { token: customerToken });
+const onlineDone = await api(`/api/helper/jobs/${onlineTaskId}/complete`, {
+  method: 'POST', token: winnerToken, body: { otp: onlineWithOtp.task?.completionOtp },
+});
+ok('the second job completes too', onlineDone.task?.status === 'COMPLETED', JSON.stringify(onlineDone.error));
+
+const paidOnline = await api(`/api/customer/tasks/${onlineTaskId}/pay`, { method: 'POST', token: customerToken });
+ok('the customer pays online in the app', paidOnline.task?.status === 'SETTLED' && paidOnline.task?.paymentMode === 'ONLINE',
+  JSON.stringify(paidOnline.error));
+ok('a receipt comes back', paidOnline.receipt?.amount > 0 && paidOnline.receipt?.method === 'ONLINE', JSON.stringify(paidOnline.receipt));
+
+const payOnlineTwice = await api(`/api/customer/tasks/${onlineTaskId}/pay`, { method: 'POST', token: customerToken });
+ok('cannot pay for the same job twice', payOnlineTwice.status === 409, JSON.stringify(payOnlineTwice.error));
+
+const helperCantCashAnOnlineJob = await api(`/api/helper/jobs/${onlineTaskId}/confirm-payment`, { method: 'POST', token: winnerToken });
+ok('and the helper cannot also mark an already-paid job as cash',
+  helperCantCashAnOnlineJob.status === 409, JSON.stringify(helperCantCashAnOnlineJob.error));
+
+const financeAfterOnline = await api('/api/admin/finance', { token: adminToken });
+const owedAfterOnline = financeAfterOnline.commissionOwed?.find((h) => h.helperId === winnerId)?.amount || 0;
+ok('paid online, nothing new is added to what the helper owes',
+  owedAfterOnline === owedBeforeOnline, JSON.stringify({ owedBeforeOnline, owedAfterOnline }));
+const payoutDue = financeAfterOnline.payoutsOwed?.find((h) => h.helperId === winnerId);
+ok('instead, the platform now owes them a payout', Boolean(payoutDue) && payoutDue.amount > 0, JSON.stringify(financeAfterOnline.payoutsOwed));
+
+// ------------------------------------------------------------ wallet history
+const wallet = await api('/api/helper/wallet', { token: winnerToken });
+const sumLines = (g) => Math.round(g.lines.reduce((t, l) => t + l.amount, 0) * 100) / 100;
+const cashGroup = wallet.groups?.find((g) => g.taskId === taskId);
+const onlineGroup = wallet.groups?.find((g) => g.taskId === onlineTaskId);
+ok('the wallet lists both paid bookings, newest first',
+  wallet.groups?.[0]?.taskId === onlineTaskId && Boolean(cashGroup), JSON.stringify(wallet.groups?.map((g) => g.code)));
+ok('a cash booking reads: bill received, commission out, service fee out',
+  cashGroup?.method === 'CASH' &&
+  cashGroup.lines.map((l) => l.kind).join() === 'PAID_CASH,COMMISSION,PLATFORM_FEE' &&
+  cashGroup.lines[0].amount > 0 && cashGroup.lines.slice(1).every((l) => l.amount < 0),
+  JSON.stringify(cashGroup?.lines));
+ok('an online booking reads: job value in, commission out',
+  onlineGroup?.method === 'ONLINE' && onlineGroup.lines.map((l) => l.kind).join() === 'PAID_ONLINE,COMMISSION',
+  JSON.stringify(onlineGroup?.lines));
+ok('each booking nets to exactly the helper payout',
+  sumLines(cashGroup) === cashConfirm.earning && sumLines(onlineGroup) === onlineDone.earning,
+  JSON.stringify({ cash: sumLines(cashGroup), cashPayout: cashConfirm.earning, online: sumLines(onlineGroup), onlinePayout: onlineDone.earning }));
+ok('the one net-earning figure is every line added up',
+  wallet.netEarning === Math.round(wallet.groups.reduce((t, g) => t + sumLines(g), 0) * 100) / 100 && !wallet.truncated,
+  JSON.stringify({ net: wallet.netEarning }));
+ok('the balance shows what they owe the platform against the payout due to them',
+  wallet.owedToPlatform === cashConfirm.owed && wallet.payoutDue === onlineDone.earning &&
+  wallet.balance === Math.round((wallet.payoutDue - wallet.owedToPlatform) * 100) / 100,
+  JSON.stringify({ owed: wallet.owedToPlatform, due: wallet.payoutDue, balance: wallet.balance }));
+const earningsNow = await api('/api/helper/earnings', { token: winnerToken });
+ok('and the earnings screen shows the same amount owed',
+  earningsNow.summary?.owedToPlatform === wallet.owedToPlatform && earningsNow.summary?.payoutDue === wallet.payoutDue,
+  JSON.stringify(earningsNow.summary));
+
+const payoutSettled = await api(`/api/admin/finance/settle-payout/${winnerId}`, {
+  method: 'POST', token: adminToken, body: { reason: 'Bank transfer sent' },
+});
+ok('the admin sends the payout and marks it settled', payoutSettled.settled >= 1 && payoutSettled.amount > 0, JSON.stringify(payoutSettled.error));
+
+const payoutTwice = await api(`/api/admin/finance/settle-payout/${winnerId}`, {
+  method: 'POST', token: adminToken, body: { reason: 'Again' },
+});
+ok('and a payout cannot be settled twice', payoutTwice.status === 409, JSON.stringify(payoutTwice.error));
+const walletAfterPayout = await api('/api/helper/wallet', { token: winnerToken });
+ok('once paid out, nothing is due — but what they owe from cash still stands',
+  walletAfterPayout.payoutDue === 0 && walletAfterPayout.owedToPlatform === cashConfirm.owed,
+  JSON.stringify({ due: walletAfterPayout.payoutDue, owed: walletAfterPayout.owedToPlatform }));
+
+// ---------------------------------------------------------------- referrals
+console.log('\n8b. Referrals');
+const r2 = (n) => Math.round(n * 100) / 100;
+
+const custRef = await api('/api/referrals', { token: customerToken });
+ok('every account has a 6-character referral code', /^[A-Z2-9]{6}$/.test(String(custRef.code)), String(custRef.code));
+ok('and it never changes', (await api('/api/referrals', { token: customerToken })).code === custRef.code);
+
+const helperRef = await api('/api/referrals', { token: winnerToken });
+const duesBefore = helperRef.owedToPlatform;
+ok('a helper sees the dues their referral balance could pay off', duesBefore === cashConfirm.owed,
+  JSON.stringify({ dues: duesBefore, owed: cashConfirm.owed }));
+
+// A small reward for this run, so it pays off only part of the helper's dues.
+await api('/api/admin/settings', { method: 'PUT', token: adminToken, body: { referral_reward_amount: 20 } });
+
+const friendPhone = `7${RUN}0011`.slice(0, 10);
+const friendToken = await login(friendPhone, 'customer');
+ok('a malformed code is refused',
+  (await api('/api/referrals/check?code=AB1', { token: friendToken })).error?.code === 'REFERRAL_CODE_INVALID');
+ok('nobody can use their own code',
+  (await api(`/api/referrals/check?code=${custRef.code}`, { token: customerToken })).error?.code === 'REFERRAL_OWN_CODE');
+const checked = await api(`/api/referrals/check?code=${helperRef.code.toLowerCase()}`, { token: friendToken });
+ok('a real code checks out, whatever the case it is typed in', checked.valid === true && checked.welcome === 100,
+  JSON.stringify(checked));
+
+const applied = await api('/api/referrals/apply', { method: 'POST', token: friendToken, body: { code: helperRef.code } });
+ok('joining with a code pays the newcomer ₹100', applied.status === 201 && applied.balance === 100, JSON.stringify(applied));
+const appliedTwice = await api('/api/referrals/apply', { method: 'POST', token: friendToken, body: { code: custRef.code } });
+ok('a code can only ever be used once per account', appliedTwice.error?.code === 'REFERRAL_ALREADY_APPLIED',
+  JSON.stringify(appliedTwice.error));
+
+const helperRewarded = await api('/api/referrals', { token: winnerToken });
+ok('and rewards the person whose code it was',
+  helperRewarded.balance === r2(helperRef.balance + 20) &&
+  helperRewarded.totals.referrals === helperRef.totals.referrals + 1 &&
+  helperRewarded.history[0]?.type === 'REFERRER_REWARD' && helperRewarded.history[0]?.amount === 20,
+  JSON.stringify({ balance: helperRewarded.balance, totals: helperRewarded.totals, top: helperRewarded.history[0] }));
+
+// Helper: pay dues from the referral balance — here only part of them.
+const settledRef = await api('/api/referrals/settle', { method: 'POST', token: winnerToken });
+ok('a helper pays what they can of their dues from referral balance',
+  settledRef.settled === 20 && settledRef.referralBalance === r2(helperRewarded.balance - 20) &&
+  settledRef.owedToPlatform === r2(duesBefore - 20),
+  JSON.stringify(settledRef));
+ok('with nothing left to spend, settling again is refused',
+  (await api('/api/referrals/settle', { method: 'POST', token: winnerToken })).error?.code === 'NO_REFERRAL_BALANCE');
+ok('customers cannot settle dues', (await api('/api/referrals/settle', { method: 'POST', token: friendToken })).status === 403);
+const walletAfterSettle = await api('/api/helper/wallet', { token: winnerToken });
+ok('the wallet shows the smaller amount still owed', walletAfterSettle.owedToPlatform === r2(duesBefore - 20),
+  JSON.stringify({ owed: walletAfterSettle.owedToPlatform }));
+const financeAfterSettle = await api('/api/admin/finance', { token: adminToken });
+ok('and so does admin finance',
+  financeAfterSettle.commissionOwed?.find((h) => h.helperId === winnerId)?.amount === r2(duesBefore - 20),
+  JSON.stringify(financeAfterSettle.commissionOwed?.find((h) => h.helperId === winnerId)));
+
+// Customer: spend referral balance on a booking.
+await api('/api/customer/profile', { method: 'PATCH', token: friendToken, body: { name: 'Rahul Friend' } });
+const friendAddr = await api('/api/customer/addresses', {
+  method: 'POST', token: friendToken, body: { label: 'Home', line1: 'Tower A, Flat 101', society: 'rps_savana' },
+});
+const friendAddressId = friendAddr.address?._id || friendAddr.addresses?.[0]?._id;
+
+const quoteOff = await api('/api/customer/quote', { method: 'POST', token: friendToken, body: { services: [{ code: 'full_home' }] } });
+ok('the bill offers the referral balance without taking it',
+  quoteOff.referral?.balance === 100 && quoteOff.referral?.usable === 100 && !quoteOff.pricing?.referralCredit,
+  JSON.stringify(quoteOff.referral));
+const quoteOn = await api('/api/customer/quote', {
+  method: 'POST', token: friendToken, body: { services: [{ code: 'full_home' }], useReferral: true },
+});
+ok('switched on, it comes off what they pay',
+  quoteOn.pricing?.referralCredit === 100 && quoteOn.pricing?.amountDue === r2(quoteOn.pricing.total - 100),
+  JSON.stringify(quoteOn.pricing));
+ok('but never more than half the booking',
+  quoteOn.referral?.maxPercent === 50 && quoteOn.pricing.referralCredit <= r2(quoteOn.pricing.total / 2),
+  JSON.stringify({ credit: quoteOn.pricing?.referralCredit, total: quoteOn.pricing?.total, ref: quoteOn.referral }));
+
+// With a tighter cap, the cap rather than the balance decides what comes off.
+await api('/api/admin/settings', { method: 'PUT', token: adminToken, body: { referral_max_booking_percent: 20 } });
+const quoteCapped = await api('/api/customer/quote', {
+  method: 'POST', token: friendToken, body: { services: [{ code: 'full_home' }], useReferral: true },
+});
+ok('the share is an admin setting, and the rest of the balance is kept for later',
+  quoteCapped.pricing?.referralCredit === r2(quoteCapped.pricing.total * 0.2) &&
+  quoteCapped.referral?.limited === true && quoteCapped.referral?.balance === 100,
+  JSON.stringify({ credit: quoteCapped.pricing?.referralCredit, total: quoteCapped.pricing?.total, ref: quoteCapped.referral }));
+const cappedBooking = await api('/api/customer/tasks', {
+  method: 'POST', token: friendToken,
+  body: { services: [{ code: 'full_home' }], addressId: friendAddressId, bookingType: 'instant', useReferral: true, idempotencyKey: `smoke-ref-cap-${Date.now()}` },
+});
+ok('and a booking is held to it too — not just the bill preview',
+  cappedBooking.task?.referralCredit === r2(cappedBooking.task.total * 0.2) &&
+  (await api('/api/referrals', { token: friendToken })).balance === r2(100 - cappedBooking.task.referralCredit),
+  JSON.stringify({ credit: cappedBooking.task?.referralCredit, error: cappedBooking.error }));
+await api(`/api/customer/tasks/${cappedBooking.task?.id}/cancel`, { method: 'POST', token: friendToken, body: { reason: 'Smoke test cap check' } });
+await api('/api/admin/settings', { method: 'PUT', token: adminToken, body: { referral_max_booking_percent: 50 } });
+
+const creditBooking = (key) => api('/api/customer/tasks', {
+  method: 'POST', token: friendToken,
+  body: { services: [{ code: 'full_home' }], addressId: friendAddressId, bookingType: 'instant', useReferral: true, idempotencyKey: key },
+});
+const booked1 = await creditBooking(`smoke-ref-a-${Date.now()}`);
+ok('a booking made with it records the credit', booked1.task?.referralCredit === 100 && booked1.task?.amountDue === r2(booked1.task.total - 100),
+  JSON.stringify({ credit: booked1.task?.referralCredit, due: booked1.task?.amountDue, error: booked1.error }));
+ok('and the balance is spent', (await api('/api/referrals', { token: friendToken })).balance === 0);
+
+await api(`/api/customer/tasks/${booked1.task?.id}/cancel`, { method: 'POST', token: friendToken, body: { reason: 'Smoke test refund' } });
+const refunded = await api('/api/referrals', { token: friendToken });
+ok('cancelling the booking gives it all back',
+  refunded.balance === 100 && refunded.totals.used === 0 &&
+  refunded.history.map((h) => h.type).slice(0, 2).join() === 'BOOKING_REFUND,BOOKING_REDEMPTION',
+  JSON.stringify({ balance: refunded.balance, totals: refunded.totals, types: refunded.history.map((h) => h.type) }));
+
+// A cash job paid partly with referral balance: the platform makes it up to the helper.
+const booked2 = await creditBooking(`smoke-ref-b-${Date.now()}`);
+let refAccepted = null;
+for (let i = 0; i < 15 && !refAccepted; i += 1) {
+  await sleep(400);
+  const attempt = await api(`/api/helper/requests/${booked2.task?.id}/accept`, { method: 'POST', token: winnerToken });
+  if (attempt.status === 200) refAccepted = attempt;
+}
+await startJob(booked2.task?.id, winnerToken, friendToken);
+await api(`/api/helper/jobs/${booked2.task?.id}/completion-otp`, { method: 'POST', token: winnerToken });
+const refOtp = (await api(`/api/customer/tasks/${booked2.task?.id}`, { token: friendToken })).task?.completionOtp;
+await api(`/api/helper/jobs/${booked2.task?.id}/complete`, { method: 'POST', token: winnerToken, body: { otp: refOtp } });
+const helperJob = await api(`/api/helper/jobs/${booked2.task?.id}`, { token: winnerToken });
+ok('the helper is told to collect the bill less the credit',
+  helperJob.task?.amountDue === r2(booked2.task.total - 100), JSON.stringify({ due: helperJob.task?.amountDue }));
+
+const payoutBefore = (await api('/api/helper/wallet', { token: winnerToken })).payoutDue;
+const refCash = await api(`/api/helper/jobs/${booked2.task?.id}/confirm-payment`, { method: 'POST', token: winnerToken });
+const platformShare = r2(booked2.task.pricing.platformFee + booked2.task.pricing.helperCommission);
+ok('with the credit bigger than the platform share, the helper owes nothing for it',
+  refCash.owed === 0 && refCash.collected === r2(booked2.task.total - 100), JSON.stringify(refCash));
+ok('and the platform owes them the difference',
+  refCash.referralCovered === r2(100 - platformShare), JSON.stringify({ covered: refCash.referralCovered, platformShare }));
+
+const refWallet = await api('/api/helper/wallet', { token: winnerToken });
+const refGroup = refWallet.groups?.find((g) => g.taskId === booked2.task?.id);
+ok('the wallet shows the credit as money in, and the job still nets to the payout',
+  refGroup?.lines.map((l) => l.kind).join() === 'PAID_CASH,COMMISSION,PLATFORM_FEE,REFERRAL_CREDIT' &&
+  r2(refGroup.lines.reduce((t, l) => t + l.amount, 0)) === refCash.earning,
+  JSON.stringify(refGroup?.lines));
+ok('as a payout due, with the dues left as they were',
+  refWallet.payoutDue === r2(payoutBefore + refCash.referralCovered) && refWallet.owedToPlatform === r2(duesBefore - 20),
+  JSON.stringify({ due: refWallet.payoutDue, owed: refWallet.owedToPlatform }));
+
+const friendAdmin = await api(`/api/admin/customers/${(await api('/api/auth/me', { token: friendToken })).user.id}`, { token: adminToken });
+ok('admin sees who referred a customer, and their balance (spent on the second booking)',
+  friendAdmin.customer?.referral?.referredBy?.id === winnerId && friendAdmin.customer?.referral?.balance === 0,
+  JSON.stringify(friendAdmin.customer?.referral));
+
+await api('/api/admin/settings', { method: 'PUT', token: adminToken, body: { referral_reward_amount: 100 } });
 
 // -------------------------------------------------- Test 4: no helper
 console.log('\n9. Nobody available');
@@ -479,7 +773,7 @@ for (let i = 0; i < 12 && !liveAlert.requests.length; i += 1) {
   liveAlert = await api('/api/helper/requests', { token: helperA });
 }
 await api(`/api/helper/requests/${liveId}/accept`, { method: 'POST', token: helperA });
-const underWay = await api(`/api/helper/jobs/${liveId}/start`, { method: 'POST', token: helperA });
+const underWay = await startJob(liveId, helperA, customerToken);
 ok('the job is under way', underWay.task?.status === 'IN_PROGRESS', JSON.stringify(underWay.error));
 
 const midCancel = await api(`/api/customer/tasks/${liveId}/cancel`, {
@@ -773,7 +1067,8 @@ ok('payout details stay optional', stillFine.approvalStatus === 'APPROVED', JSON
 const finance = await api('/api/admin/finance', { token: adminToken });
 ok('finance totals come off completed bookings',
   finance.totals?.bookings >= 1 && finance.totals.gross > 0 &&
-  finance.totals.platformEarned === Math.round((finance.totals.platformFee + finance.totals.commission) * 100) / 100,
+  finance.totals.platformEarned ===
+    Math.round((finance.totals.platformFee + finance.totals.commission - finance.totals.referralCredit) * 100) / 100,
   JSON.stringify(finance.totals));
 ok('the per-booking bill is listed',
   Array.isArray(finance.bookings) && finance.bookings[0]?.pricing?.total > 0,
@@ -805,6 +1100,111 @@ const helperView = await api(`/api/admin/helpers/${winnerId}`, { token: adminTok
 ok('and the admin sees the payout details on the helper',
   helperView.profile?.paymentDetails?.accountNo === '123456789012',
   JSON.stringify(helperView.profile?.paymentDetails));
+
+// ------------------------------------------------------- transaction detail
+console.log('\n12a. Every transaction, in detail');
+
+const txns = await api(`/api/admin/finance/transactions?limit=100`, { token: adminToken });
+const cashTxn = txns.transactions?.find((t) => t.id === taskId);
+const onlineTxn = txns.transactions?.find((t) => t.id === onlineTaskId);
+ok('the cash-paid booking is listed with who paid whom, how, and when',
+  cashTxn?.paymentMode === 'CASH' && cashTxn?.paidByRole === 'helper' && Boolean(cashTxn?.paidAt) &&
+  Boolean(cashTxn?.customer?.name) && ['Helper A', 'Helper B'].includes(cashTxn?.helper?.name),
+  JSON.stringify(cashTxn));
+ok('its owed-by-helper ledger row is settled, now that it has been collected',
+  cashTxn?.owedByHelper?.settled === true && cashTxn?.owedByHelper?.amount > 0, JSON.stringify(cashTxn?.owedByHelper));
+ok('the online-paid booking shows the customer paid, with no debt attached',
+  onlineTxn?.paymentMode === 'ONLINE' && onlineTxn?.paidByRole === 'customer' && !onlineTxn?.owedByHelper,
+  JSON.stringify(onlineTxn));
+ok('its payout to the helper is booked but not yet settled',
+  onlineTxn?.earning?.amount > 0, JSON.stringify(onlineTxn?.earning));
+
+const txnByCode = await api(`/api/admin/finance/transactions?q=${cashTxn?.code}`, { token: adminToken });
+ok('transactions can be found by booking code',
+  txnByCode.transactions?.some((t) => t.id === taskId), JSON.stringify(txnByCode.transactions?.map((t) => t.code)));
+
+const paidOnly = await api(`/api/admin/finance/transactions?status=paid&limit=100`, { token: adminToken });
+ok('and filtered to only what has actually been paid',
+  paidOnly.transactions?.every((t) => t.paymentStatus === 'PAID'), JSON.stringify(paidOnly.transactions?.map((t) => t.paymentStatus)));
+
+// -------------------------------------------------------------------- track
+console.log('\n12b. Tracking who was asked, and what they did');
+
+const track = await api(`/api/admin/track?q=${cashTxn?.code}`, { token: adminToken });
+const tracked = track.tasks?.find((t) => t.id === taskId);
+ok('the booking is found with its full request history', Boolean(tracked), JSON.stringify(track.tasks?.map((t) => t.code)));
+ok('the helper who took it shows as accepted',
+  tracked?.requests?.some((r) => r.helperId === winnerId && r.status === 'ACCEPTED'), JSON.stringify(tracked?.requests));
+ok('the summary counts add up to every helper that was alerted',
+  tracked?.summary?.sent === tracked?.requests?.length &&
+  tracked?.summary?.accepted + tracked?.summary?.declined + tracked?.summary?.unanswered + tracked?.summary?.standDown + tracked?.summary?.pending === tracked?.summary?.sent,
+  JSON.stringify(tracked?.summary));
+ok('each request carries when it was sent and how long it took to answer',
+  tracked?.requests?.every((r) => r.sentAt && Number.isFinite(r.waitedSeconds)), JSON.stringify(tracked?.requests));
+
+// ------------------------------------------------------------ admin filters
+console.log('\n12c. Filtering admin lists');
+const future = new Date(Date.now() + 365 * 86_400_000).toISOString();
+const all = (rows, pred) => Array.isArray(rows) && rows.every(pred);
+
+const options = await api('/api/admin/filter-options', { token: adminToken });
+ok('filter dropdowns get the services and societies', options.services?.length === 4 && options.societies?.length === 3,
+  JSON.stringify({ s: options.services?.length, so: options.societies?.length }));
+
+const doneBookings = await api('/api/admin/bookings?status=COMPLETED,SETTLED&limit=100', { token: adminToken });
+ok('bookings filter by a group of statuses', doneBookings.bookings?.length > 0 && all(doneBookings.bookings, (b) => ['COMPLETED', 'SETTLED'].includes(b.status)),
+  JSON.stringify(doneBookings.bookings?.map((b) => b.status)));
+ok('with tab counts that ignore the status filter', Object.keys(doneBookings.counts || {}).length > 2, JSON.stringify(doneBookings.counts));
+const byPerson = await api(`/api/admin/bookings?q=${encodeURIComponent('Rahul Friend')}&limit=100`, { token: adminToken });
+ok('bookings can be found by the customer on them', byPerson.bookings?.length >= 2 && all(byPerson.bookings, (b) => b.customer?.name === 'Rahul Friend'),
+  JSON.stringify(byPerson.bookings?.map((b) => b.customer?.name)));
+const instantOnly = await api('/api/admin/bookings?type=instant&limit=100', { token: adminToken });
+ok('by booking type', instantOnly.bookings?.length > 0 && all(instantOnly.bookings, (b) => b.bookingType === 'instant'));
+const kitchenOnly = await api('/api/admin/bookings?service=kitchen&limit=100', { token: adminToken });
+ok('by service', kitchenOnly.bookings?.some((b) => b.id === onlineTaskId) && all(kitchenOnly.bookings, (b) => b.services.some((n) => /kitchen/i.test(n))),
+  JSON.stringify(kitchenOnly.bookings?.map((b) => b.services)));
+const onlinePaid = await api('/api/admin/bookings?payment=online&limit=100', { token: adminToken });
+ok('by how they were paid', onlinePaid.bookings?.some((b) => b.id === onlineTaskId) && !onlinePaid.bookings?.some((b) => b.id === taskId));
+ok('by date', (await api(`/api/admin/bookings?from=${future}`, { token: adminToken })).total === 0);
+const oneHelper = await api(`/api/admin/bookings?helper=${winnerId}&status=COMPLETED,SETTLED&limit=100`, { token: adminToken });
+ok('by one helper, with the tab counts narrowed to them too',
+  oneHelper.bookings?.length >= 3 && all(oneHelper.bookings, (b) => ['Helper A', 'Helper B'].includes(b.helper?.name)) &&
+  Object.values(oneHelper.counts || {}).reduce((a, b) => a + b, 0) < (doneBookings.total + 100),
+  JSON.stringify({ n: oneHelper.bookings?.length, counts: oneHelper.counts }));
+ok('a malformed person id matches nothing rather than failing',
+  (await api('/api/admin/bookings?customer=not-an-id', { token: adminToken })).total === 0);
+const pageOne = await api('/api/admin/bookings?limit=1', { token: adminToken });
+ok('and page through the results', pageOne.bookings?.length === 1 && pageOne.pages === pageOne.total && pageOne.total > 1,
+  JSON.stringify({ n: pageOne.bookings?.length, total: pageOne.total, pages: pageOne.pages }));
+
+const onlineHelpers = await api('/api/admin/helpers?online=online', { token: adminToken });
+ok('helpers filter by online', all(onlineHelpers.helpers, (h) => h.isOnline), JSON.stringify(onlineHelpers.helpers?.map((h) => h.isOnline)));
+const sofaHelpers = await api('/api/admin/helpers?service=sofa&status=APPROVED', { token: adminToken });
+ok('by service and verification together', sofaHelpers.helpers?.some((h) => h.id === helperAId) && all(sofaHelpers.helpers, (h) => h.approvalStatus === 'APPROVED' && h.services.includes('sofa')));
+const byJobs = await api('/api/admin/helpers?sort=jobs', { token: adminToken });
+ok('and sort by jobs done', all(byJobs.helpers?.slice(1), (h, i) => (byJobs.helpers[i].completedJobs ?? 0) >= (h.completedJobs ?? 0)),
+  JSON.stringify(byJobs.helpers?.map((h) => h.completedJobs)));
+
+const neverBooked = await api('/api/admin/customers?has=never', { token: adminToken });
+ok('customers filter to those who never booked', all(neverBooked.customers, (c) => c.bookings === 0) && neverBooked.counts?.all >= 0);
+const bySpend = await api('/api/admin/customers?sort=spend', { token: adminToken });
+ok('and sort by spend', all(bySpend.customers?.slice(1), (c, i) => bySpend.customers[i].spend >= c.spend), JSON.stringify(bySpend.customers?.map((c) => c.spend)));
+
+const acceptedTrack = await api('/api/admin/track?status=all&outcome=accepted&limit=100', { token: adminToken });
+ok('track filters by dispatch outcome', acceptedTrack.tasks?.length > 0 && all(acceptedTrack.tasks, (t) => t.summary.accepted > 0));
+const neverAlerted = await api('/api/admin/track?status=all&outcome=not_alerted&limit=100', { token: adminToken });
+ok('including bookings nobody was alerted for', all(neverAlerted.tasks, (t) => t.summary.sent === 0));
+const trackByHelper = await api(`/api/admin/track?status=all&q=${encodeURIComponent('Helper B')}&limit=100`, { token: adminToken });
+ok('and finds bookings by a helper who was only alerted', trackByHelper.tasks?.length > 0 &&
+  all(trackByHelper.tasks, (t) => t.requests.some((r) => r.helperName === 'Helper B') || t.helper?.name === 'Helper B'));
+
+const helperTxns = await api(`/api/admin/finance/transactions?helper=${winnerId}&limit=100`, { token: adminToken });
+ok('transactions filter by helper', helperTxns.transactions?.length >= 2 && all(helperTxns.transactions, (t) => t.helper?.id === winnerId));
+ok('and by date', (await api(`/api/admin/finance/transactions?from=${future}`, { token: adminToken })).total === 0);
+
+const settledLogs = await api('/api/admin/audit?action=COMMISSION_SETTLED', { token: adminToken });
+ok('the audit log filters by action', settledLogs.logs?.length > 0 && all(settledLogs.logs, (l) => l.action === 'COMMISSION_SETTLED'),
+  JSON.stringify(settledLogs.logs?.map((l) => l.action)));
 
 /* --------------------------------------------------------------- Hindi */
 console.log('\n13. Hindi');

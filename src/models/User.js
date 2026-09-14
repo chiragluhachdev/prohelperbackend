@@ -41,11 +41,18 @@ const userSchema = new mongoose.Schema(
     ],
 
     lastLoginAt: { type: Date },
+
+    /** Six characters, handed out once and never reused — see lib/referral.js. */
+    referralCode: { type: String, uppercase: true, trim: true },
+    /** Who referred this account, set once at sign-up and never changed. */
+    referredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    referredAt: { type: Date },
   },
   { timestamps: true },
 );
 
 userSchema.index({ phone: 1, role: 1 }, { unique: true, partialFilterExpression: { phone: { $type: 'string' } } });
 userSchema.index({ email: 1 }, { unique: true, sparse: true });
+userSchema.index({ referralCode: 1 }, { unique: true, partialFilterExpression: { referralCode: { $type: 'string' } } });
 
 export const User = mongoose.model('User', userSchema);

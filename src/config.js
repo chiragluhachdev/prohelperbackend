@@ -108,6 +108,14 @@ export const DEFAULT_SETTINGS = {
   gst_percent: 18,
   surcharge_flat: 20,
   currency: 'INR',
+  // --- referrals ---
+  referral_enabled: true,
+  referral_reward_amount: 100,     // to the person whose code was used
+  referral_welcome_amount: 100,    // to the person who joined with it
+  referral_apply_window_days: 7,   // a code can only be entered this soon after signing up
+  referral_max_booking_percent: 50, // at most this share of a booking's total can be paid with referral balance
+  // --- start (the customer's code before work begins) ---
+  start_otp_enabled: true,
   // --- completion (UC-C17) ---
   completion_otp_ttl_seconds: 900,
   completion_otp_max_attempts: 5,

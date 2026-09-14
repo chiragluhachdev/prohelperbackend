@@ -1,10 +1,19 @@
 import { Router } from 'express';
-import { Notification, Service } from '../models/index.js';
+import { Notification, Service, Category } from '../models/index.js';
 import { authenticate } from '../lib/auth.js';
 import { wrap, notFound } from '../lib/http.js';
 import { getSettings } from '../lib/settings.js';
 
 const router = Router();
+
+/** GET /api/categories — the dynamic categories for the home screen. */
+router.get(
+  '/categories',
+  wrap(async (_req, res) => {
+    const categories = await Category.find({ active: true }).sort({ sortOrder: 1, name: 1 }).lean();
+    res.json(categories);
+  })
+);
 
 /** GET /api/services — the catalog both apps render. Configurable, not hard-coded. */
 router.get(

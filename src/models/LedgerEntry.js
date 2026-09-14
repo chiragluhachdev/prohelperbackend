@@ -11,7 +11,13 @@ const ledgerEntrySchema = new mongoose.Schema(
     taskId: { type: mongoose.Schema.Types.ObjectId, ref: 'Task', index: true },
     type: {
       type: String,
-      enum: ['JOB_EARNING', 'PLATFORM_COMMISSION', 'ADJUSTMENT', 'PAYOUT', 'REFERRAL_REWARD', 'REFUND'],
+      enum: [
+        'JOB_EARNING', 'PLATFORM_COMMISSION', 'ADJUSTMENT', 'PAYOUT', 'REFERRAL_REWARD', 'REFUND',
+        // A helper paid part of what they owe from their referral balance.
+        'DUES_PAYMENT',
+        // A customer's referral credit on a cash job — the platform makes it up to the helper.
+        'REFERRAL_CREDIT',
+      ],
       required: true,
     },
     direction: { type: String, enum: ['CREDIT', 'DEBIT'], required: true },

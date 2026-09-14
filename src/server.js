@@ -18,6 +18,7 @@ import commonRoutes from './routes/common.js';
 import customerRoutes from './routes/customer.js';
 import helperRoutes from './routes/helper.js';
 import adminRoutes from './routes/admin.js';
+import referralRoutes from './routes/referrals.js';
 
 export function createApp() {
   const app = express();
@@ -44,6 +45,7 @@ export function createApp() {
   app.use('/api/customer', customerRoutes);
   app.use('/api/helper', helperRoutes);
   app.use('/api/admin', adminRoutes);
+  app.use('/api/referrals', referralRoutes);
 
   app.use((req, res) => res.status(404).json({ error: { message: `No route for ${req.method} ${req.path}`, code: 'NOT_FOUND' } }));
 

@@ -44,6 +44,8 @@ const pricingSchema = new mongoose.Schema(
     platformFeePercent: { type: Number, default: 0 },
     platformFee: { type: Number, default: 0 },
     discount: { type: Number, default: 0 },
+    /** Paid from the customer's referral balance — the platform covers it, the helper is never short. */
+    referralCredit: { type: Number, default: 0 },
     promoCode: { type: String, default: '' },
     total: { type: Number, default: 0 },
     helperCommissionPercent: { type: Number, default: 0 },
@@ -89,7 +91,19 @@ const taskSchema = new mongoose.Schema(
       enum: ['PENDING', 'PAID', 'SETTLED', 'REFUNDED'],
       default: 'PENDING',
     },
-    paymentMode: { type: String, enum: ['CASH', 'ONLINE'], default: 'CASH' },
+    /** How the job was actually paid for — set only once payment is confirmed. */
+    paymentMode: { type: String, enum: ['CASH', 'ONLINE'], default: null },
+    paidAt: Date,
+    /** Who confirmed the payment: the customer (paid in the app) or the helper (received cash/UPI). */
+    paidBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    paidByRole: { type: String, enum: ['customer', 'helper'] },
+
+    // --- start handshake: the customer's code proves the helper is at the door ---
+    startOtp: {
+      code: { type: String, select: false },
+      attempts: { type: Number, default: 0 },
+      issuedAt: Date,
+    },
 
     // --- completion handshake (UC-C17) ---
     completionOtp: {
