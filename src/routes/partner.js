@@ -5,6 +5,8 @@ import { authenticate, requireRole } from '../lib/auth.js';
 import { wrap, badRequest, conflict } from '../lib/http.js';
 import { getSettings } from '../lib/settings.js';
 import { ensureReferralCode, referralBalance } from '../lib/referral.js';
+import { upload, uploadBuffer } from '../lib/cloudinary.js';
+import { publicUser } from './auth.js';
 
 const router = Router();
 router.use(authenticate, requireRole(ROLES.PARTNER));
@@ -24,7 +26,27 @@ router.put(
     req.user.name = name;
     await req.user.save();
     
-    res.json({ success: true });
+    res.json({ success: true, user: publicUser(req.user) });
+  })
+);
+
+/**
+ * POST /api/partner/profile/photo
+ */
+router.post(
+  '/profile/photo',
+  upload.single('file'),
+  wrap(async (req, res) => {
+    if (!req.file) throw badRequest('Choose a photo to upload.', 'FILE_REQUIRED');
+    const result = await uploadBuffer(req.file.buffer, {
+      folder: 'prohelper/partners',
+      publicId: `partner_${req.user._id}`,
+      resourceType: 'image',
+    });
+    req.user.photoUrl = result.secure_url;
+    req.user.photoPublicId = result.public_id;
+    await req.user.save();
+    res.json({ success: true, user: publicUser(req.user) });
   })
 );
 
