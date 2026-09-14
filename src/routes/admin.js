@@ -1486,7 +1486,7 @@ router.post(
     if (existing) throw conflict('Category with this name already exists.');
 
     const category = await Category.create({ name, nameHi, icon, color, active, sortOrder, comingSoon });
-    await audit(req, 'admin', 'Created category', { categoryId: category._id, name });
+    await audit(req, { action: 'CATEGORY_CREATED', entity: 'Category', entityId: category._id, after: category.toObject() });
     res.json(category);
   }),
 );
@@ -1507,7 +1507,7 @@ router.put(
     if (comingSoon !== undefined) category.comingSoon = comingSoon;
 
     await category.save();
-    await audit(req, 'admin', 'Updated category', { categoryId: category._id, updates: req.body });
+    await audit(req, { action: 'CATEGORY_UPDATED', entity: 'Category', entityId: category._id, after: req.body });
     res.json(category);
   }),
 );
@@ -1519,7 +1519,7 @@ router.delete(
     if (!category) throw notFound('Category not found');
     
     await Category.deleteOne({ _id: req.params.id });
-    await audit(req, 'admin', 'Deleted category', { categoryId: category._id, name: category.name });
+    await audit(req, { action: 'CATEGORY_DELETED', entity: 'Category', entityId: category._id, before: category.toObject() });
     res.json({ ok: true });
   }),
 );
