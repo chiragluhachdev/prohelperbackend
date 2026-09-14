@@ -42,7 +42,7 @@ router.post(
 
     await verifyOtp(phone, code);
 
-    const accounts = await User.find({ phone, role: { $in: [ROLES.CUSTOMER, ROLES.HELPER] } })
+    const accounts = await User.find({ phone, role: { $in: [ROLES.CUSTOMER, ROLES.HELPER, ROLES.PARTNER] } })
       .select('role name status')
       .lean();
 
@@ -61,8 +61,8 @@ router.post(
   '/session',
   wrap(async (req, res) => {
     const { verificationToken, role } = req.body;
-    if (![ROLES.CUSTOMER, ROLES.HELPER].includes(role)) {
-      throw badRequest('Choose whether you are a customer or a helper.', 'INVALID_ROLE');
+    if (![ROLES.CUSTOMER, ROLES.HELPER, ROLES.PARTNER].includes(role)) {
+      throw badRequest('Choose a valid role.', 'INVALID_ROLE');
     }
 
     let payload;

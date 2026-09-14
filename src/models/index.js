@@ -14,3 +14,4 @@ export { Notification } from './Notification.js';
 export { Setting } from './Setting.js';
 export { AuditLog } from './AuditLog.js';
 export { Otp } from './Otp.js';
+export { RedemptionRequest } from './RedemptionRequest.js';

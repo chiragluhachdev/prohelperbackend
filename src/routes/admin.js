@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 import { Router } from 'express';
 import {
   Address, AuditLog, HelperDocument, HelperProfile, JobRequest,
-  LedgerEntry, Rating, ReferralEntry, Service, Task, TaskEvent, User, Category
+  LedgerEntry, Rating, ReferralEntry, Service, Task, TaskEvent, User, Category, RedemptionRequest
 } from '../models/index.js';
 import { ROLES, TASK_STATUS, HELPER_APPROVAL, BUSINESS_TZ, dayKey } from '../config.js';
 import { authenticate, requireAdmin } from '../lib/auth.js';
@@ -1521,6 +1521,97 @@ router.delete(
     await Category.deleteOne({ _id: req.params.id });
     await audit(req, { action: 'CATEGORY_DELETED', entity: 'Category', entityId: category._id, before: category.toObject() });
     res.json({ ok: true });
+  }),
+);
+
+/* ------------------------------------------------------------ referral partners & redemptions */
+
+router.get(
+  '/partners',
+  wrap(async (req, res) => {
+    const filter = { role: ROLES.PARTNER };
+    if (req.query.q) filter.$or = search(req.query.q, ['name', 'phone']).$or;
+    if (req.query.status) filter.status = req.query.status;
+    
+    const pg = pageOf(req.query, 25);
+    const [partners, total] = await Promise.all([
+      User.find(filter).sort({ createdAt: -1 }).skip(pg.skip).limit(pg.limit).lean(),
+      User.countDocuments(filter),
+    ]);
+
+    res.json({ partners, total, ...pg });
+  }),
+);
+
+router.post(
+  '/partners',
+  wrap(async (req, res) => {
+    const { name, phone } = req.body;
+    const cleanPhone = String(phone || '').replace(/[^\d]/g, '').slice(-10);
+    if (!cleanPhone || cleanPhone.length !== 10) throw badRequest('Enter a valid 10-digit mobile number.');
+    if (!name) throw badRequest('Name is required.');
+
+    const taken = await User.exists({ phone: cleanPhone, role: ROLES.PARTNER });
+    if (taken) throw conflict('A partner with this phone number already exists.');
+
+    const partner = await User.create({ phone: cleanPhone, name, role: ROLES.PARTNER });
+    await audit(req, { action: 'PARTNER_CREATED', entity: 'User', entityId: partner._id, after: partner.toObject() });
+    res.status(201).json(partner);
+  }),
+);
+
+router.get(
+  '/redemptions',
+  wrap(async (req, res) => {
+    const filter = {};
+    if (req.query.status) filter.status = req.query.status;
+    
+    const pg = pageOf(req.query, 25);
+    const [requests, total] = await Promise.all([
+      RedemptionRequest.find(filter)
+        .populate('userId', 'name phone')
+        .populate('processedBy', 'name')
+        .sort({ createdAt: -1 })
+        .skip(pg.skip)
+        .limit(pg.limit)
+        .lean(),
+      RedemptionRequest.countDocuments(filter),
+    ]);
+
+    res.json({ requests, total, ...pg });
+  }),
+);
+
+router.put(
+  '/redemptions/:id',
+  wrap(async (req, res) => {
+    const request = await RedemptionRequest.findById(req.params.id);
+    if (!request) throw notFound('Request not found');
+    if (request.status !== 'PROCESSING') throw badRequest(`Request is already ${request.status}`);
+
+    const { status, rejectionReason } = req.body;
+    if (!['PAID', 'REJECTED'].includes(status)) throw badRequest('Invalid status');
+
+    const before = request.toObject();
+    request.status = status;
+    request.processedBy = req.user._id;
+    request.processedAt = new Date();
+    
+    if (status === 'REJECTED') {
+      request.rejectionReason = rejectionReason || '';
+      // Refund the partner's referral balance
+      await ReferralEntry.create({
+        userId: request.userId,
+        type: 'PARTNER_REDEMPTION', // Reuse type, but positive amount
+        amount: request.amount,
+        ref: `refund_req:${request._id}`,
+        note: `Redemption rejected: ${rejectionReason || 'No reason provided'}`,
+      });
+    }
+
+    await request.save();
+    await audit(req, { action: 'REDEMPTION_UPDATED', entity: 'RedemptionRequest', entityId: request._id, before, after: request.toObject() });
+    res.json(request);
   }),
 );
 

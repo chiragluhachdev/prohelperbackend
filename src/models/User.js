@@ -47,6 +47,8 @@ const userSchema = new mongoose.Schema(
     /** Who referred this account, set once at sign-up and never changed. */
     referredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     referredAt: { type: Date },
+    /** True if this user has completed their first booking and triggered the referral rewards. */
+    referralRewardEarned: { type: Boolean, default: false },
   },
   { timestamps: true },
 );

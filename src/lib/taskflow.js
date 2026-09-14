@@ -1,7 +1,7 @@
 import { Task, TaskEvent } from '../models/index.js';
 import { ALLOWED_TRANSITIONS } from '../config.js';
 import { conflict } from './http.js';
-import { refundBookingCredit } from './referral.js';
+import { refundBookingCredit, triggerFirstBookingRewards } from './referral.js';
 
 /**
  * The single door through which a task changes status.
@@ -48,6 +48,14 @@ export async function transition(taskId, from, to, options = {}) {
   // Referral balance spent on a booking comes back if the booking never happens.
   if (to === 'CANCELLED' || to === 'EXPIRED') {
     await refundBookingCredit(task).catch((err) => console.error('[referral] refund failed', task.code, err.message));
+  }
+  
+  if (to === 'COMPLETED') {
+    // Both customer and helper might be completing their first booking
+    Promise.all([
+      triggerFirstBookingRewards(task.customerId, task),
+      task.helperId ? triggerFirstBookingRewards(task.helperId, task) : Promise.resolve(),
+    ]).catch(err => console.error('[referral] first booking rewards failed', task.code, err.message));
   }
   return task;
 }

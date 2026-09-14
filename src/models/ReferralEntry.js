@@ -17,6 +17,7 @@ const referralEntrySchema = new mongoose.Schema(
         'BOOKING_REDEMPTION', // customer: spent on a booking
         'BOOKING_REFUND', // customer: that booking was cancelled, so it comes back
         'DUES_SETTLEMENT', // helper: spent on what they owe the platform
+        'PARTNER_REDEMPTION', // partner: requested a payout
       ],
       required: true,
     },

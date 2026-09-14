@@ -103,31 +103,59 @@ export async function applyReferral(user, rawCode) {
 
   const claimed = await User.findOneAndUpdate(
     { _id: user._id, referredBy: null },
-    { $set: { referredBy: referrer._id, referredAt: new Date() } },
+    { $set: { referredBy: referrer._id, referredAt: new Date(), referralRewardEarned: false } },
     { new: true },
   );
   if (!claimed) throw conflict('You have already used a referral code.', 'REFERRAL_ALREADY_APPLIED');
 
+  // We do NOT post rewards yet. They are posted when the first booking completes.
+
+  return { user: claimed, referrerName: firstName(referrer.name), welcome, reward };
+}
+
+/**
+ * Triggered when a task is completed. If this is the user's first completed booking
+ * and they joined with a referral code, post the rewards to both parties.
+ */
+export async function triggerFirstBookingRewards(userId, task) {
+  const user = await User.findById(userId).populate('referredBy', 'name role status').lean();
+  if (!user || !user.referredBy || user.referralRewardEarned) return;
+
+  const referrer = user.referredBy;
+  if (referrer.status !== 'active') return;
+
+  const settings = await getSettings();
+  if (!settings.referral_enabled) return;
+
+  const reward = Number(settings.referral_reward_amount) || 0;
+  const welcome = Number(settings.referral_welcome_amount) || 0;
+
+  // Mark the reward as earned atomically so we don't double-pay
+  const marked = await User.findOneAndUpdate(
+    { _id: user._id, referralRewardEarned: false },
+    { $set: { referralRewardEarned: true } },
+  );
+  if (!marked) return; // Raced and lost, already paid
+
   if (reward > 0) {
     await post({
       userId: referrer._id, type: 'REFERRER_REWARD', amount: reward, counterpartyId: user._id,
-      ref: `referral:${user._id}:referrer`, note: `Joined with code ${code}`,
+      ref: `referral:${user._id}:referrer`, note: `Joined with code ${referrer.referralCode || ''}`,
     });
   }
   if (welcome > 0) {
     await post({
       userId: user._id, type: 'WELCOME_REWARD', amount: welcome, counterpartyId: referrer._id,
-      ref: `referral:${user._id}:welcome`, note: `Joined with code ${code}`,
+      ref: `referral:${user._id}:welcome`, note: `Joined with code ${referrer.referralCode || ''}`,
     });
   }
 
-  const joiner = firstName(claimed.name);
+  const joiner = firstName(user.name);
   await notify(referrer._id, 'REFERRAL_REWARD', 'Referral reward',
-    `${joiner || 'Someone'} joined using your code. ₹${reward} added to your referral balance.`,
+    `${joiner || 'Someone'} completed their first booking! ₹${reward} added to your referral balance.`,
     { name: joiner, amount: String(reward) });
-
-  return { user: claimed, referrerName: firstName(referrer.name), welcome, reward };
 }
+
 
 /** The share of a booking's total that referral balance may pay — 50% unless an admin changes it. */
 export function maxBookingPercent(settings) {

@@ -32,7 +32,7 @@ export const CLOUDINARY_ENABLED = Boolean(
 export const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@prohelper.in';
 export const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin@123';
 
-export const ROLES = { CUSTOMER: 'customer', HELPER: 'helper', ADMIN: 'admin' };
+export const ROLES = { CUSTOMER: 'customer', HELPER: 'helper', ADMIN: 'admin', PARTNER: 'partner' };
 
 /** Task lifecycle (spec §60). */
 export const TASK_STATUS = {
