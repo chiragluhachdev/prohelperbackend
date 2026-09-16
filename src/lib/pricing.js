@@ -3,7 +3,7 @@ import { Service } from '../models/index.js';
 import { badRequest } from './http.js';
 import { evaluateAnswers } from './serviceOptions.js';
 import { promoDiscountFor } from './promo.js';
-import { zoneForSociety, zonePrice, zoneRuleText } from './zones.js';
+import { localityByCode, localityPrice } from './localities.js';
 
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 const on = (v) => v === true || v === 'true' || v === 1 || v === '1';
@@ -72,10 +72,10 @@ export function chargeRules(settings) {
  * codes and platform charges are the platform's, never taken out of the
  * helper's pay — a discounted booking still pays the helper in full.
  *
- * Prices themselves can differ by locality: a society may sit in a price zone
- * with its own rule or its own exact prices, and `ctx.society` is what decides
- * which. Whether the extra goes to the helper or stays with the platform is an
- * admin setting (`zone_uplift_to`).
+ * Prices themselves can differ by locality (UC-C43): each locality has its own
+ * price list, and `ctx.society` — the booking's address — decides which one
+ * applies. Whether any extra over the catalog goes to the helper or stays with
+ * the platform is an admin setting (`locality_uplift_to`).
  *
  * @param {Array<{code: string, options?: object}>} selections
  * @param {{ bookingType?: 'instant' | 'scheduled', promo?: object, society?: string }} ctx
@@ -96,8 +96,8 @@ export async function quote(selections, ctx = {}) {
   const services = await Service.find({ code: { $in: codes }, active: true }).lean();
   const byCode = new Map(services.map((s) => [s.code, s]));
 
-  // What this locality pays, if it is priced differently from the catalog.
-  const zone = await zoneForSociety(ctx.society);
+  // This locality's price list, if the booking has one.
+  const locality = await localityByCode(ctx.society);
 
   const lines = selections.map((selection) => {
     const service = byCode.get(String(selection?.code || ''));
@@ -105,15 +105,16 @@ export async function quote(selections, ctx = {}) {
 
     // Questions switched off are not asked, so they cannot be charged for either.
     const evaluated = evaluateAnswers(service, selection.options || selection.answers || {});
-    const { price, listPrice } = zonePrice(zone, service);
+    const { price, listPrice, source } = localityPrice(locality, service);
     return {
       code: service.code,
       name: service.name,
       nameHi: service.nameHi || '',
       icon: service.icon,
       basePrice: price,
-      /** The catalog price, before the locality's rule — what "was ₹177" reads from. */
+      /** The catalog price, and whether this one was fixed for the locality or came from its fallback. */
       listPrice,
+      priceSource: source,
       options: evaluated.values,
       answers: evaluated.answers,
       optionsAmount: evaluated.amount,
@@ -124,9 +125,9 @@ export async function quote(selections, ctx = {}) {
 
   const rules = chargeRules(settings);
   const servicesAmount = round2(lines.reduce((sum, l) => sum + l.amount, 0));
-  // The same booking at catalog prices — what the locality's rule moved.
+  // The same booking at catalog prices — what the locality's prices moved.
   const listServicesAmount = round2(lines.reduce((sum, l) => sum + l.listPrice + l.optionsAmount, 0));
-  const zoneUplift = round2(servicesAmount - listServicesAmount);
+  const localityUplift = round2(servicesAmount - listServicesAmount);
 
   let discount = 0;
   if (rules.discount.enabled && servicesAmount >= rules.discount.minOrder) {
@@ -161,7 +162,7 @@ export async function quote(selections, ctx = {}) {
    * with the platform. Commission is worked out on whichever of the two the
    * helper is being paid on.
    */
-  const payOn = settings.zone_uplift_to === 'platform' ? Math.min(listServicesAmount, servicesAmount) : servicesAmount;
+  const payOn = settings.locality_uplift_to === 'platform' ? Math.min(listServicesAmount, servicesAmount) : servicesAmount;
   const helperCommission = !rules.helperCommission.enabled
     ? 0
     : rules.helperCommission.kind === 'flat'
@@ -175,12 +176,13 @@ export async function quote(selections, ctx = {}) {
     durationMins,
     pricing: {
       servicesAmount,
-      // Locality pricing, kept with the booking so the bill can always be read back.
+      // Locality pricing, kept with the booking: which price list, which version of it,
+      // and what it moved against the catalog — so the bill can always be read back.
       listServicesAmount,
-      zoneUplift,
-      zoneCode: zone?.code || '',
-      zoneName: zone?.name || '',
-      zoneRule: zoneRuleText(zone),
+      localityUplift,
+      localityCode: locality?.code || '',
+      localityName: locality?.name || '',
+      priceVersion: locality?.pricing?.version || 0,
       discount,
       discountPercent: rules.discount.enabled ? rules.discount.percent : 0,
       discountLabel: rules.discount.label,

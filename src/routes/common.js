@@ -5,10 +5,58 @@ import { authenticate } from '../lib/auth.js';
 import { wrap, badRequest, notFound } from '../lib/http.js';
 import { getSettings } from '../lib/settings.js';
 import { handlePaymentCallback } from '../lib/payments.js';
-import { pricedForSociety, zoneRuleText } from '../lib/zones.js';
+import { activeLocalities, detectLocality, pricedForLocality, publicLocality } from '../lib/localities.js';
+import { reverseGeocode, searchPlaces } from '../lib/geocode.js';
 import { notifyAdmins } from '../lib/accounts.js';
 
 const router = Router();
+
+/**
+ * GET /api/localities — the places currently served, for the apps' pickers.
+ * Managed in the admin panel; never the prices, only what is needed to choose.
+ */
+router.get(
+  '/localities',
+  wrap(async (_req, res) => {
+    res.json({ localities: (await activeLocalities()).map(publicLocality) });
+  }),
+);
+
+/**
+ * GET /api/localities/detect?lat=&lng= — which served locality a map pin is
+ * in, for the address picker. `locality` is null outside all of them, with the
+ * nearest one alongside so the app can say how far off the pin is.
+ */
+router.get(
+  '/localities/detect',
+  wrap(async (req, res) => {
+    res.json(await detectLocality(req.query.lat, req.query.lng));
+  }),
+);
+
+/**
+ * GET /api/geo/place?lat=&lng= — everything the map picker shows for a pin in
+ * one call: the street address there, and which served locality it is in.
+ */
+router.get(
+  '/geo/place',
+  wrap(async (req, res) => {
+    const lat = Number(req.query.lat);
+    const lng = Number(req.query.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) throw badRequest('Give a latitude and longitude.', 'INVALID_LOCATION');
+    const [place, detected] = await Promise.all([reverseGeocode(lat, lng), detectLocality(lat, lng)]);
+    res.json({ lat, lng, ...place, ...detected });
+  }),
+);
+
+/** GET /api/geo/search?q=&lat=&lng= — places to jump the map to, biased towards where the customer is looking. */
+router.get(
+  '/geo/search',
+  wrap(async (req, res) => {
+    const near = { lat: Number(req.query.lat), lng: Number(req.query.lng) };
+    res.json({ results: await searchPlaces(req.query.q, near) });
+  }),
+);
 
 /** GET /api/categories — the dynamic categories for the home screen. */
 router.get(
@@ -22,17 +70,17 @@ router.get(
 /**
  * GET /api/services — the catalog both apps render. Configurable, not hard-coded.
  *
- * `?society=` prices it for that locality: a society in a price zone sees that
- * zone's prices, everyone else sees the catalog's. The apps never work a price
+ * `?society=` prices it for that locality (UC-C43): its fixed prices where it
+ * has them, its fallback rule where it does not. The apps never work a price
  * out for themselves, here or anywhere else.
  */
 router.get(
   '/services',
   wrap(async (req, res) => {
     const services = await Service.find({ active: true }).sort({ sortOrder: 1, name: 1 }).lean();
-    const { zone, services: priced } = await pricedForSociety(services, req.query.society);
+    const { locality, services: priced } = await pricedForLocality(services, req.query.society);
     res.json({
-      zone: zone ? { code: zone.code, name: zone.name, rule: zoneRuleText(zone) } : null,
+      locality: locality ? { code: locality.code, name: locality.name } : null,
       services: priced.map((s) => ({
         code: s.code,
         name: s.name,

@@ -19,7 +19,7 @@ import { ensureStartCode, startCodeFields } from '../lib/startCode.js';
 import { getSettings } from '../lib/settings.js';
 import { upload, uploadBuffer } from '../lib/cloudinary.js';
 import { publicUser } from './auth.js';
-import { SOCIETIES, societyByCode } from '../constants/societies.js';
+import { activeLocalities, localityByCode, publicLocality } from '../lib/localities.js';
 
 const router = Router();
 router.use(authenticate, requireRole(ROLES.CUSTOMER));
@@ -76,6 +76,19 @@ function addressText(body, { partial = false } = {}) {
   return out;
 }
 
+/**
+ * The exact spot of an address. A map pin is used as given; without one the
+ * locality's centre stands in, so every address still has a position.
+ */
+function addressPoint(body, locality) {
+  const lat = Number(body.lat);
+  const lng = Number(body.lng);
+  const valid = body.lat !== undefined && body.lng !== undefined && Number.isFinite(lat) && Number.isFinite(lng) &&
+    Math.abs(lat) <= 90 && Math.abs(lng) <= 180 && !(lat === 0 && lng === 0);
+  if (valid) return { lat, lng, pinned: true, formatted: String(body.formatted || '').replace(/\s+/g, ' ').trim().slice(0, 240) };
+  return { lat: locality.lat, lng: locality.lng, pinned: false, formatted: '' };
+}
+
 /** A customer's default address, or their oldest one if somehow none is marked. */
 async function defaultAddress(userId) {
   return (
@@ -96,7 +109,7 @@ router.get(
 
 /** POST /api/customer/addresses — UC-C03. The first one saved becomes default. */
 /** The societies a customer can book in. */
-router.get('/societies', wrap(async (_req, res) => res.json({ societies: SOCIETIES })));
+router.get('/societies', wrap(async (_req, res) => res.json({ societies: (await activeLocalities()).map(publicLocality) })));
 
 router.post(
   '/addresses',
@@ -104,14 +117,16 @@ router.post(
     const { label, line1, landmark } = addressText(req.body);
     const line2 = String(req.body.line2 || '').trim().slice(0, 120);
 
-    // The society supplies city, pincode and coordinates — the customer only
-    // picks which one they live in.
-    const society = societyByCode(req.body.society);
-    if (!society) throw badRequest('Choose your society.', 'SOCIETY_REQUIRED');
+    /*
+     * Where the address is: the customer's map pin when they dropped one, and
+     * the served locality it belongs to — detected from the pin in the app,
+     * and changeable by the customer, but it has to be one that is served.
+     */
+    const society = await localityByCode(req.body.society);
+    if (!society || !society.active) throw badRequest('Choose your society.', 'SOCIETY_REQUIRED');
     const city = society.city;
     const pincode = society.pincode;
-    const lat = society.lat;
-    const lng = society.lng;
+    const { lat, lng, pinned, formatted } = addressPoint(req.body, society);
 
     const count = await Address.countDocuments({ userId: req.user._id, active: true });
     if (count >= MAX_ADDRESSES) {
@@ -132,6 +147,8 @@ router.post(
       society: society.code,
       lat,
       lng,
+      pinned,
+      formatted,
       isDefault,
     });
     res.status(201).json({ address });
@@ -152,15 +169,18 @@ router.patch(
      * exactly as creating one does — otherwise an edited address keeps the old
      * estate's location and matching sends the helper to the wrong gate.
      */
-    if (req.body.society !== undefined) {
-      const society = societyByCode(req.body.society);
-      if (!society) throw badRequest('Choose your society.', 'SOCIETY_REQUIRED');
+    if (req.body.society !== undefined || req.body.lat !== undefined) {
+      const society = await localityByCode(req.body.society ?? address.society);
+      if (!society || !society.active) throw badRequest('Choose your society.', 'SOCIETY_REQUIRED');
       address.society = society.code;
       address.line2 = req.body.line2 || `${society.name}, ${society.area}`;
       address.city = society.city;
       address.pincode = society.pincode;
-      address.lat = society.lat;
-      address.lng = society.lng;
+      // A new pin moves it; a new locality without a pin keeps the pin it had.
+      const point = req.body.lat !== undefined
+        ? addressPoint(req.body, society)
+        : address.pinned ? { lat: address.lat, lng: address.lng, pinned: true, formatted: address.formatted } : addressPoint({}, society);
+      Object.assign(address, point);
     }
     if (req.body.isDefault) {
       await Address.updateMany({ userId: req.user._id }, { $set: { isDefault: false } });
@@ -287,6 +307,13 @@ router.post(
       ? await Address.findOne({ _id: addressId, userId: req.user._id, active: true }).lean()
       : await defaultAddress(req.user._id);
     if (!address) throw badRequest('Choose a valid address.', 'ADDRESS_REQUIRED');
+    // A locality the admin has switched off takes no new bookings.
+    if (address.society) {
+      const locality = await localityByCode(address.society);
+      if (locality && !locality.active) {
+        throw badRequest(`We are not taking bookings in ${locality.name} right now.`, 'LOCALITY_NOT_SERVED');
+      }
+    }
 
     /*
      * An instant booking is timed by the server, not the phone. Trusting a
@@ -348,6 +375,7 @@ router.post(
           label: address.label, line1: address.line1, line2: address.line2,
           landmark: address.landmark, city: address.city, pincode: address.pincode,
           lat: address.lat, lng: address.lng,
+          pinned: Boolean(address.pinned), formatted: address.formatted || '',
         },
         bookingType: instant ? 'instant' : 'scheduled',
         scheduledAt,

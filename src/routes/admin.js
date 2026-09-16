@@ -3,7 +3,7 @@ import { Router } from 'express';
 import {
   Address, AuditLog, Complaint, HelperDocument, HelperProfile, JobRequest,
   LedgerEntry, Payment, PromoCode, PromoRedemption, Rating, ReferralEntry, Rejection,
-  PriceZone, Service, Task, TaskEvent, User, Category, RedemptionRequest
+  Locality, PriceHistory, Service, Task, TaskEvent, User, Category, RedemptionRequest
 } from '../models/index.js';
 import { ROLES, TASK_STATUS, HELPER_APPROVAL, BUSINESS_TZ, SETTING_CHOICES, dayKey } from '../config.js';
 import { authenticate, requireAdmin } from '../lib/auth.js';
@@ -20,9 +20,8 @@ import { normaliseOptions } from '../lib/serviceOptions.js';
 import { documentUrl } from '../lib/cloudinary.js';
 import { DUES_MATCH, PAYOUT_MATCH, PAYOUT_STAGES, SIGNED_DUES, helperEarnings, openPayoutEntries } from '../lib/wallet.js';
 import { publicPayment } from '../lib/payments.js';
-import { invalidateZones, zonePrice, zoneRuleText } from '../lib/zones.js';
+import { allLocalities, fallbackText, invalidateLocalities, localityPrice } from '../lib/localities.js';
 import { ensureReferralCode, referralBalance } from '../lib/referral.js';
-import { SOCIETIES, societyByCode } from '../constants/societies.js';
 
 const router = Router();
 router.use(authenticate, requireAdmin);
@@ -94,7 +93,7 @@ router.get(
     res.json({
       services: services.map((sv) => ({ code: sv.code, name: sv.name, active: sv.active, category: sv.category })),
       categories: categories.map((c) => ({ id: String(c._id), name: c.name })),
-      societies: SOCIETIES.map((so) => ({ code: so.code, name: so.name })),
+      societies: (await allLocalities()).map((so) => ({ code: so.code, name: so.name })),
       auditActions: actions.sort(),
       auditEntities: entities.filter(Boolean).sort(),
     });
@@ -1727,128 +1726,225 @@ router.post(
   }),
 );
 
-/* ----------------------------------------------------------------- price zones */
+/* ------------------------------------------------------------------ localities */
 
-/** Every field of a zone, checked — including that a society is only priced once. */
-async function zoneBody(body, existing = {}) {
-  const code = String(body.code ?? existing.code ?? '').trim().toLowerCase().replace(/\s+/g, '_');
-  if (!/^[a-z0-9_]{2,30}$/.test(code)) throw badRequest('A zone code is 2–30 letters, numbers or underscores.', 'INVALID_CODE');
+/** A locality's own details, checked. The code is fixed once made — everything else refers to it. */
+function localityDetails(body, existing = {}) {
   const name = String(body.name ?? existing.name ?? '').trim();
-  if (!name) throw badRequest('Give the zone a name.', 'NAME_REQUIRED');
-
-  const adjustType = ['percent', 'flat', 'none'].includes(body.adjustType) ? body.adjustType : existing.adjustType || 'percent';
-  const adjustValue = round(Number(body.adjustValue ?? existing.adjustValue ?? 0));
-  if (!Number.isFinite(adjustValue)) throw badRequest('The adjustment must be a number.', 'INVALID_VALUE');
-  if (adjustType === 'percent' && (adjustValue <= -100 || adjustValue > 500)) {
-    throw badRequest('A percentage adjustment must be above −100 and at most 500.', 'INVALID_VALUE');
-  }
-
-  const societies = [...new Set((body.societies ?? existing.societies ?? []).map((c) => String(c)))]
-    .filter((c) => SOCIETIES.some((sc) => sc.code === c));
-
-  // A society priced twice would make the bill depend on which zone was read first.
-  if (societies.length) {
-    const clash = await PriceZone.findOne({
-      societies: { $in: societies },
-      ...(existing._id ? { _id: { $ne: existing._id } } : {}),
-    }).lean();
-    if (clash) {
-      const taken = societies.filter((c) => (clash.societies || []).includes(c)).map((c) => societyByCode(c)?.name || c);
-      throw conflict(`${taken.join(', ')} already belongs to "${clash.name}".`, 'SOCIETY_TAKEN');
-    }
-  }
-
-  const codes = (body.overrides ?? existing.overrides ?? [])
-    .map((o) => ({ serviceCode: String(o.serviceCode || '').trim(), price: round(Number(o.price)) }))
-    .filter((o) => o.serviceCode);
-  for (const o of codes) {
-    if (!Number.isFinite(o.price) || o.price < 0) throw badRequest(`"${o.serviceCode}" needs a price of zero or more.`, 'INVALID_VALUE');
-  }
-  const known = await Service.find({ code: { $in: codes.map((o) => o.serviceCode) } }).select('code').lean();
-  const knownCodes = new Set(known.map((k) => k.code));
-  const overrides = codes.filter((o) => knownCodes.has(o.serviceCode));
-
+  if (!name) throw badRequest('Give the locality a name.', 'NAME_REQUIRED');
+  const num = (v, d) => (v === undefined || v === '' || v === null ? d : Number(v));
+  const lat = num(body.lat, existing.lat ?? 0);
+  const lng = num(body.lng, existing.lng ?? 0);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) throw badRequest('Latitude and longitude must be numbers.', 'INVALID_VALUE');
   return {
-    code, name, adjustType, adjustValue, societies, overrides,
-    description: String(body.description ?? existing.description ?? '').trim().slice(0, 200),
+    name,
+    area: String(body.area ?? existing.area ?? '').trim().slice(0, 80),
+    city: String(body.city ?? existing.city ?? '').trim().slice(0, 60),
+    pincode: String(body.pincode ?? existing.pincode ?? '').trim().slice(0, 10),
+    lat, lng,
+    radiusKm: Math.min(50, Math.max(0.1, num(body.radiusKm, existing.radiusKm ?? 1.5) || 1.5)),
     active: body.active === undefined ? existing.active !== false : Boolean(body.active),
+    sortOrder: Math.round(num(body.sortOrder, existing.sortOrder ?? 0)) || 0,
   };
 }
 
-/** GET /api/admin/zones — the zones, the societies each covers, and what they price. */
+/** What a locality charges for every live service, resolved — the page never does the sums itself. */
+function localityPriceRows(locality, services) {
+  return services.map((sv) => {
+    const { price, listPrice, source } = localityPrice(locality, sv);
+    return { code: sv.code, name: sv.name, listPrice, price, source, difference: round(price - listPrice) };
+  });
+}
+
+/**
+ * GET /api/admin/localities — UC-C43. Every locality with its price list
+ * resolved against the live catalog, and a services × localities grid for
+ * comparing them side by side.
+ */
 router.get(
-  '/zones',
+  '/localities',
   wrap(async (_req, res) => {
-    const [zones, services] = await Promise.all([
-      PriceZone.find().sort({ name: 1 }).lean(),
+    const [localities, services, usage] = await Promise.all([
+      Locality.find().sort({ sortOrder: 1, name: 1 }).lean(),
       Service.find({ active: true }).select('code name basePrice').sort({ sortOrder: 1, name: 1 }).lean(),
+      Address.aggregate([{ $match: { active: true } }, { $group: { _id: '$society', n: { $sum: 1 } } }]),
     ]);
-    const taken = new Set(zones.filter((z) => z.active).flatMap((z) => z.societies || []));
+    const addresses = new Map(usage.map((u) => [u._id, u.n]));
+
     res.json({
-      zones: zones.map((z) => ({
-        ...z,
-        id: String(z._id),
-        rule: zoneRuleText(z),
-        // What this zone actually charges, so the page can show it without doing the sums.
-        prices: services.map((sv) => {
-          const { price, listPrice, source } = zonePrice(z, sv);
-          return { code: sv.code, name: sv.name, listPrice, price, source };
-        }),
-      })),
       services: services.map((sv) => ({ code: sv.code, name: sv.name, basePrice: sv.basePrice })),
-      // Every society we serve, and whether another zone already prices it.
-      societies: SOCIETIES.map((sc) => ({
-        code: sc.code, name: sc.name, area: sc.area, city: sc.city,
-        zone: zones.find((z) => (z.societies || []).includes(sc.code))?.name || null,
-        taken: taken.has(sc.code),
+      localities: localities.map((l) => ({
+        ...l,
+        id: String(l._id),
+        fallbackText: fallbackText(l),
+        fixedCount: (l.pricing?.prices || []).length,
+        addresses: addresses.get(l.code) || 0,
+        prices: localityPriceRows(l, services),
       })),
     });
   }),
 );
 
+/** POST /api/admin/localities — a new place to serve. It starts on catalog prices. */
 router.post(
-  '/zones',
+  '/localities',
   wrap(async (req, res) => {
-    const body = await zoneBody(req.body);
-    if (await PriceZone.exists({ code: body.code })) throw conflict('A zone with that code already exists.', 'CODE_TAKEN');
-    const zone = await PriceZone.create({ ...body, createdBy: req.user._id });
-    invalidateZones();
-    await audit(req, { action: 'ZONE_CREATED', entity: 'PriceZone', entityId: zone._id, after: zone.toObject(), reason: req.body.reason || '' });
-    res.status(201).json({ zone: zone.toObject() });
-  }),
-);
+    const code = String(req.body.code || req.body.name || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+    if (!/^[a-z0-9_]{2,40}$/.test(code)) throw badRequest('A locality code is 2–40 letters, numbers or underscores.', 'INVALID_CODE');
+    if (await Locality.exists({ code })) throw conflict('A locality with that code already exists.', 'CODE_TAKEN');
 
-router.put(
-  '/zones/:id',
-  wrap(async (req, res) => {
-    const zone = await PriceZone.findById(req.params.id);
-    if (!zone) throw notFound('Zone not found.');
-    const before = zone.toObject();
-    const body = await zoneBody(req.body, before);
-    if (body.code !== zone.code && (await PriceZone.exists({ code: body.code }))) {
-      throw conflict('A zone with that code already exists.', 'CODE_TAKEN');
+    // A new locality joins the end of the list unless told where to go.
+    const details = localityDetails(req.body);
+    if (req.body.sortOrder === undefined || req.body.sortOrder === '') {
+      const last = await Locality.findOne().sort({ sortOrder: -1 }).select('sortOrder').lean();
+      details.sortOrder = (last?.sortOrder ?? -1) + 1;
     }
-    Object.assign(zone, body);
-    await zone.save();
-    invalidateZones();
-    await audit(req, {
-      action: 'ZONE_UPDATED', entity: 'PriceZone', entityId: zone._id,
-      before, after: zone.toObject(), reason: req.body.reason || '',
-    });
-    res.json({ zone: zone.toObject() });
+    const locality = await Locality.create({ code, ...details });
+    invalidateLocalities();
+    await audit(req, { action: 'LOCALITY_CREATED', entity: 'Locality', entityId: code, after: locality.toObject(), reason: req.body.reason || '' });
+    res.status(201).json({ locality: locality.toObject() });
   }),
 );
 
-router.delete(
-  '/zones/:id',
+/**
+ * PUT /api/admin/localities/:code — name, area, city, position, and whether it
+ * is served. Switching one off hides it from the apps and stops new bookings
+ * there; addresses, helpers and bookings already in it are left alone.
+ */
+router.put(
+  '/localities/:code',
   wrap(async (req, res) => {
-    const zone = await PriceZone.findById(req.params.id);
-    if (!zone) throw notFound('Zone not found.');
-    await zone.deleteOne();
-    invalidateZones();
-    // Bookings keep the prices they were made with, so removing a zone is safe.
-    await audit(req, { action: 'ZONE_DELETED', entity: 'PriceZone', entityId: zone._id, before: zone.toObject(), reason: req.body.reason || '' });
-    res.json({ ok: true });
+    const locality = await Locality.findOne({ code: req.params.code });
+    if (!locality) throw notFound('Locality not found.');
+    const before = locality.toObject();
+    Object.assign(locality, localityDetails(req.body, before));
+    await locality.save();
+    invalidateLocalities();
+    await audit(req, {
+      action: before.active && !locality.active ? 'LOCALITY_DISABLED' : 'LOCALITY_UPDATED',
+      entity: 'Locality', entityId: locality.code,
+      before: { name: before.name, area: before.area, city: before.city, active: before.active },
+      after: { name: locality.name, area: locality.area, city: locality.city, active: locality.active },
+      reason: req.body.reason || '',
+    });
+    res.json({ locality: locality.toObject() });
+  }),
+);
+
+/**
+ * Saves a locality's price list — its fallback rule and its fixed prices — as
+ * a new version. Only what actually changed is recorded in the price history;
+ * a save that changes nothing does not bump the version.
+ */
+async function savePriceList(req, locality, { fallback, fallbackValue, prices }, reason) {
+  const services = await Service.find().select('code name').lean();
+  const known = new Set(services.map((sv) => sv.code));
+
+  const nextFallback = ['catalog', 'percent', 'flat'].includes(fallback) ? fallback : locality.pricing?.fallback || 'catalog';
+  const nextFallbackValue = nextFallback === 'catalog' ? 0 : round(Number(fallbackValue ?? locality.pricing?.fallbackValue ?? 0));
+  if (!Number.isFinite(nextFallbackValue)) throw badRequest('The fallback adjustment must be a number.', 'INVALID_VALUE');
+  if (nextFallback === 'percent' && (nextFallbackValue <= -100 || nextFallbackValue > 500)) {
+    throw badRequest('A percentage must be above −100 and at most 500.', 'INVALID_VALUE');
+  }
+
+  // One price per service; blank or missing means "use the fallback".
+  const nextPrices = new Map();
+  for (const row of Array.isArray(prices) ? prices : []) {
+    const code = String(row?.serviceCode || '').trim();
+    if (!code || row.price === '' || row.price === null || row.price === undefined) continue;
+    if (!known.has(code)) throw badRequest(`"${code}" is not a service.`, 'UNKNOWN_SERVICE');
+    const price = round(Number(row.price));
+    if (!Number.isFinite(price) || price < 0) throw badRequest(`The price for "${code}" must be zero or more.`, 'INVALID_VALUE');
+    nextPrices.set(code, price);
+  }
+
+  const before = new Map((locality.pricing?.prices || []).map((p) => [p.serviceCode, p.price]));
+  const changes = [];
+  for (const code of new Set([...before.keys(), ...nextPrices.keys()])) {
+    const from = before.has(code) ? before.get(code) : null;
+    const to = nextPrices.has(code) ? nextPrices.get(code) : null;
+    if (from !== to) changes.push({ field: 'price', serviceCode: code, from, to });
+  }
+  const prevFallback = { rule: locality.pricing?.fallback || 'catalog', value: locality.pricing?.fallbackValue || 0 };
+  if (prevFallback.rule !== nextFallback || prevFallback.value !== nextFallbackValue) {
+    changes.push({ field: 'fallback', serviceCode: '', from: prevFallback, to: { rule: nextFallback, value: nextFallbackValue } });
+  }
+  if (!changes.length) return { locality: locality.toObject(), changes: 0 };
+
+  const version = (locality.pricing?.version || 0) + 1;
+  const beforePricing = locality.toObject().pricing;
+  locality.pricing = {
+    fallback: nextFallback,
+    fallbackValue: nextFallbackValue,
+    prices: [...nextPrices.entries()].map(([serviceCode, price]) => ({ serviceCode, price })),
+    version,
+    updatedAt: new Date(),
+    updatedBy: req.user._id,
+  };
+  await locality.save();
+  invalidateLocalities();
+
+  await PriceHistory.insertMany(
+    changes.map((c) => ({
+      localityCode: locality.code, ...c, version,
+      byId: req.user._id, byName: req.user.name || req.user.email, reason,
+    })),
+  );
+  await audit(req, {
+    action: 'LOCALITY_PRICES_CHANGED', entity: 'Locality', entityId: locality.code,
+    before: beforePricing, after: locality.toObject().pricing, reason,
+  });
+  return { locality: locality.toObject(), changes: changes.length };
+}
+
+/** PUT /api/admin/localities/:code/pricing — the fallback rule and fixed prices, saved as a new version. */
+router.put(
+  '/localities/:code/pricing',
+  wrap(async (req, res) => {
+    const locality = await Locality.findOne({ code: req.params.code });
+    if (!locality) throw notFound('Locality not found.');
+    const result = await savePriceList(req, locality, req.body, String(req.body.reason || '').trim().slice(0, 300));
+    res.json(result);
+  }),
+);
+
+/** POST /api/admin/localities/:code/pricing/copy — take another locality's whole price list. */
+router.post(
+  '/localities/:code/pricing/copy',
+  wrap(async (req, res) => {
+    const [locality, source] = await Promise.all([
+      Locality.findOne({ code: req.params.code }),
+      Locality.findOne({ code: String(req.body.from || '') }).lean(),
+    ]);
+    if (!locality) throw notFound('Locality not found.');
+    if (!source) throw notFound('The locality to copy from was not found.');
+    if (source.code === locality.code) throw badRequest('Choose a different locality to copy from.', 'SAME_LOCALITY');
+
+    const result = await savePriceList(req, locality, {
+      fallback: source.pricing?.fallback,
+      fallbackValue: source.pricing?.fallbackValue,
+      prices: source.pricing?.prices || [],
+    }, `Copied from ${source.name}`);
+    res.json(result);
+  }),
+);
+
+/** GET /api/admin/localities/:code/history — every price change, newest first. */
+router.get(
+  '/localities/:code/history',
+  wrap(async (req, res) => {
+    const [rows, services] = await Promise.all([
+      PriceHistory.find({ localityCode: req.params.code }).sort({ createdAt: -1 }).limit(300).lean(),
+      Service.find().select('code name').lean(),
+    ]);
+    const names = new Map(services.map((sv) => [sv.code, sv.name]));
+    res.json({
+      history: rows.map((r) => ({
+        id: String(r._id), version: r.version, field: r.field,
+        serviceCode: r.serviceCode, serviceName: names.get(r.serviceCode) || r.serviceCode,
+        from: r.from, to: r.to, byName: r.byName, reason: r.reason, at: r.createdAt,
+      })),
+    });
   }),
 );
 

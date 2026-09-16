@@ -10,6 +10,7 @@ import './lib/env.js';
 import mongoose from 'mongoose';
 import { connectDb } from './lib/db.js';
 import { ensureSettings } from './lib/settings.js';
+import { ensureLocalities } from './lib/localities.js';
 import { hashPassword } from './lib/auth.js';
 import { ADMIN_EMAIL, ADMIN_PASSWORD, ROLES } from './config.js';
 import { CATALOG } from './scripts/catalog.js';
@@ -45,6 +46,7 @@ async function run() {
   }
 
   await ensureSettings();
+  await ensureLocalities();
   console.log('[seed] settings ready');
 
   for (const s of SERVICES) {

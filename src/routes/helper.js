@@ -19,7 +19,7 @@ import { ensureStartCode } from '../lib/startCode.js';
 import { upload, uploadBuffer, destroyAsset, documentUrl } from '../lib/cloudinary.js';
 import { issueOtp, verifyOtp } from '../lib/otp.js';
 import { publicUser } from './auth.js';
-import { SOCIETIES, societyByCode } from '../constants/societies.js';
+import { activeLocalities, publicLocality } from '../lib/localities.js';
 
 /**
  * Payout details are optional — money changes hands directly today — but if a
@@ -293,7 +293,8 @@ router.put(
   '/service-area',
   wrap(async (req, res) => {
     const codes = Array.isArray(req.body.societies) ? req.body.societies : [];
-    const chosen = codes.map(societyByCode).filter(Boolean);
+    const served = await activeLocalities();
+    const chosen = codes.map((c) => served.find((l) => l.code === c)).filter(Boolean);
 
     if (chosen.length === 0) {
       throw badRequest('Choose at least one society you can work in.', 'NO_SOCIETY');
@@ -316,7 +317,7 @@ router.put(
 );
 
 /** The societies a helper can pick from. */
-router.get('/societies', wrap(async (_req, res) => res.json({ societies: SOCIETIES })));
+router.get('/societies', wrap(async (_req, res) => res.json({ societies: (await activeLocalities()).map(publicLocality) })));
 
 /** POST /api/helper/submit — hands the profile to the admin queue. */
 router.post(

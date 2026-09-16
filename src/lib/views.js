@@ -100,6 +100,9 @@ export function serializeTask(task, { audience = 'customer', helperProfile = nul
       options: s.options || {},
       answers: s.answers || [],
       basePrice: s.basePrice,
+      // What the catalog asks, and where this price came from (locality pricing, UC-C43).
+      listPrice: s.listPrice ?? s.basePrice,
+      priceSource: s.priceSource || 'catalog',
       optionsAmount: s.optionsAmount || 0,
       amount: s.amount,
       minutes: s.minutes || 0,

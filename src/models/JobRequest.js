@@ -15,7 +15,8 @@ const jobRequestSchema = new mongoose.Schema(
       default: 'SENT',
       index: true,
     },
-    distanceKm: { type: Number, default: 0 },
+    /** Null when the helper's position was unknown at the time. */
+    distanceKm: { type: Number, default: null },
     matchedAllServices: { type: Boolean, default: true },
     sentAt: { type: Date, default: Date.now },
     expiresAt: { type: Date, required: true, index: true },

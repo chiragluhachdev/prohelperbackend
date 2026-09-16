@@ -18,6 +18,10 @@ const addressSchema = new mongoose.Schema(
     pincode: { type: String, default: '' },
     lat: { type: Number, required: true },
     lng: { type: Number, required: true },
+    /** True when lat/lng came from the customer's map pin; false when it is the locality's centre. */
+    pinned: { type: Boolean, default: false },
+    /** The street address read from the map where they dropped the pin. */
+    formatted: { type: String, default: '' },
     isDefault: { type: Boolean, default: false },
     active: { type: Boolean, default: true },
   },

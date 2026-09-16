@@ -8,9 +8,10 @@
  * still speak lat/lng — they are not used for precise positioning.
  */
 export const SOCIETIES = [
-  { code: 'rps_savana', name: 'RPS Savana', area: 'Sector 88', city: 'Faridabad', pincode: '121002', lat: 28.3915, lng: 77.3210 },
-  { code: 'rps_auria',  name: 'RPS Auria',  area: 'Sector 88', city: 'Faridabad', pincode: '121002', lat: 28.3892, lng: 77.3186 },
-  { code: 'rps_palms',  name: 'RPS Palms',  area: 'Sector 88', city: 'Faridabad', pincode: '121002', lat: 28.3938, lng: 77.3241 },
+  // Positions from OpenStreetMap (RPS Savana Road, Sector 88). Admins fine-tune them on the map.
+  { code: 'rps_savana', name: 'RPS Savana', area: 'Sector 88', city: 'Faridabad', pincode: '121002', lat: 28.4148, lng: 77.3543, radiusKm: 1 },
+  { code: 'rps_auria',  name: 'RPS Auria',  area: 'Sector 88', city: 'Faridabad', pincode: '121002', lat: 28.4209, lng: 77.3542, radiusKm: 1 },
+  { code: 'rps_palms',  name: 'RPS Palms',  area: 'Sector 88', city: 'Faridabad', pincode: '121002', lat: 28.4157, lng: 77.3543, radiusKm: 1 },
 ];
 
 export const SOCIETY_CODES = SOCIETIES.map((s) => s.code);

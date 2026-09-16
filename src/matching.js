@@ -2,7 +2,8 @@ import mongoose from 'mongoose';
 import { HelperProfile, JobRequest, Task, User } from './models/index.js';
 import { TASK_STATUS, HELPER_APPROVAL, ROLES } from './config.js';
 import { getSettings } from './lib/settings.js';
-import { distanceKm, boundingBox } from './lib/geo.js';
+import { distanceKm } from './lib/geo.js';
+import { allLocalities } from './lib/localities.js';
 import { closeJobAlerts, notify, notifyMany } from './lib/notify.js';
 import { mustTransition, transition } from './lib/taskflow.js';
 import { conflict } from './lib/http.js';
@@ -19,14 +20,17 @@ export { searchTimings, planSearch };
  * UC-C08 — who is allowed to be alerted for this task.
  *
  * Every one of these is a hard gate: approved, not blocked, online, not on DND,
- * covers the address, and offers at least one of the requested services.
- * Availability is the online switch alone — there are no working days or
- * hours. Helpers already alerted for this task are skipped so a later round
- * never spams the same person twice.
+ * not busy at that hour, and offers at least one of the requested services.
+ * Where they work is the admin's call (`match_mode`):
+ *
+ *  anywhere  every available helper, whatever localities they chose
+ *  society   only helpers who chose the booking's locality
+ *
+ * The distance shown to the helper is from the nearest locality they work in
+ * to the booking's address — a rough "how far", not a tracked position.
  */
-export async function findEligibleHelpers(task, { radiusKm, excludeHelperIds = [], ignoreLocation = false }) {
+export async function findEligibleHelpers(task, { excludeHelperIds = [], mode = 'anywhere' }) {
   const point = { lat: task.address.lat, lng: task.address.lng };
-  const box = boundingBox(point, radiusKm);
   const requestedCodes = task.services.map((s) => s.code);
 
   const query = {
@@ -36,28 +40,15 @@ export async function findEligibleHelpers(task, { radiusKm, excludeHelperIds = [
     services: { $in: requestedCodes },
     userId: { $nin: excludeHelperIds },
   };
-  /*
-   * Location, when it is switched on, means "works in this society" rather
-   * than "is within N km" — the MVP serves a handful of named estates, so an
-   * overlap is both more accurate and easier to reason about than a radius.
-   * Falls back to the bounding box for any helper who predates societies.
-   */
   const society = task.address?.society;
-  if (!ignoreLocation) {
-    if (society) {
-      query.societies = society;
-    } else {
-      query['serviceArea.lat'] = { $gte: box.minLat, $lte: box.maxLat };
-      query['serviceArea.lng'] = { $gte: box.minLng, $lte: box.maxLng };
-    }
-  }
+  if (mode === 'society' && society) query.societies = society;
 
-  const profiles = await HelperProfile.find(query)
-    .populate('userId', 'name phone photoUrl status')
-    .lean();
-
-  // Helpers already committed to something at this hour are not offered more work.
-  const busyIds = await busyHelperIds(task);
+  const [profiles, busyIds, localities] = await Promise.all([
+    HelperProfile.find(query).populate('userId', 'name phone photoUrl status').lean(),
+    // Helpers already committed to something at this hour are not offered more work.
+    busyHelperIds(task),
+    allLocalities(),
+  ]);
 
   const candidates = [];
   for (const profile of profiles) {
@@ -65,21 +56,15 @@ export async function findEligibleHelpers(task, { radiusKm, excludeHelperIds = [
     if (!user || user.status !== 'active') continue;
     if (busyIds.has(String(user._id))) continue;
 
-    // Distance is still reported so the helper sees how far the job is; in
-    // ignore-location mode it simply stops being a reason to exclude anyone.
-    const km = distanceKm(profile.serviceArea, point);
-    if (!ignoreLocation && !society) {
-      const reach = Math.min(radiusKm, profile.serviceArea?.radiusKm ?? radiusKm);
-      if (km > reach) continue;
-    }
-
+    const km = workAreaDistance(profile, point, localities);
     const offered = new Set(profile.services || []);
     const matchedAll = requestedCodes.every((code) => offered.has(code));
 
     candidates.push({
       helperId: user._id,
       name: user.name,
-      distanceKm: Number.isFinite(km) ? Math.round(km * 10) / 10 : 0,
+      // Unknown stays unknown, not "0 km".
+      distanceKm: Number.isFinite(km) ? Math.round(km * 10) / 10 : null,
       matchedAllServices: matchedAll,
       rating: profile.ratingAvg || 0,
       completedJobs: profile.completedJobs || 0,
@@ -90,10 +75,20 @@ export async function findEligibleHelpers(task, { radiusKm, excludeHelperIds = [
   candidates.sort(
     (a, b) =>
       Number(b.matchedAllServices) - Number(a.matchedAllServices) ||
-      a.distanceKm - b.distanceKm ||
+      (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity) ||
       b.rating - a.rating,
   );
   return candidates;
+}
+
+/** From the nearest locality a helper works in to a point; Infinity when none has a position. */
+export function workAreaDistance(profile, point, localities = []) {
+  if (!Number.isFinite(point?.lat) || !Number.isFinite(point?.lng)) return Number.POSITIVE_INFINITY;
+  const distances = (profile.societies || [])
+    .map((code) => localities.find((l) => l.code === code))
+    .filter((l) => l && Number.isFinite(l.lat) && Number.isFinite(l.lng) && (l.lat || l.lng))
+    .map((l) => distanceKm({ lat: l.lat, lng: l.lng }, point));
+  return distances.length ? Math.min(...distances) : Number.POSITIVE_INFINITY;
 }
 
 /** Helpers whose accepted/in-progress job overlaps this task's time window. */
@@ -154,9 +149,16 @@ export async function startSearch(taskId, actorId) {
   return task;
 }
 
+/** The admin's matching mode: every available helper, or only those who work in the locality. */
+export const matchMode = (settings) => (settings.match_mode === 'society' ? 'society' : 'anywhere');
+
+/** How the search area reads in the matching history. */
+function matchAreaText(settings) {
+  return matchMode(settings) === 'society' ? 'Helpers in this locality' : 'All available helpers';
+}
+
 /** The first line of a booking's matching history: how this search is going to run. */
 export async function logSearchStarted(task, settings, reason = 'Search started') {
-  const ignoreLocation = settings.match_ignore_location !== false;
   const scheduled = task.searchMode === 'scheduled';
   return logMatching(task._id, reason, {
     step: 'SEARCH_STARTED',
@@ -165,7 +167,7 @@ export async function logSearchStarted(task, settings, reason = 'Search started'
     closesAt: task.searchExpiresAt,
     waves: scheduled ? task.searchWaves : undefined,
     remindEverySeconds: scheduled ? undefined : Number(settings.renotify_interval_seconds) || undefined,
-    area: ignoreLocation ? 'All areas' : `Within ${settings.search_radius_km} km`,
+    area: matchAreaText(settings),
   });
 }
 
@@ -197,10 +199,8 @@ export async function dispatchTask(taskId) {
   if (now >= deadline) return exhaust(task, 'Nobody accepted within the search window');
 
   const scheduled = task.searchMode === 'scheduled';
-  const ignoreLocation = settings.match_ignore_location !== false;
-  // With location on, the net widens a step each re-notify interval.
-  const radiusKm =
-    settings.search_radius_km + Math.floor((now - startedAt) / (interval * 1000)) * settings.radius_step_km;
+  const mode = matchMode(settings);
+  const ignoreLocation = mode === 'anywhere';
 
   // Every alert this task has ever sent, newest first per helper.
   const history = await JobRequest.find({ taskId: task._id }).sort({ round: -1 }).lean();
@@ -214,7 +214,7 @@ export async function dispatchTask(taskId) {
     ...(task.helperCancellations || []).map((c) => c.helperId),
   ];
 
-  const candidates = await findEligibleHelpers(task, { radiusKm, excludeHelperIds: declined, ignoreLocation });
+  const candidates = await findEligibleHelpers(task, { excludeHelperIds: declined, mode });
 
   const fresh = [];
   const renotify = [];
@@ -311,13 +311,13 @@ export async function dispatchTask(taskId) {
       alerted: alertedNames,
       reminded: remindedNames,
       ringsUntil: expiresAt,
-      area: ignoreLocation ? 'All areas' : `Within ${radiusKm} km`,
+      area: matchAreaText(settings),
     });
 
     console.log(
       `[match] ${task.code} → ${newcomers.length} new, ${renotify.length} re-notified` +
         (scheduled ? ` (wave ${wavesSent + 1}/${wavesPlanned})` : '') +
-        (ignoreLocation ? ' (all areas)' : ` within ${radiusKm}km`) +
+        (mode === 'society' ? ' (same locality)' : ' (all areas)') +
         ` · ${Math.round(remainingMs / 1000)}s left`,
     );
   }

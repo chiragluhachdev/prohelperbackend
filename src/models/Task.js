@@ -14,6 +14,8 @@ const addressSnapshotSchema = new mongoose.Schema(
     pincode: String,
     lat: Number,
     lng: Number,
+    pinned: Boolean,
+    formatted: String,
   },
   { _id: false },
 );
@@ -46,6 +48,8 @@ const taskServiceSchema = new mongoose.Schema(
     /** What this service cost here, and what the catalog asks for it. */
     basePrice: Number,
     listPrice: Number,
+    /** fixed — set for this locality; fallback — the locality's rule; catalog — no locality price. */
+    priceSource: String,
     /** key → value, for code that needs the raw answer. */
     options: { type: mongoose.Schema.Types.Mixed, default: {} },
     /** The same answers with their question text and what each added — what people read (UC-C05). */
@@ -66,12 +70,13 @@ const taskServiceSchema = new mongoose.Schema(
 const pricingSchema = new mongoose.Schema(
   {
     servicesAmount: { type: Number, default: 0 },
-    /** The same booking at catalog prices, and what the locality's rule added. */
+    /** Locality pricing (UC-C43): the same booking at catalog prices, what the locality's prices added,
+        and which price list — at which version — set them. */
     listServicesAmount: { type: Number, default: 0 },
-    zoneUplift: { type: Number, default: 0 },
-    zoneCode: { type: String, default: '' },
-    zoneName: { type: String, default: '' },
-    zoneRule: { type: String, default: '' },
+    localityUplift: { type: Number, default: 0 },
+    localityCode: { type: String, default: '' },
+    localityName: { type: String, default: '' },
+    priceVersion: { type: Number, default: 0 },
     discount: { type: Number, default: 0 },
     discountPercent: { type: Number, default: 0 },
     discountLabel: { type: String, default: '' },

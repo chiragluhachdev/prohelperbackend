@@ -946,22 +946,22 @@ const audit = await api('/api/admin/audit', { token: adminToken });
 /*
  * Settings are typed. A boolean arriving from a form as the string "false"
  * used to be stored as a string, and every `if (setting)` in the codebase
- * would have read it as true — the location filter would have stayed off.
+ * would have read it as true — a switched-off rule would have stayed on.
  */
 const boolOff = await api('/api/admin/settings', {
-  method: 'PUT', token: adminToken, body: { match_ignore_location: 'false' },
+  method: 'PUT', token: adminToken, body: { accept_after_ring_enabled: 'false' },
 });
-ok('a boolean setting stays a boolean', boolOff.settings?.match_ignore_location === false,
-  JSON.stringify(boolOff.settings?.match_ignore_location));
+ok('a boolean setting stays a boolean', boolOff.settings?.accept_after_ring_enabled === false,
+  JSON.stringify(boolOff.settings?.accept_after_ring_enabled));
 
 const numBad = await api('/api/admin/settings', {
   method: 'PUT', token: adminToken, body: { accept_window_seconds: 'soon' },
 });
 ok('a number setting refuses nonsense', numBad.status === 400, JSON.stringify(numBad.error));
 
-await api('/api/admin/settings', { method: 'PUT', token: adminToken, body: { match_ignore_location: true } });
+await api('/api/admin/settings', { method: 'PUT', token: adminToken, body: { accept_after_ring_enabled: true } });
 const restored = await api('/api/admin/settings', { token: adminToken });
-ok('settings can be put back', restored.settings?.match_ignore_location === true);
+ok('settings can be put back', restored.settings?.accept_after_ring_enabled === true);
 
 // Editing an address has to carry the new society's city and coordinates.
 const addr = me.addresses[0];

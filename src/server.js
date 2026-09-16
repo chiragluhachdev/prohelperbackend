@@ -12,6 +12,7 @@ import { connectDb } from './lib/db.js';
 import { ensureSettings } from './lib/settings.js';
 import { ApiError } from './lib/http.js';
 import { recoverOnBoot, startDispatcher } from './matching.js';
+import { ensureLocalities } from './lib/localities.js';
 
 import authRoutes from './routes/auth.js';
 import commonRoutes from './routes/common.js';
@@ -82,6 +83,8 @@ export function createApp() {
 async function main() {
   await connectDb();
   await ensureSettings();
+  // The first run on a new database turns the built-in estates into editable localities.
+  await ensureLocalities();
 
   const app = createApp();
   const server = app.listen(PORT, () => {

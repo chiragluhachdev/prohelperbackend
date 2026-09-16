@@ -78,8 +78,13 @@ export const HELPER_APPROVAL = {
 /** Initial values for the admin-tunable rules. Seeded once, then owned by the DB. */
 export const DEFAULT_SETTINGS = {
   // --- matching (UC-C08 / UC-C10 / UC-C12) ---
-  search_radius_km: 12,          // covers most of a metro on the first wave
-  radius_step_km: 15,            // widen by this much each dispatch round
+  /**
+   * Which helpers a booking is sent to (UC-C08):
+   *  anywhere  — every available helper
+   *  society   — only helpers who work in the booking's locality
+   * Helpers choose their localities; the admin chooses how strictly they apply.
+   */
+  match_mode: 'anywhere',
   /*
    * The search is a window, not a fixed number of rounds: it stays open this
    * long, alerting helpers as they become available, then closes as
@@ -93,15 +98,7 @@ export const DEFAULT_SETTINGS = {
    */
   scheduled_notify_waves: 5,
   scheduled_close_minutes_before: 30, // stop searching this long before the slot
-  /**
-   * MVP: alert every eligible helper regardless of distance.
-   *
-   * The other gates still apply — approved, not blocked, online, not on DND,
-   * offers the service, working that day and hour. Only the distance and
-   * service-area checks are skipped. Set to false to switch the radius back on.
-   */
-  match_ignore_location: true,
-  dispatch_batch_size: 3,         // with location on: new helpers alerted at a time, nearest first
+  dispatch_batch_size: 3,         // society mode: new helpers alerted per pass, nearest first
   accept_window_seconds: 60,      // how long each alert rings (never longer than the re-notify interval)
   /**
    * Whether a helper may still take a job after their own alert stopped
@@ -137,11 +134,11 @@ export const DEFAULT_SETTINGS = {
   helper_commission_flat: 0,      // used when the type is flat
   currency: 'INR',
   /**
-   * Locality pricing: where the extra goes when a society is priced above the
-   * catalog. 'helper' — the helper is paid on the price the customer paid.
-   * 'platform' — the helper is paid as if it were the catalog price.
+   * Locality pricing (UC-C43): where the extra goes when a locality is priced
+   * above the catalog. 'helper' — the helper is paid on the price the customer
+   * paid. 'platform' — the helper is paid as if it were the catalog price.
    */
-  zone_uplift_to: 'helper', // helper | platform
+  locality_uplift_to: 'helper', // helper | platform
   // --- promo codes (UC-C32) ---
   promo_enabled: true,
   // --- online payment (UC-C28) ---
@@ -189,9 +186,10 @@ export const SETTING_CHOICES = {
   surcharge_applies_to: ['all', 'instant', 'scheduled'],
   gst_base: ['all', 'fees'],
   customer_cancel_until: ['SEARCHING', 'ACCEPTED', 'IN_PROGRESS'],
+  match_mode: ['anywhere', 'society'],
   platform_fee_type: ['percent', 'flat'],
   helper_commission_type: ['percent', 'flat'],
-  zone_uplift_to: ['helper', 'platform'],
+  locality_uplift_to: ['helper', 'platform'],
   referral_qualify_event: ['COMPLETED', 'SETTLED'],
   helper_cancel_action: ['research', 'cancel'],
 };

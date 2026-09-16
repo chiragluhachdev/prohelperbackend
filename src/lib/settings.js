@@ -1,5 +1,5 @@
 import { Setting } from '../models/index.js';
-import { DEFAULT_SETTINGS } from '../config.js';
+import { DEFAULT_SETTINGS, SETTING_CHOICES } from '../config.js';
 
 /**
  * Settings are read on nearly every request, so they are cached for a few
@@ -14,6 +14,10 @@ export async function ensureSettings() {
   const ops = Object.entries(DEFAULT_SETTINGS).map(([key, value]) => ({
     updateOne: { filter: { key }, update: { $setOnInsert: { key, value } }, upsert: true },
   }));
+  // A choice that no longer exists (match_mode "nearby", say) goes back to the default.
+  for (const [key, choices] of Object.entries(SETTING_CHOICES)) {
+    ops.push({ updateOne: { filter: { key, value: { $nin: choices } }, update: { $set: { value: DEFAULT_SETTINGS[key] } } } });
+  }
   if (ops.length) await Setting.bulkWrite(ops);
   invalidateSettings();
 }
