@@ -27,6 +27,10 @@ const referralEntrySchema = new mongoose.Schema(
     counterpartyId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     taskId: { type: mongoose.Schema.Types.ObjectId, ref: 'Task' },
     ref: { type: String, required: true, unique: true },
+    /** The id this transaction is known by outside the database (UC-C35). */
+    txnId: { type: String, unique: true, sparse: true },
+    /** REVERSED is a reward taken back; everything else takes effect at once. */
+    status: { type: String, enum: ['SETTLED', 'REVERSED'], default: 'SETTLED' },
     note: { type: String, default: '' },
   },
   { timestamps: true },

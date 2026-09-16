@@ -1,12 +1,53 @@
 import { TASK_STATUS } from '../config.js';
+import { badRequest } from './http.js';
 
-/** The four tabs both apps show, mapped onto real statuses. */
+/** The helper app's tabs, mapped onto real statuses. */
 export const TASK_TABS = {
   upcoming: [TASK_STATUS.CREATED, TASK_STATUS.SEARCHING, TASK_STATUS.ACCEPTED],
   active: [TASK_STATUS.IN_PROGRESS, TASK_STATUS.COMPLETION_PENDING],
   completed: [TASK_STATUS.COMPLETED, TASK_STATUS.SETTLED],
   cancelled: [TASK_STATUS.CANCELLED, TASK_STATUS.EXPIRED, TASK_STATUS.NO_HELPER_AVAILABLE],
 };
+
+/**
+ * UC-C19 — the customer's booking history, one filter per tab.
+ *
+ *  cancelled   the customer called it off
+ *  rejected    it was called off on their side of the table: by the helper,
+ *              Pro Helper (an admin), or the system — or it expired
+ *  no_helper   the search ended without anyone accepting
+ */
+export const CUSTOMER_TABS = {
+  upcoming: { status: { $in: TASK_TABS.upcoming } },
+  active: { status: { $in: TASK_TABS.active } },
+  completed: { status: { $in: TASK_TABS.completed } },
+  cancelled: { status: TASK_STATUS.CANCELLED, 'cancellation.by': 'customer' },
+  rejected: {
+    $or: [
+      { status: TASK_STATUS.CANCELLED, 'cancellation.by': { $ne: 'customer' } },
+      { status: TASK_STATUS.EXPIRED },
+    ],
+  },
+  no_helper: { status: TASK_STATUS.NO_HELPER_AVAILABLE },
+};
+
+/** A rating as sent by either app, checked: whole stars 1–5, a short comment, a few short tags. */
+export function ratingInput(body = {}) {
+  const stars = Number(body.stars);
+  if (!Number.isInteger(stars) || stars < 1 || stars > 5) throw badRequest('Choose between 1 and 5 stars.', 'INVALID_RATING');
+  const comment = String(body.comment ?? '').trim().slice(0, 500);
+  const tags = (Array.isArray(body.tags) ? body.tags : [])
+    .map((tag) => String(tag).trim().slice(0, 40))
+    .filter(Boolean)
+    .slice(0, 8);
+  return { stars, comment, tags };
+}
+
+/** When a job should be done by: its start (or slot, if not started) plus how long it was booked for. */
+export function expectedEndAt(t) {
+  const start = new Date(t.startedAt || t.scheduledAt || t.createdAt);
+  return new Date(start.getTime() + (Number(t.durationMins) || 60) * 60_000);
+}
 
 export const STATUS_LABELS = {
   CREATED: 'Creating',
@@ -57,7 +98,11 @@ export function serializeTask(task, { audience = 'customer', helperProfile = nul
       nameHi: s.nameHi || '',
       icon: s.icon,
       options: s.options || {},
+      answers: s.answers || [],
+      basePrice: s.basePrice,
+      optionsAmount: s.optionsAmount || 0,
       amount: s.amount,
+      minutes: s.minutes || 0,
     })),
     address: t.address,
     bookingType: t.bookingType || 'scheduled',
@@ -78,7 +123,17 @@ export function serializeTask(task, { audience = 'customer', helperProfile = nul
     startedAt: t.startedAt,
     completedAt: t.completedAt,
     settledAt: t.settledAt,
-    cancellation: t.cancellation?.at ? t.cancellation : null,
+    cancellation: t.cancellation?.at
+      ? {
+          by: t.cancellation.by,
+          reason: t.cancellation.reason,
+          previousStatus: t.cancellation.previousStatus,
+          at: t.cancellation.at,
+          financialImpact: t.cancellation.financialImpact || null,
+        }
+      : null,
+    expectedEndAt: expectedEndAt(t),
+    overdue: Boolean(t.overdueNotifiedAt) && ['ACCEPTED', 'IN_PROGRESS', 'COMPLETION_PENDING'].includes(t.status),
   };
 
   if (audience === 'customer') {
@@ -97,12 +152,18 @@ export function serializeTask(task, { audience = 'customer', helperProfile = nul
             jobsLabel: helperProfile ? jobsLabel(helperProfile) : null,
             experienceYears: helperProfile?.experienceYears ?? null,
           }
-        : null,
+        : t.helperId && t.helperSnapshot?.name
+          // The account is gone or wasn't loaded: the booking still says who did it.
+          ? { id: String(t.helperId), name: t.helperSnapshot.name, phone: '', photoUrl: '' }
+          : null,
+      // How many helpers took this booking and then dropped it.
+      helperChanges: (t.helperCancellations || []).length,
       rated: Boolean(t.ratedByCustomer),
       // Read out to the helper at the door; gone once work has started.
       startOtp: t.status === 'ACCEPTED' ? t.startOtp?.code ?? null : null,
       // Only meaningful once the helper has asked to close the job (UC-C17).
       completionOtp: t.status === 'COMPLETION_PENDING' ? t.completionOtp?.code ?? null : null,
+      completionOtpExpiresAt: t.status === 'COMPLETION_PENDING' ? t.completionOtp?.expiresAt ?? null : null,
     };
   }
 

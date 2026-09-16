@@ -1,17 +1,47 @@
+import crypto from 'node:crypto';
 import { LedgerEntry } from '../models/index.js';
+
+/** The id a transaction is known by outside the database (UC-C35). */
+export const newTxnId = () => `TXN-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
 
 /**
  * Appends a ledger row. `ref` is unique, so calling this twice for the same
  * event is a no-op rather than double-paying anyone (UC-C50).
  * @returns the entry, or null if it already existed.
  */
-export async function postEntry({ userId, taskId, type, direction, amount, note, ref, currency = 'INR' }) {
+export async function postEntry({
+  userId, taskId, type, direction, amount, note, ref,
+  currency = 'INR', source = 'TASK', settled = false,
+}) {
   try {
-    return await LedgerEntry.create({ userId, taskId, type, direction, amount, note, ref, currency });
+    return await LedgerEntry.create({
+      userId, taskId, type, direction, amount, note, ref, currency, source,
+      txnId: newTxnId(),
+      settled,
+      status: settled ? 'SETTLED' : 'PENDING',
+    });
   } catch (err) {
     if (err?.code === 11000) return null; // already posted
     throw err;
   }
+}
+
+/** One wallet row as the apps and the admin panel read it (UC-C35). */
+export function publicEntry(e) {
+  return {
+    id: String(e._id),
+    txnId: e.txnId || String(e._id),
+    type: e.type,
+    direction: e.direction,
+    amount: Math.round((e.amount || 0) * 100) / 100,
+    currency: e.currency || 'INR',
+    source: e.source || 'TASK',
+    status: e.status || (e.settled ? 'SETTLED' : 'PENDING'),
+    note: e.note || '',
+    taskId: e.taskId ? String(e.taskId._id || e.taskId) : null,
+    taskCode: e.taskId?.code || '',
+    at: e.createdAt,
+  };
 }
 
 /** Rolls the helper's rows up into the numbers the Earnings screen shows. */

@@ -5,6 +5,7 @@ import { authenticate, requireRole } from '../lib/auth.js';
 import { wrap, badRequest, conflict } from '../lib/http.js';
 import { getSettings } from '../lib/settings.js';
 import { ensureReferralCode, referralBalance } from '../lib/referral.js';
+import { newTxnId } from '../lib/ledger.js';
 import { upload, uploadBuffer } from '../lib/cloudinary.js';
 import { publicUser } from './auth.js';
 
@@ -143,6 +144,7 @@ router.post(
 
     const row = await ReferralEntry.create({
       userId: req.user._id,
+      txnId: newTxnId(),
       type: 'PARTNER_REDEMPTION',
       amount: -round2(amount),
       ref: `redemption_req:${req.user._id}:${Date.now()}`,

@@ -5,6 +5,7 @@ import { badRequest, conflict } from './http.js';
 import { getSettings } from './settings.js';
 import { notify } from './notify.js';
 import { asId, DUES_MATCH, helperDues } from './wallet.js';
+import { newTxnId } from './ledger.js';
 
 const round2 = (n) => Math.round((n || 0) * 100) / 100;
 
@@ -56,7 +57,7 @@ export async function referralBalance(userId) {
 
 async function post(entry) {
   try {
-    return await ReferralEntry.create(entry);
+    return await ReferralEntry.create({ txnId: newTxnId(), ...entry });
   } catch (err) {
     if (err?.code === 11000) return null; // already written
     throw err;
@@ -127,7 +128,9 @@ export async function triggerFirstBookingRewards(userId, task) {
   const settings = await getSettings();
   if (!settings.referral_enabled) return;
 
-  const reward = Number(settings.referral_reward_amount) || 0;
+  // A referral partner (a guard, a society contact) has their own rate (UC-C34).
+  const isPartner = referrer.role === ROLES.PARTNER;
+  const reward = Number(isPartner ? settings.partner_reward_amount : settings.referral_reward_amount) || 0;
   const welcome = Number(settings.referral_welcome_amount) || 0;
 
   // Mark the reward as earned atomically so we don't double-pay
@@ -139,13 +142,14 @@ export async function triggerFirstBookingRewards(userId, task) {
 
   if (reward > 0) {
     await post({
-      userId: referrer._id, type: 'REFERRER_REWARD', amount: reward, counterpartyId: user._id,
-      ref: `referral:${user._id}:referrer`, note: `Joined with code ${referrer.referralCode || ''}`,
+      userId: referrer._id, type: 'REFERRER_REWARD', amount: reward, counterpartyId: user._id, taskId: task?._id,
+      ref: `referral:${user._id}:referrer`,
+      note: isPartner ? `Cashback — ${firstName(user.name) || 'someone'} you signed up finished their first booking` : `Joined with code ${referrer.referralCode || ''}`,
     });
   }
   if (welcome > 0) {
     await post({
-      userId: user._id, type: 'WELCOME_REWARD', amount: welcome, counterpartyId: referrer._id,
+      userId: user._id, type: 'WELCOME_REWARD', amount: welcome, counterpartyId: referrer._id, taskId: task?._id,
       ref: `referral:${user._id}:welcome`, note: `Joined with code ${referrer.referralCode || ''}`,
     });
   }
@@ -256,7 +260,7 @@ export async function settleDuesFromReferral(helper) {
   }
 
   if (duesAfter === 0) {
-    await LedgerEntry.updateMany({ userId: asId(helper._id), ...DUES_MATCH }, { $set: { settled: true } });
+    await LedgerEntry.updateMany({ userId: asId(helper._id), ...DUES_MATCH }, { $set: { settled: true, status: 'SETTLED' } });
   }
 
   return { settled: amount, referralBalance: balanceAfter, owedToPlatform: Math.max(0, duesAfter) };

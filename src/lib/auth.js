@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import { JWT_SECRET, JWT_TTL, ROLES } from '../config.js';
 import { User } from '../models/index.js';
-import { unauthorized, forbidden } from './http.js';
+import { accountBlocked, unauthorized, forbidden } from './http.js';
 
 export function signToken(user) {
   return jwt.sign({ sub: String(user._id), role: user.role }, JWT_SECRET, { expiresIn: JWT_TTL });
@@ -40,7 +40,7 @@ export async function authenticate(req, _res, next) {
     const user = await User.findById(payload.sub);
     if (!user) throw unauthorized('Account no longer exists');
     if (user.status === 'blocked') {
-      throw forbidden(user.blockReason || 'This account has been blocked. Please contact support.');
+      throw accountBlocked(user.blockReason);
     }
 
     req.user = user;

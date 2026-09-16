@@ -12,6 +12,7 @@
     "start": "node src/server.js",
     "seed": "node src/seed.js",
     "seed:reset": "node src/seed.js --reset",
+    "catalog:sync": "node src/scripts/sync-catalog.js",
     "test": "node tests/smoke.mjs"
   },
   "dependencies": {

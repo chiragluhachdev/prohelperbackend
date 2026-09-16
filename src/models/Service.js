@@ -1,17 +1,39 @@
 import mongoose from 'mongoose';
 
-/** UC-C05 — the per-service questions are data, not hard-coded screens. */
+/**
+ * UC-C05 — the per-service questions are data, not hard-coded screens.
+ * The rules for reading and pricing them live in lib/serviceOptions.js.
+ */
 const serviceOptionSchema = new mongoose.Schema(
   {
     key: { type: String, required: true },
     label: { type: String, required: true },
-    type: { type: String, enum: ['number', 'text', 'select', 'boolean'], default: 'text' },
+    labelHi: { type: String, default: '' },
+    help: { type: String, default: '' },
+    helpHi: { type: String, default: '' },
+    placeholder: { type: String, default: '' },
+    placeholderHi: { type: String, default: '' },
+    type: {
+      type: String,
+      enum: ['select', 'multiselect', 'number', 'boolean', 'text', 'textarea', 'time', 'date'],
+      default: 'text',
+    },
+    // Choice lists: parallel arrays, lined up by position.
     choices: [{ type: String }],
+    choicesHi: [{ type: String }],
+    choicePrices: [{ type: Number }],
+    choiceMinutes: [{ type: Number }],
     unit: { type: String, default: '' },
+    unitHi: { type: String, default: '' },
+    min: { type: Number, default: null },
+    max: { type: Number, default: null },
+    step: { type: Number, default: 1 },
     required: { type: Boolean, default: false },
     defaultValue: { type: mongoose.Schema.Types.Mixed },
-    // adds `pricePerUnit * value` to the line item when set
+    /** number: × value · boolean: when yes · multiselect: × how many picked */
     pricePerUnit: { type: Number, default: 0 },
+    /** The same, for how long the job takes. */
+    minutesPerUnit: { type: Number, default: 0 },
   },
   { _id: false },
 );

@@ -2,20 +2,21 @@ import crypto from 'node:crypto';
 import { Router } from 'express';
 import {
   HelperDocument, HelperProfile, JobRequest, LedgerEntry,
-  Rating, Service, Task, TaskEvent,
+  Rating, Service, Task, TaskEvent, User,
 } from '../models/index.js';
 import { ROLES, TASK_STATUS, HELPER_APPROVAL } from '../config.js';
 import { authenticate, requireRole } from '../lib/auth.js';
 import { wrap, badRequest, notFound, conflict, forbidden } from '../lib/http.js';
-import { serializeTask, TASK_TABS } from '../lib/views.js';
+import { serializeTask, TASK_TABS, ratingInput } from '../lib/views.js';
 import { mustTransition } from '../lib/taskflow.js';
-import { acceptJob, declineJob } from '../matching.js';
+import { acceptJob, declineJob, releaseHelperJob } from '../matching.js';
+import { sameCode, sendSms } from '../lib/sms.js';
 import { notify } from '../lib/notify.js';
 import { getSettings } from '../lib/settings.js';
 import { postEntry, earningsSummary } from '../lib/ledger.js';
-import { helperBalances, walletStatement } from '../lib/wallet.js';
+import { helperBalances, helperEarnings, walletStatement } from '../lib/wallet.js';
 import { ensureStartCode } from '../lib/startCode.js';
-import { upload, uploadBuffer, destroyAsset } from '../lib/cloudinary.js';
+import { upload, uploadBuffer, destroyAsset, documentUrl } from '../lib/cloudinary.js';
 import { issueOtp, verifyOtp } from '../lib/otp.js';
 import { publicUser } from './auth.js';
 import { SOCIETIES, societyByCode } from '../constants/societies.js';
@@ -93,7 +94,7 @@ router.get(
       user: publicUser(req.user),
       profile: req.profile.toObject(),
       checklist: req.profile.checklist(documents.length),
-      documents,
+      documents: documents.map(helperDocument),
       canGoOnline: req.profile.approvalStatus === HELPER_APPROVAL.APPROVED,
     });
   }),
@@ -194,7 +195,7 @@ router.get(
   '/documents',
   wrap(async (req, res) => {
     const documents = await HelperDocument.find({ helperId: req.user._id }).sort({ createdAt: -1 }).lean();
-    res.json({ documents });
+    res.json({ documents: documents.map(helperDocument) });
   }),
 );
 
@@ -226,7 +227,8 @@ router.post(
       folder: `prohelper/kyc/${req.user._id}`,
       publicId: `${type}_${crypto.randomBytes(4).toString('hex')}`,
       resourceType: mimetype === 'application/pdf' ? 'raw' : 'image',
-      privateFile: false,
+      // KYC files are stored privately: the URL alone opens nothing (UC-C25).
+      privateFile: true,
     });
 
     // Re-uploading a document type replaces the previous submission.
@@ -241,12 +243,13 @@ router.post(
       type,
       url: result.secure_url,
       publicId: result.public_id,
+      private: true,
       originalName: originalname,
       mimeType: mimetype,
       sizeBytes: sizeBytes || buffer.length,
       status: 'PENDING',
     });
-    res.status(201).json({ document: doc });
+    res.status(201).json({ document: helperDocument(doc) });
   }),
 );
 
@@ -477,11 +480,15 @@ router.post(
 router.get(
   '/jobs',
   wrap(async (req, res) => {
-    const filter = { helperId: req.user._id };
+    let filter = { helperId: req.user._id };
     const tab = req.query.tab;
     if (tab) {
       if (!TASK_TABS[tab]) throw badRequest('Unknown tab.', 'INVALID_TAB');
       filter.status = { $in: TASK_TABS[tab] };
+    }
+    // A job the helper dropped is no longer theirs, but it is still part of their history.
+    if (tab === 'cancelled') {
+      filter = { $or: [filter, { 'helperCancellations.helperId': req.user._id }] };
     }
     const tasks = await Task.find(filter)
       .populate('customerId', 'name phone photoUrl')
@@ -494,18 +501,30 @@ router.get(
 router.get(
   '/jobs/:id',
   wrap(async (req, res) => {
-    const task = await Task.findOne({ _id: req.params.id, helperId: req.user._id })
-      .populate('customerId', 'name phone photoUrl');
+    const task = await Task.findOne({
+      _id: req.params.id,
+      $or: [{ helperId: req.user._id }, { 'helperCancellations.helperId': req.user._id }],
+    }).populate('customerId', 'name phone photoUrl');
     if (!task) throw notFound('Job not found.');
+    const mine = task.helperId && String(task.helperId) === String(req.user._id);
     const [timeline, settings] = await Promise.all([
-      TaskEvent.find({ taskId: task._id }).sort({ at: 1 }).lean(),
+      TaskEvent.find({ taskId: task._id, kind: { $ne: 'MATCHING' } }).sort({ at: 1 }).lean(),
       getSettings(),
     ]);
+    const view = serializeTask(task, { audience: 'helper' });
+    // A job they dropped: what happened to it next is not theirs to see.
+    if (!mine) {
+      const dropped = (task.helperCancellations || []).filter((c) => String(c.helperId) === String(req.user._id)).pop();
+      Object.assign(view, { status: 'CANCELLED', statusLabel: 'Cancelled', customer: null, address: { ...view.address, line1: '', landmark: '' } });
+      view.cancellation = dropped ? { by: dropped.by, reason: dropped.reason, at: dropped.at, previousStatus: dropped.previousStatus } : null;
+    }
     res.json({
-      task: serializeTask(task, { audience: 'helper' }),
-      timeline,
+      task: view,
+      timeline: mine ? timeline : [],
       // Whether Start asks for the customer's code — an admin can switch it off.
       startOtpRequired: settings.start_otp_enabled !== false,
+      startRule: startRule(task, settings),
+      cancelRule: mine ? helperCancelRule(task, settings) : { allowed: false },
     });
   }),
 );
@@ -525,6 +544,18 @@ router.post(
     const settings = await getSettings();
     const required = settings.start_otp_enabled !== false;
 
+    // "At the scheduled time": a booking for later can't be started hours early.
+    const booked = await Task.findOne({ _id: req.params.id, helperId: req.user._id }).select('status bookingType scheduledAt').lean();
+    if (!booked) throw notFound('Job not found.');
+    const rule = startRule(booked, settings);
+    if (booked.status === TASK_STATUS.ACCEPTED && !rule.allowed) {
+      throw badRequest(
+        `This job can be started from ${rule.from.toISOString()} — ${rule.earlyMinutes} minutes before the booked time.`,
+        'START_TOO_EARLY',
+        { from: rule.from, earlyMinutes: rule.earlyMinutes },
+      );
+    }
+
     if (required) {
       const current = await Task.findOne({ _id: req.params.id, helperId: req.user._id }).select('+startOtp.code');
       if (!current) throw notFound('Job not found.');
@@ -541,7 +572,7 @@ router.post(
       if (attempts >= max) {
         throw badRequest('Too many incorrect codes. Ask the customer to get a new start code.', 'START_OTP_LOCKED');
       }
-      if (entered !== code) {
+      if (!sameCode(entered, code)) {
         await Task.updateOne({ _id: current._id }, { $inc: { 'startOtp.attempts': 1 } });
         const left = max - attempts - 1;
         if (left <= 0) throw badRequest('Too many incorrect codes. Ask the customer to get a new start code.', 'START_OTP_LOCKED');
@@ -574,32 +605,64 @@ router.post(
   requireApproved,
   wrap(async (req, res) => {
     const settings = await getSettings();
-    const code = String(crypto.randomInt(100000, 1000000));
-    const expiresAt = new Date(Date.now() + settings.completion_otp_ttl_seconds * 1000);
+    const now = new Date();
+    const ttl = Math.max(60, Number(settings.completion_otp_ttl_seconds) || 900);
+    const cooldown = Math.max(0, Number(settings.completion_otp_resend_seconds) || 0);
+    const maxSends = Math.max(1, Number(settings.completion_otp_max_sends) || 5);
 
+    const current = await Task.findOne({ _id: req.params.id, helperId: req.user._id }).select('status completionOtp').lean();
+    if (!current) throw notFound('Job not found.');
+    if (![TASK_STATUS.IN_PROGRESS, TASK_STATUS.COMPLETION_PENDING].includes(current.status)) {
+      throw conflict(`This booking is ${current.status.toLowerCase().replace(/_/g, ' ')}.`, 'INVALID_STATE');
+    }
+    /*
+     * A new code resets the wrong-attempt count, so sending new codes has
+     * limits of its own — a short wait between them and a cap per job —
+     * or the attempt limit could be sidestepped by asking again and again.
+     */
+    const sends = current.completionOtp?.sends || 0;
+    const lastIssued = current.completionOtp?.issuedAt ? new Date(current.completionOtp.issuedAt) : null;
+    if (current.status === TASK_STATUS.COMPLETION_PENDING && lastIssued && now - lastIssued < cooldown * 1000) {
+      const wait = Math.ceil((cooldown * 1000 - (now - lastIssued)) / 1000);
+      throw badRequest(`Please wait ${wait} seconds before sending a new code.`, 'OTP_RESEND_TOO_SOON', { retryInSeconds: wait });
+    }
+    if (sends >= maxSends) {
+      throw badRequest('Too many codes have been sent for this job. Contact support to close it.', 'OTP_SEND_LIMIT');
+    }
+
+    const code = String(crypto.randomInt(100000, 1000000));
+    const expiresAt = new Date(now.getTime() + ttl * 1000);
     const task = await mustTransition(
       req.params.id,
       [TASK_STATUS.IN_PROGRESS, TASK_STATUS.COMPLETION_PENDING],
       TASK_STATUS.COMPLETION_PENDING,
       {
         set: {
-          completionRequestedAt: new Date(),
+          completionRequestedAt: now,
           'completionOtp.code': code,
           'completionOtp.expiresAt': expiresAt,
           'completionOtp.attempts': 0,
-          'completionOtp.issuedAt': new Date(),
+          'completionOtp.issuedAt': now,
+          'completionOtp.sends': sends + 1,
         },
-        extraFilter: { helperId: req.user._id },
-        actorType: 'helper', actorId: req.user._id, reason: 'Completion OTP requested',
+        // Guards against two taps both passing the checks above.
+        extraFilter: { helperId: req.user._id, 'completionOtp.sends': current.completionOtp?.sends ?? { $in: [null, 0] } },
+        actorType: 'helper', actorId: req.user._id,
+        reason: sends ? `Completion OTP sent again (${sends + 1} of ${maxSends})` : 'Completion OTP requested',
       },
     );
 
+    // To the customer's registered number, and in their app — never to the helper.
+    const customer = await User.findById(task.customerId).select('phone').lean();
+    await sendSms(customer?.phone, `Pro Helper: share ${code} with your helper to confirm ${task.code} is complete. Valid for ${Math.round(ttl / 60)} min.`);
     await notify(task.customerId, 'COMPLETION_OTP', 'Confirm job completion',
       `Share code ${code} with your helper to close ${task.code}.`,
       { taskId: String(task._id), code, taskCode: task.code });
 
-    console.log(`[completion] ${task.code} otp → ${code}`);
-    res.json({ sent: true, expiresAt, expiresInSeconds: settings.completion_otp_ttl_seconds });
+    res.json({
+      sent: true, expiresAt, expiresInSeconds: ttl,
+      resendInSeconds: cooldown, sendsLeft: Math.max(0, maxSends - sends - 1),
+    });
   }),
 );
 
@@ -622,10 +685,15 @@ router.post(
       throw badRequest('Too many incorrect attempts. Request a new OTP.', 'OTP_ATTEMPTS_EXCEEDED');
     }
 
-    if (task.completionOtp.code !== entered) {
-      task.completionOtp.attempts += 1;
-      await task.save();
-      const left = settings.completion_otp_max_attempts - task.completionOtp.attempts;
+    if (!sameCode(entered, task.completionOtp.code)) {
+      // Counted in the database, not on the loaded copy, so parallel guesses all count.
+      const counted = await Task.findOneAndUpdate(
+        { _id: task._id, status: TASK_STATUS.COMPLETION_PENDING },
+        { $inc: { 'completionOtp.attempts': 1 } },
+        { new: true },
+      ).lean();
+      const left = Math.max(0, settings.completion_otp_max_attempts - (counted?.completionOtp?.attempts ?? 0));
+      if (left <= 0) throw badRequest('Too many incorrect attempts. Request a new OTP.', 'OTP_ATTEMPTS_EXCEEDED');
       throw badRequest(`Incorrect OTP. ${left} attempt${left === 1 ? '' : 's'} left.`, 'OTP_INVALID');
     }
 
@@ -643,6 +711,15 @@ router.post(
     await HelperProfile.updateOne({ userId: req.user._id }, { $inc: { completedJobs: 1 } });
     await notify(completed.customerId, 'TASK_COMPLETED', 'Job completed',
       `${completed.code} is complete. Pay your helper to close it out.`, { taskId: String(completed._id), code: completed.code });
+
+    // UC-C20 / UC-C21 — each side is asked to rate the other; either can do it later.
+    const customer = await User.findById(completed.customerId).select('name').lean();
+    await notify(completed.customerId, 'RATE_HELPER', 'How did it go?',
+      `Rate ${req.user.name || 'your helper'} for ${completed.code}.`,
+      { taskId: String(completed._id), code: completed.code, helperName: req.user.name || '' });
+    await notify(req.user._id, 'RATE_CUSTOMER', 'Rate your customer',
+      `How was working with ${customer?.name || 'the customer'} on ${completed.code}?`,
+      { taskId: String(completed._id), code: completed.code, customerName: customer?.name || '' });
 
     res.json({
       task: serializeTask(completed, { audience: 'helper' }),
@@ -685,11 +762,12 @@ router.post(
       amount: helperPayout, currency, note: `Earning for ${settled.code} (cash/UPI, paid direct)`,
       ref: `earning:${settled._id}`,
     });
-    // What they collected beyond their own payout — the platform's cut — is owed
-    // back. If the customer paid part with referral balance the helper was handed
-    // that much less, so it comes off; should it outweigh the platform's cut, the
-    // platform owes the helper the difference instead.
-    const net = round2((platformFee || 0) + (helperCommission || 0) - (referralCredit || 0));
+    // Everything they were handed beyond their own payout is the platform's:
+    // its fee, surcharge and commission, and the GST it has to pay on. A
+    // discount or referral balance means they were handed that much less, which
+    // comes off — and should that outweigh the platform's share, the platform
+    // owes the helper the difference instead. In one line: cash in hand − payout.
+    const net = round2((total || 0) - (referralCredit || 0) - (helperPayout || 0));
     const owed = Math.max(0, net);
     if (net > 0) {
       await postEntry({
@@ -719,16 +797,56 @@ router.post(
 
 const round2 = (n) => Math.round((n || 0) * 100) / 100;
 
+/**
+ * A document as its owner sees it: never the stored path, only a link that
+ * works for a few minutes (UC-C25).
+ */
+function helperDocument(doc) {
+  const d = doc.toObject ? doc.toObject() : doc;
+  return {
+    _id: String(d._id), type: d.type, status: d.status, remark: d.remark || '',
+    originalName: d.originalName || '', mimeType: d.mimeType || '',
+    createdAt: d.createdAt, reviewedAt: d.reviewedAt || null,
+    url: documentUrl(d),
+  };
+}
+
+/**
+ * UC-C16 — when an accepted job may be started. An instant booking: straight
+ * away. A booking for later: from `start_early_minutes` before its slot.
+ */
+function startRule(task, settings) {
+  const early = Math.max(0, Number(settings.start_early_minutes) || 0);
+  if (task.bookingType === 'instant' || !early || !task.scheduledAt) return { allowed: true, earlyMinutes: early, from: null };
+  const from = new Date(new Date(task.scheduledAt).getTime() - early * 60_000);
+  return { allowed: Date.now() >= from.getTime(), earlyMinutes: early, from };
+}
+
+/** UC-C22 — whether this helper can still drop this job, and if not, why. */
+function helperCancelRule(task, settings) {
+  const minutesBefore = Math.max(0, Number(settings.helper_cancel_min_minutes_before) || 0);
+  if (settings.helper_cancel_enabled === false) return { allowed: false, why: 'DISABLED', minutesBefore };
+  if (task.status !== TASK_STATUS.ACCEPTED) return { allowed: false, why: 'STARTED', minutesBefore };
+  if (task.bookingType !== 'instant' && minutesBefore && task.scheduledAt) {
+    const cutoff = new Date(task.scheduledAt).getTime() - minutesBefore * 60_000;
+    // A slot already past can always be dropped — nobody is going to be there.
+    if (Date.now() > cutoff && Date.now() < new Date(task.scheduledAt).getTime()) {
+      return { allowed: false, why: 'TOO_LATE', minutesBefore };
+    }
+  }
+  return { allowed: true, minutesBefore, action: settings.helper_cancel_action || 'research' };
+}
+
 /** UC-C21 — the helper rates the customer. */
 router.post(
   '/jobs/:id/rate',
   wrap(async (req, res) => {
-    const stars = Number(req.body.stars);
-    if (!(stars >= 1 && stars <= 5)) throw badRequest('Choose between 1 and 5 stars.', 'INVALID_RATING');
+    const { stars, comment, tags } = ratingInput(req.body);
 
     const task = await Task.findOne({ _id: req.params.id, helperId: req.user._id });
     if (!task) throw notFound('Job not found.');
-    if (![TASK_STATUS.COMPLETED, TASK_STATUS.SETTLED].includes(task.status)) {
+    // Only a job that genuinely finished — closed with the customer's OTP.
+    if (![TASK_STATUS.COMPLETED, TASK_STATUS.SETTLED].includes(task.status) || !task.completedAt) {
       throw conflict('You can only rate a completed job.', 'NOT_COMPLETED');
     }
 
@@ -736,7 +854,7 @@ router.post(
       await Rating.create({
         taskId: task._id, direction: 'helper_to_customer',
         fromUserId: req.user._id, toUserId: task.customerId,
-        stars, comment: req.body.comment || '',
+        stars, comment, tags,
       });
     } catch (err) {
       if (err?.code === 11000) throw conflict('You have already rated this job.', 'ALREADY_RATED');
@@ -746,6 +864,59 @@ router.post(
     task.ratedByHelper = true;
     await task.save();
     res.status(201).json({ ok: true, stars });
+  }),
+);
+
+/**
+ * POST /api/helper/jobs/:id/cancel — UC-C22, the helper drops a job they
+ * accepted but have not started. Within the admin's rules: switched on, and
+ * not too close to a booking-for-later's slot. The customer is not left
+ * without anyone: by default the search starts again (see releaseHelperJob).
+ * It counts as a rejection towards the auto-block threshold.
+ */
+router.post(
+  '/jobs/:id/cancel',
+  requireApproved,
+  wrap(async (req, res) => {
+    const reason = String(req.body.reason || '').trim().slice(0, 300);
+    if (reason.length < 3) throw badRequest('Please tell us why you are dropping this job.', 'REASON_REQUIRED');
+
+    const settings = await getSettings();
+    const task = await Task.findOne({ _id: req.params.id, helperId: req.user._id }).lean();
+    if (!task) throw notFound('Job not found.');
+    const rule = helperCancelRule(task, settings);
+    if (!rule.allowed) {
+      const messages = {
+        DISABLED: 'Jobs cannot be dropped from the app. Contact support.',
+        STARTED: 'This job has already started. Contact support if you cannot finish it.',
+        TOO_LATE: `It is too close to the booked time to drop this job (${rule.minutesBefore} minutes' notice needed). Contact support.`,
+      };
+      throw conflict(messages[rule.why] || 'This job can no longer be dropped.', rule.why === 'TOO_LATE' ? 'CANCEL_TOO_LATE' : 'NOT_CANCELLABLE');
+    }
+
+    const { task: updated, research } = await releaseHelperJob(task._id, { by: 'helper', actorId: req.user._id, reason });
+    res.json({ ok: true, research, status: updated.status });
+  }),
+);
+
+/** GET /api/helper/ratings — what customers said about this helper, and what the helper said back. */
+router.get(
+  '/ratings',
+  wrap(async (req, res) => {
+    const [received, given] = await Promise.all([
+      Rating.find({ toUserId: req.user._id, direction: 'customer_to_helper' })
+        .populate('taskId', 'code services completedAt').sort({ createdAt: -1 }).limit(100).lean(),
+      Rating.find({ fromUserId: req.user._id, direction: 'helper_to_customer' })
+        .populate('taskId', 'code services completedAt').sort({ createdAt: -1 }).limit(100).lean(),
+    ]);
+    const row = (r) => ({
+      id: String(r._id), stars: r.stars, comment: r.comment, tags: r.tags || [], at: r.createdAt,
+      task: r.taskId ? { id: String(r.taskId._id), code: r.taskId.code, services: (r.taskId.services || []).map((sv) => ({ code: sv.code, name: sv.name, nameHi: sv.nameHi || '' })) } : null,
+    });
+    res.json({
+      average: req.profile.ratingAvg, count: req.profile.ratingCount,
+      received: received.map(row), given: given.map(row),
+    });
   }),
 );
 
@@ -767,7 +938,7 @@ router.get(
 router.get(
   '/earnings',
   wrap(async (req, res) => {
-    const [summary, entries, balances] = await Promise.all([
+    const [summary, entries, balances, earnings] = await Promise.all([
       earningsSummary(req.user._id),
       LedgerEntry.find({ userId: req.user._id })
         .populate('taskId', 'code services scheduledAt')
@@ -775,6 +946,7 @@ router.get(
         .limit(50)
         .lean(),
       helperBalances(req.user._id),
+      helperEarnings(req.user._id),
     ]);
 
     res.json({
@@ -785,9 +957,15 @@ router.get(
         owedToPlatform: balances.owedToPlatform,
         payoutDue: balances.payoutDue,
         balance: balances.balance,
+        // UC-C26 — the full picture, every figure straight off the records.
+        ...earnings,
       },
       entries: entries.map((e) => ({
         id: String(e._id),
+        // UC-C35 — every row carries its own transaction id, source and status.
+        txnId: e.txnId || String(e._id),
+        source: e.source || 'TASK',
+        status: e.status || (e.settled ? 'SETTLED' : 'PENDING'),
         type: e.type,
         direction: e.direction,
         amount: e.amount,

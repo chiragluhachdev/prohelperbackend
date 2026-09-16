@@ -11,6 +11,8 @@ export class ApiError extends Error {
 export const badRequest = (m, code, d) => new ApiError(400, m, code, d);
 export const unauthorized = (m = 'Not signed in') => new ApiError(401, m, 'UNAUTHORIZED');
 export const forbidden = (m = 'Not allowed') => new ApiError(403, m, 'FORBIDDEN');
+/** A blocked account (UC-C23) — its own code, so the apps can say so instead of a generic error. */
+export const accountBlocked = (m) => new ApiError(403, m || 'This account has been blocked. Please contact support.', 'ACCOUNT_BLOCKED');
 export const notFound = (m = 'Not found') => new ApiError(404, m, 'NOT_FOUND');
 export const conflict = (m, code) => new ApiError(409, m, code);
 

@@ -12,7 +12,8 @@ import { connectDb } from './lib/db.js';
 import { ensureSettings } from './lib/settings.js';
 import { hashPassword } from './lib/auth.js';
 import { ADMIN_EMAIL, ADMIN_PASSWORD, ROLES } from './config.js';
-import { HINDI_CATALOG } from './scripts/hindiCatalog.js';
+import { CATALOG } from './scripts/catalog.js';
+import { normaliseOptions } from './lib/serviceOptions.js';
 import {
   Address, HelperProfile, Service, User,
   Task, JobRequest, TaskEvent, Rating, LedgerEntry, Notification, AuditLog, Otp, HelperDocument,
@@ -21,89 +22,8 @@ import {
 const RESET = process.argv.includes('--reset');
 
 
-/** The six categories in the MVP brief. Everything here is admin-editable later. */
-const SERVICES = [
-  {
-    code: 'full_home', name: 'Full Home Cleaning', category: 'Cleaning', icon: '🏠',
-    description: 'Dusting, floors, bathrooms and kitchen — the whole house in one visit.',
-    basePrice: 249, durationLabel: '2 - 4 hours', defaultDurationMins: 180, sortOrder: 1,
-    inclusions: [
-      'Dusting all rooms and surfaces',
-      'Sweeping and mopping all floors',
-      'Bathroom deep cleaning',
-      'Kitchen cleaning and organising',
-      'Trash removal and disposal',
-    ],
-    /*
-     * UC-C05 — the questions are data, not screens. Priced options default to
-     * zero so the advertised "from ₹249" stays true until the customer adds
-     * something.
-     */
-    options: [
-      {
-        key: 'home_size', label: 'Home size', type: 'select',
-        choices: ['1 BHK', '2 BHK', '3 BHK', '4 BHK+'],
-        required: true, defaultValue: '2 BHK',
-      },
-      {
-        key: 'extra_bathrooms', label: 'Extra bathrooms', type: 'number',
-        unit: 'bathrooms', pricePerUnit: 80, defaultValue: 0,
-      },
-      {
-        key: 'balcony', label: 'Include balcony', type: 'boolean',
-        pricePerUnit: 60, defaultValue: false,
-      },
-    ],
-  },
-  {
-    code: 'kitchen', name: 'Kitchen Cleaning', category: 'Cleaning', icon: '🍲',
-    description: 'Slabs, stove, chimney, sink and cabinet fronts scrubbed down.',
-    basePrice: 149, durationLabel: '1 - 2 hours', defaultDurationMins: 90, sortOrder: 2,
-    inclusions: [
-      'Cleaning kitchen slabs and countertops',
-      'Stove, hob and chimney cleaning',
-      'Sink cleaning and descaling',
-      'Outside cleaning of cabinets and drawers',
-      'Floor cleaning and trash removal',
-    ],
-    options: [
-      {
-        key: 'load', label: 'How much is there?', type: 'select',
-        choices: ['Light', 'Medium', 'Heavy'], required: true, defaultValue: 'Medium',
-      },
-      {
-        key: 'chimney', label: 'Deep-clean the chimney', type: 'boolean',
-        pricePerUnit: 99, defaultValue: false,
-      },
-    ],
-  },
-  {
-    code: 'bathroom', name: 'Bathroom Cleaning', category: 'Cleaning', icon: '🚿',
-    description: 'Commode, shower area, tiles, grout and fixtures disinfected.',
-    basePrice: 149, durationLabel: '1 - 2 hours', defaultDurationMins: 90, sortOrder: 3,
-    inclusions: [
-      'Toilet and commode deep cleaning',
-      'Shower area and glass cleaning',
-      'Tile and grout scrubbing',
-      'Mirror and fixture polishing',
-      'Floor cleaning and disinfecting',
-    ],
-    options: [],
-  },
-  {
-    code: 'sofa', name: 'Sofa & Upholstery Cleaning', category: 'Cleaning', icon: '🛋️',
-    description: 'Vacuum, shampoo and stain treatment for sofas and upholstery.',
-    basePrice: 199, durationLabel: '1 - 2 hours', defaultDurationMins: 90, sortOrder: 4,
-    inclusions: [
-      'Vacuuming sofa and cushions',
-      'Stain removal treatment',
-      'Deep fabric cleaning',
-      'Deodorising and sanitising',
-      'Drying and fluffing cushions',
-    ],
-    options: [],
-  },
-];
+/** The launch catalog lives in one place, shared with `npm run catalog:sync`. */
+const SERVICES = CATALOG.map((service) => ({ ...service, options: normaliseOptions(service.options || []) }));
 
 async function run() {
   await connectDb();
@@ -128,7 +48,7 @@ async function run() {
   console.log('[seed] settings ready');
 
   for (const s of SERVICES) {
-    await Service.updateOne({ code: s.code }, { $set: { ...s, ...(HINDI_CATALOG[s.code] || {}), active: true } }, { upsert: true });
+    await Service.updateOne({ code: s.code }, { $set: { ...s, active: true } }, { upsert: true });
   }
   // Anything no longer offered is retired rather than deleted, so past bookings
   // keep pointing at a real catalog entry (UC-C42).

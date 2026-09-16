@@ -4,7 +4,7 @@ import { User, HelperProfile, Address, HelperDocument, Otp } from '../models/ind
 import { JWT_SECRET, ROLES, HELPER_APPROVAL } from '../config.js';
 import { issueOtp, verifyOtp } from '../lib/otp.js';
 import { signToken, verifyPassword, authenticate } from '../lib/auth.js';
-import { wrap, badRequest, conflict, unauthorized, forbidden } from '../lib/http.js';
+import { wrap, badRequest, conflict, unauthorized, forbidden, accountBlocked } from '../lib/http.js';
 import { notify } from '../lib/notify.js';
 
 const router = Router();
@@ -20,7 +20,7 @@ router.post(
     if (!PHONE_RE.test(phone)) throw badRequest('Enter a valid 10-digit mobile number.', 'INVALID_PHONE');
 
     const blocked = await User.findOne({ phone, status: 'blocked' }).lean();
-    if (blocked) throw forbidden(blocked.blockReason || 'This number has been blocked. Please contact support.');
+    if (blocked) throw accountBlocked(blocked.blockReason || 'This number has been blocked. Please contact support.');
 
     const result = await issueOtp(phone);
     res.json({ phone, ...result });
@@ -86,7 +86,7 @@ router.post(
     }
 
     if (user.status === 'blocked') {
-      throw forbidden(user.blockReason || 'This account has been blocked. Please contact support.');
+      throw accountBlocked(user.blockReason);
     }
 
     user.lastLoginAt = new Date();

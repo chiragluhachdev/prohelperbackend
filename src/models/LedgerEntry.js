@@ -26,9 +26,17 @@ const ledgerEntrySchema = new mongoose.Schema(
     note: { type: String, default: '' },
     /** Idempotency handle, e.g. `earning:<taskId>`. */
     ref: { type: String, required: true, unique: true },
+    /** The id people quote: on statements, in support, in the admin panel (UC-C35). */
+    txnId: { type: String, unique: true },
+    /** Where the money came from: a booking, the gateway, an admin, a referral. */
+    source: { type: String, enum: ['TASK', 'GATEWAY', 'ADMIN', 'REFERRAL', 'SYSTEM'], default: 'TASK' },
     settled: { type: Boolean, default: false },
+    /** Kept in step with `settled`; REVERSED is for a row undone rather than paid. */
+    status: { type: String, enum: ['PENDING', 'SETTLED', 'REVERSED'], default: 'PENDING', index: true },
   },
   { timestamps: true },
 );
+
+ledgerEntrySchema.index({ userId: 1, createdAt: -1 });
 
 export const LedgerEntry = mongoose.model('LedgerEntry', ledgerEntrySchema);

@@ -11,7 +11,7 @@ import { PORT, NODE_ENV, DUMMY_AUTH, CLOUDINARY_ENABLED } from './config.js';
 import { connectDb } from './lib/db.js';
 import { ensureSettings } from './lib/settings.js';
 import { ApiError } from './lib/http.js';
-import { startDispatcher } from './matching.js';
+import { recoverOnBoot, startDispatcher } from './matching.js';
 
 import authRoutes from './routes/auth.js';
 import commonRoutes from './routes/common.js';
@@ -88,6 +88,9 @@ async function main() {
     console.log(`\n  Pro Helper API → http://localhost:${PORT}`);
     console.log(`  env: ${NODE_ENV} · dummy auth: ${DUMMY_AUTH ? 'ON (any 6 digits)' : 'off'} · uploads: ${CLOUDINARY_ENABLED ? 'cloudinary' : 'disabled'}\n`);
   });
+
+  // Work that was in flight when this process last stopped (UC-C54).
+  await recoverOnBoot().catch((err) => console.error('[recover]', err.message));
 
   // The 60-second window and every other deadline is enforced here, not on the phone.
   startDispatcher();

@@ -18,9 +18,12 @@ const helperDocumentSchema = new mongoose.Schema(
     originalName: { type: String, default: '' },
     mimeType: { type: String, default: '' },
     sizeBytes: { type: Number, default: 0 },
+    /** True for files stored privately — they are only ever served through a signed link. */
+    private: { type: Boolean, default: false },
     status: {
       type: String,
-      enum: ['PENDING', 'APPROVED', 'REJECTED'],
+      // CORRECTION_REQUESTED: an admin asked for a better copy of this one (UC-C25).
+      enum: ['PENDING', 'APPROVED', 'REJECTED', 'CORRECTION_REQUESTED'],
       default: 'PENDING',
       index: true,
     },

@@ -5,6 +5,8 @@
  *   node tests/smoke.mjs
  */
 import { planSearch, waveDueAt } from '../src/lib/searchPlan.js';
+// The same signing a gateway would do, so a forged callback can be told from a real one.
+import { signPayload as paymentSignature } from '../src/lib/gateway.js';
 
 const BASE = process.env.API || 'http://localhost:4100';
 let pass = 0, fail = 0;
@@ -76,6 +78,11 @@ ok('API is up and connected to Mongo', health.ok && health.db === 'connected', J
 console.log('\n1. Authentication');
 const adminBootstrap = await api('/api/auth/admin/login', { method: 'POST', body: { email: 'admin@prohelper.in', password: 'admin@123' } });
 const adminToken = adminBootstrap.token;
+// Rules with checks of their own in section 14 — kept out of the way of the flows before it.
+await api('/api/admin/settings', {
+  method: 'PUT', token: adminToken,
+  body: { start_early_minutes: 0, completion_otp_resend_seconds: 0, rejection_block_threshold: 0, customer_rejection_block_threshold: 0 },
+});
 
 const customerToken = await login(PHONE.customer, 'customer');
 await api('/api/customer/profile', { method: 'PATCH', token: customerToken, body: { name: 'Test Customer' } });
@@ -102,7 +109,7 @@ ok('both helpers sign in', Boolean(helperA && helperB));
 // ---------------------------------------------------------------- catalog + quote
 console.log('\n2. Services and pricing');
 const catalog = await api('/api/services', { token: customerToken });
-ok(`catalog returns ${catalog.services?.length} services`, catalog.services?.length === 4);
+ok(`catalog returns ${catalog.services?.length} services`, catalog.services?.length >= 18 && ['full_home', 'cooking', 'pet_care', 'child_care_day'].every((c) => catalog.services.some((sv) => sv.code === c)));
 
 const q = await api('/api/customer/quote', {
   method: 'POST', token: customerToken,
@@ -303,7 +310,9 @@ ok('the second job completes too', onlineDone.task?.status === 'COMPLETED', JSON
 const paidOnline = await api(`/api/customer/tasks/${onlineTaskId}/pay`, { method: 'POST', token: customerToken });
 ok('the customer pays online in the app', paidOnline.task?.status === 'SETTLED' && paidOnline.task?.paymentMode === 'ONLINE',
   JSON.stringify(paidOnline.error));
-ok('a receipt comes back', paidOnline.receipt?.amount > 0 && paidOnline.receipt?.method === 'ONLINE', JSON.stringify(paidOnline.receipt));
+ok('a receipt comes back, with the gateway\'s own ids on it',
+  paidOnline.receipt?.amount > 0 && Boolean(paidOnline.receipt?.orderId) && Boolean(paidOnline.receipt?.transactionId),
+  JSON.stringify(paidOnline.receipt));
 
 const payOnlineTwice = await api(`/api/customer/tasks/${onlineTaskId}/pay`, { method: 'POST', token: customerToken });
 ok('cannot pay for the same job twice', payOnlineTwice.status === 409, JSON.stringify(payOnlineTwice.error));
@@ -328,7 +337,7 @@ ok('the wallet lists both paid bookings, newest first',
   wallet.groups?.[0]?.taskId === onlineTaskId && Boolean(cashGroup), JSON.stringify(wallet.groups?.map((g) => g.code)));
 ok('a cash booking reads: bill received, commission out, service fee out',
   cashGroup?.method === 'CASH' &&
-  cashGroup.lines.map((l) => l.kind).join() === 'PAID_CASH,COMMISSION,PLATFORM_FEE' &&
+  cashGroup.lines.map((l) => l.kind).join().startsWith('PAID_CASH,COMMISSION,PLATFORM_FEE') &&
   cashGroup.lines[0].amount > 0 && cashGroup.lines.slice(1).every((l) => l.amount < 0),
   JSON.stringify(cashGroup?.lines));
 ok('an online booking reads: job value in, commission out',
@@ -390,42 +399,87 @@ ok('a real code checks out, whatever the case it is typed in', checked.valid ===
   JSON.stringify(checked));
 
 const applied = await api('/api/referrals/apply', { method: 'POST', token: friendToken, body: { code: helperRef.code } });
-ok('joining with a code pays the newcomer ₹100', applied.status === 201 && applied.balance === 100, JSON.stringify(applied));
+ok('a code can be applied when joining', applied.status === 201 && applied.applied === true, JSON.stringify(applied));
+// UC-C33 — installing the app and typing a code earns nobody anything.
+ok('but nothing is paid out just for joining', applied.balance === 0, JSON.stringify(applied));
+ok('and the person whose code it was is not paid either',
+  (await api('/api/referrals', { token: winnerToken })).balance === helperRef.balance,
+  String((await api('/api/referrals', { token: winnerToken })).balance));
 const appliedTwice = await api('/api/referrals/apply', { method: 'POST', token: friendToken, body: { code: custRef.code } });
 ok('a code can only ever be used once per account', appliedTwice.error?.code === 'REFERRAL_ALREADY_APPLIED',
   JSON.stringify(appliedTwice.error));
 
-const helperRewarded = await api('/api/referrals', { token: winnerToken });
-ok('and rewards the person whose code it was',
-  helperRewarded.balance === r2(helperRef.balance + 20) &&
-  helperRewarded.totals.referrals === helperRef.totals.referrals + 1 &&
-  helperRewarded.history[0]?.type === 'REFERRER_REWARD' && helperRewarded.history[0]?.amount === 20,
-  JSON.stringify({ balance: helperRewarded.balance, totals: helperRewarded.totals, top: helperRewarded.history[0] }));
-
-// Helper: pay dues from the referral balance — here only part of them.
-const settledRef = await api('/api/referrals/settle', { method: 'POST', token: winnerToken });
-ok('a helper pays what they can of their dues from referral balance',
-  settledRef.settled === 20 && settledRef.referralBalance === r2(helperRewarded.balance - 20) &&
-  settledRef.owedToPlatform === r2(duesBefore - 20),
-  JSON.stringify(settledRef));
-ok('with nothing left to spend, settling again is refused',
-  (await api('/api/referrals/settle', { method: 'POST', token: winnerToken })).error?.code === 'NO_REFERRAL_BALANCE');
-ok('customers cannot settle dues', (await api('/api/referrals/settle', { method: 'POST', token: friendToken })).status === 403);
-const walletAfterSettle = await api('/api/helper/wallet', { token: winnerToken });
-ok('the wallet shows the smaller amount still owed', walletAfterSettle.owedToPlatform === r2(duesBefore - 20),
-  JSON.stringify({ owed: walletAfterSettle.owedToPlatform }));
-const financeAfterSettle = await api('/api/admin/finance', { token: adminToken });
-ok('and so does admin finance',
-  financeAfterSettle.commissionOwed?.find((h) => h.helperId === winnerId)?.amount === r2(duesBefore - 20),
-  JSON.stringify(financeAfterSettle.commissionOwed?.find((h) => h.helperId === winnerId)));
-
-// Customer: spend referral balance on a booking.
+// The qualifying event: the referred customer's first booking, done properly.
 await api('/api/customer/profile', { method: 'PATCH', token: friendToken, body: { name: 'Rahul Friend' } });
 const friendAddr = await api('/api/customer/addresses', {
   method: 'POST', token: friendToken, body: { label: 'Home', line1: 'Tower A, Flat 101', society: 'rps_savana' },
 });
 const friendAddressId = friendAddr.address?._id || friendAddr.addresses?.[0]?._id;
 
+/** Books, takes, starts, closes and pays for a job — everything a qualifying booking needs. */
+async function runFullJob(custTok, addrId, helperTok, { key, useReferral = false, promoCode } = {}) {
+  const booked = await api('/api/customer/tasks', {
+    method: 'POST', token: custTok,
+    body: {
+      services: [{ code: 'full_home' }], addressId: addrId, bookingType: 'instant',
+      useReferral, promoCode, idempotencyKey: key || `smoke-job-${Math.random()}`,
+    },
+  });
+  const id = booked.task?.id;
+  if (!id) return { booked };
+  let taken = null;
+  for (let i = 0; i < 15 && !taken; i += 1) {
+    await sleep(400);
+    const attempt = await api(`/api/helper/requests/${id}/accept`, { method: 'POST', token: helperTok });
+    if (attempt.status === 200) taken = attempt;
+  }
+  await startJob(id, helperTok, custTok);
+  await api(`/api/helper/jobs/${id}/completion-otp`, { method: 'POST', token: helperTok });
+  const otp = (await api(`/api/customer/tasks/${id}`, { token: custTok })).task?.completionOtp;
+  const done = await api(`/api/helper/jobs/${id}/complete`, { method: 'POST', token: helperTok, body: { otp } });
+  return { booked, id, taken, done };
+}
+
+const qualifier = await runFullJob(friendToken, friendAddressId, winnerToken, { key: `smoke-ref-qualify-${Date.now()}` });
+ok('the referred customer finishes their first booking', qualifier.done?.task?.status === 'COMPLETED',
+  JSON.stringify(qualifier.done?.error ?? qualifier.booked?.error));
+
+const friendRewarded = await api('/api/referrals', { token: friendToken });
+ok('only then is the welcome reward paid', friendRewarded.balance === 100 && friendRewarded.history[0]?.type === 'WELCOME_REWARD',
+  JSON.stringify({ balance: friendRewarded.balance, top: friendRewarded.history[0] }));
+const helperRewarded = await api('/api/referrals', { token: winnerToken });
+ok('and the person whose code it was is rewarded too',
+  helperRewarded.balance === r2(helperRef.balance + 20) &&
+  helperRewarded.totals.referrals === helperRef.totals.referrals + 1 &&
+  helperRewarded.history[0]?.type === 'REFERRER_REWARD' && helperRewarded.history[0]?.amount === 20,
+  JSON.stringify({ balance: helperRewarded.balance, totals: helperRewarded.totals, top: helperRewarded.history[0] }));
+
+await api(`/api/helper/jobs/${qualifier.id}/confirm-payment`, { method: 'POST', token: winnerToken });
+const secondJob = await runFullJob(friendToken, friendAddressId, winnerToken, { key: `smoke-ref-second-${Date.now()}` });
+await api(`/api/helper/jobs/${secondJob.id}/confirm-payment`, { method: 'POST', token: winnerToken });
+ok('a second booking does not pay the reward again',
+  (await api('/api/referrals', { token: winnerToken })).balance === helperRewarded.balance,
+  String((await api('/api/referrals', { token: winnerToken })).balance));
+
+// Helper: pay dues from the referral balance — here only part of them.
+const duesNow = (await api('/api/helper/wallet', { token: winnerToken })).owedToPlatform;
+const settledRef = await api('/api/referrals/settle', { method: 'POST', token: winnerToken });
+ok('a helper pays what they can of their dues from referral balance',
+  settledRef.settled === 20 && settledRef.referralBalance === r2(helperRewarded.balance - 20) &&
+  settledRef.owedToPlatform === r2(duesNow - 20),
+  JSON.stringify(settledRef));
+ok('with nothing left to spend, settling again is refused',
+  (await api('/api/referrals/settle', { method: 'POST', token: winnerToken })).error?.code === 'NO_REFERRAL_BALANCE');
+ok('customers cannot settle dues', (await api('/api/referrals/settle', { method: 'POST', token: friendToken })).status === 403);
+const walletAfterSettle = await api('/api/helper/wallet', { token: winnerToken });
+ok('the wallet shows the smaller amount still owed', walletAfterSettle.owedToPlatform === r2(duesNow - 20),
+  JSON.stringify({ owed: walletAfterSettle.owedToPlatform }));
+const financeAfterSettle = await api('/api/admin/finance', { token: adminToken });
+ok('and so does admin finance',
+  financeAfterSettle.commissionOwed?.find((h) => h.helperId === winnerId)?.amount === r2(duesNow - 20),
+  JSON.stringify(financeAfterSettle.commissionOwed?.find((h) => h.helperId === winnerId)));
+
+// Customer: spend referral balance on a booking.
 const quoteOff = await api('/api/customer/quote', { method: 'POST', token: friendToken, body: { services: [{ code: 'full_home' }] } });
 ok('the bill offers the referral balance without taking it',
   quoteOff.referral?.balance === 100 && quoteOff.referral?.usable === 100 && !quoteOff.pricing?.referralCredit,
@@ -493,6 +547,7 @@ ok('the helper is told to collect the bill less the credit',
   helperJob.task?.amountDue === r2(booked2.task.total - 100), JSON.stringify({ due: helperJob.task?.amountDue }));
 
 const payoutBefore = (await api('/api/helper/wallet', { token: winnerToken })).payoutDue;
+const duesBeforeCash = (await api('/api/helper/wallet', { token: winnerToken })).owedToPlatform;
 const refCash = await api(`/api/helper/jobs/${booked2.task?.id}/confirm-payment`, { method: 'POST', token: winnerToken });
 const platformShare = r2(booked2.task.pricing.platformFee + booked2.task.pricing.helperCommission);
 ok('with the credit bigger than the platform share, the helper owes nothing for it',
@@ -507,7 +562,7 @@ ok('the wallet shows the credit as money in, and the job still nets to the payou
   r2(refGroup.lines.reduce((t, l) => t + l.amount, 0)) === refCash.earning,
   JSON.stringify(refGroup?.lines));
 ok('as a payout due, with the dues left as they were',
-  refWallet.payoutDue === r2(payoutBefore + refCash.referralCovered) && refWallet.owedToPlatform === r2(duesBefore - 20),
+  refWallet.payoutDue === r2(payoutBefore + refCash.referralCovered) && refWallet.owedToPlatform === duesBeforeCash,
   JSON.stringify({ due: refWallet.payoutDue, owed: refWallet.owedToPlatform }));
 
 const friendAdmin = await api(`/api/admin/customers/${(await api('/api/auth/me', { token: friendToken })).user.id}`, { token: adminToken });
@@ -952,23 +1007,24 @@ ok('and the new price is what the bill uses',
  * accident would quietly change the bill.
  */
 const freshCatalog = await api('/api/services', { token: customerToken });
-const bathroom = freshCatalog.services?.find((sv) => sv.code === 'bathroom');
+const bathroom = freshCatalog.services?.find((sv) => sv.code === 'sofa');
+const sofaBase = bathroom?.basePrice;
 ok('questions are off until an admin turns them on',
   bathroom?.optionsEnabled === false && (bathroom?.options ?? []).length === 0,
   JSON.stringify({ on: bathroom?.optionsEnabled, count: bathroom?.options?.length }));
 
-const emptyOn = await api('/api/admin/services/bathroom', {
+const emptyOn = await api('/api/admin/services/sofa', {
   method: 'PATCH', token: adminToken, body: { optionsEnabled: true },
 });
 ok('they cannot be switched on with nothing to ask', emptyOn.status === 400, JSON.stringify(emptyOn.error));
 
-const badChoices = await api('/api/admin/services/bathroom', {
+const badChoices = await api('/api/admin/services/sofa', {
   method: 'PATCH', token: adminToken,
   body: { options: [{ key: 'size', label: 'Size', type: 'select', choices: ['Only one'] }] },
 });
 ok('a choice question needs real choices', badChoices.status === 400, JSON.stringify(badChoices.error));
 
-const dupes = await api('/api/admin/services/bathroom', {
+const dupes = await api('/api/admin/services/sofa', {
   method: 'PATCH', token: adminToken,
   body: [
     { key: 'extra', label: 'One', type: 'number' },
@@ -977,7 +1033,7 @@ const dupes = await api('/api/admin/services/bathroom', {
 });
 ok('two questions cannot share a key', dupes.status === 400, JSON.stringify(dupes.error));
 
-const configured = await api('/api/admin/services/bathroom', {
+const configured = await api('/api/admin/services/sofa', {
   method: 'PATCH', token: adminToken,
   body: {
     optionsEnabled: true,
@@ -994,37 +1050,37 @@ ok('an admin can define questions, keys slugified',
   JSON.stringify(configured.service?.options ?? configured.error));
 
 const withOptions = await api('/api/services', { token: customerToken });
-const bath2 = withOptions.services?.find((sv) => sv.code === 'bathroom');
+const bath2 = withOptions.services?.find((sv) => sv.code === 'sofa');
 ok('the app is now asked to show them',
   bath2?.optionsEnabled === true && bath2?.options?.length === 2,
   JSON.stringify(bath2?.options?.length));
 
 const plain = await api('/api/customer/quote', {
-  method: 'POST', token: customerToken, body: { services: [{ code: 'bathroom', options: {} }] },
+  method: 'POST', token: customerToken, body: { services: [{ code: 'sofa', options: {} }] },
 });
-ok('the defaults add nothing', plain.pricing?.servicesAmount === 149, JSON.stringify(plain.pricing));
+ok('the defaults add nothing', plain.pricing?.servicesAmount === sofaBase, JSON.stringify(plain.pricing));
 
 const answered = await api('/api/customer/quote', {
   method: 'POST', token: customerToken,
-  body: { services: [{ code: 'bathroom', options: { extra_bathrooms: 2, deep: true } }] },
+  body: { services: [{ code: 'sofa', options: { extra_bathrooms: 2, deep: true } }] },
 });
 ok('answering a priced question changes the bill',
-  answered.pricing?.servicesAmount === 149 + 160 + 50, JSON.stringify(answered.pricing));
+  answered.pricing?.servicesAmount === sofaBase + 160 + 50, JSON.stringify(answered.pricing));
 
 // Switched off, the same answers must not be charged for.
-await api('/api/admin/services/bathroom', {
+await api('/api/admin/services/sofa', {
   method: 'PATCH', token: adminToken, body: { optionsEnabled: false },
 });
 const ignored = await api('/api/customer/quote', {
   method: 'POST', token: customerToken,
-  body: { services: [{ code: 'bathroom', options: { extra_bathrooms: 2, deep: true } }] },
+  body: { services: [{ code: 'sofa', options: { extra_bathrooms: 2, deep: true } }] },
 });
 ok('a disabled question is never charged for',
-  ignored.pricing?.servicesAmount === 149, JSON.stringify(ignored.pricing));
+  ignored.pricing?.servicesAmount === sofaBase, JSON.stringify(ignored.pricing));
 
 const hidden = await api('/api/services', { token: customerToken });
 ok('and the app stops being sent them',
-  (hidden.services?.find((sv) => sv.code === 'bathroom')?.options ?? []).length === 0);
+  (hidden.services?.find((sv) => sv.code === 'sofa')?.options ?? []).length === 0);
 
 /* ------------------------------------------------------------ money side */
 console.log('\n12. Payout details and finance');
@@ -1068,7 +1124,7 @@ const finance = await api('/api/admin/finance', { token: adminToken });
 ok('finance totals come off completed bookings',
   finance.totals?.bookings >= 1 && finance.totals.gross > 0 &&
   finance.totals.platformEarned ===
-    Math.round((finance.totals.platformFee + finance.totals.commission - finance.totals.referralCredit) * 100) / 100,
+    Math.round((finance.totals.platformFee + finance.totals.commission + finance.totals.surcharge - finance.totals.referralCredit - finance.totals.discount) * 100) / 100,
   JSON.stringify(finance.totals));
 ok('the per-booking bill is listed',
   Array.isArray(finance.bookings) && finance.bookings[0]?.pricing?.total > 0,
@@ -1148,7 +1204,7 @@ const future = new Date(Date.now() + 365 * 86_400_000).toISOString();
 const all = (rows, pred) => Array.isArray(rows) && rows.every(pred);
 
 const options = await api('/api/admin/filter-options', { token: adminToken });
-ok('filter dropdowns get the services and societies', options.services?.length === 4 && options.societies?.length === 3,
+ok('filter dropdowns get the services and societies', options.services?.length >= 18 && options.societies?.length === 3,
   JSON.stringify({ s: options.services?.length, so: options.societies?.length }));
 
 const doneBookings = await api('/api/admin/bookings?status=COMPLETED,SETTLED&limit=100', { token: adminToken });
@@ -1205,6 +1261,219 @@ ok('and by date', (await api(`/api/admin/finance/transactions?from=${future}`, {
 const settledLogs = await api('/api/admin/audit?action=COMMISSION_SETTLED', { token: adminToken });
 ok('the audit log filters by action', settledLogs.logs?.length > 0 && all(settledLogs.logs, (l) => l.action === 'COMMISSION_SETTLED'),
   JSON.stringify(settledLogs.logs?.map((l) => l.action)));
+
+// ---------------------------------------------------------------- addresses
+console.log('\n12d. Saved addresses (UC-C03)');
+const addr_addrToken = await login(`7${RUN}0021`.slice(0, 10), 'customer');
+await api('/api/customer/profile', { method: 'PATCH', token: addr_addrToken, body: { name: 'Address Tester' } });
+const addr_home = (await api('/api/customer/addresses', {
+  method: 'POST', token: addr_addrToken, body: { label: 'Home', line1: 'Tower B, Flat 702', society: 'rps_savana' },
+})).address;
+ok('the first address saved becomes the default', addr_home?.isDefault === true, JSON.stringify(addr_home));
+
+const addr_onlyOne = await api(`/api/customer/addresses/${addr_home?._id}`, { method: 'DELETE', token: addr_addrToken });
+ok('the only address cannot be removed', addr_onlyOne.error?.code === 'ADDRESS_LAST', JSON.stringify(addr_onlyOne.error));
+const addr_blank = await api('/api/customer/addresses', { method: 'POST', token: addr_addrToken, body: { label: 'Work', line1: '  ', society: 'rps_auria' } });
+ok('an address needs a flat or house number', addr_blank.error?.code === 'LINE1_REQUIRED');
+const addr_noSociety = await api('/api/customer/addresses', { method: 'POST', token: addr_addrToken, body: { line1: 'Flat 1', society: 'nowhere' } });
+ok('and one of the societies served', addr_noSociety.error?.code === 'SOCIETY_REQUIRED');
+
+const addr_work = (await api('/api/customer/addresses', {
+  method: 'POST', token: addr_addrToken, body: { label: 'Work', line1: 'Office 12, Block C', society: 'rps_auria' },
+})).address;
+const addr_listed = (await api('/api/customer/addresses', { token: addr_addrToken })).addresses;
+ok('a second address is saved without taking over the default',
+  addr_work?.isDefault === false && addr_listed?.length === 2 && addr_listed[0]._id === addr_home._id && addr_listed.filter((a) => a.isDefault).length === 1,
+  JSON.stringify(addr_listed?.map((a) => [a.label, a.isDefault])));
+ok('with the society filling in the city and pincode', addr_work?.city && addr_work?.pincode && addr_work?.society === 'rps_auria', JSON.stringify(addr_work));
+
+const addrBookAt = (address, key) => api('/api/customer/tasks', {
+  method: 'POST', token: addr_addrToken,
+  body: { services: [{ code: 'bathroom' }], ...(address ? { addressId: address } : {}), bookingType: 'instant', idempotencyKey: key },
+});
+const addr_atDefault = await addrBookAt(null, `smoke-addr-default-${Date.now()}`);
+ok('a booking with no address chosen goes to the default one',
+  addr_atDefault.task?.address?.addressId === addr_home._id && addr_atDefault.task?.address?.line1 === 'Tower B, Flat 702', JSON.stringify(addr_atDefault.task?.address ?? addr_atDefault.error));
+const addr_atWork = await addrBookAt(addr_work._id, `smoke-addr-addr_work-${Date.now()}`);
+ok('or to any other saved address the customer picks',
+  addr_atWork.task?.address?.label === 'Work' && addr_atWork.task?.address?.society === 'rps_auria', JSON.stringify(addr_atWork.task?.address ?? addr_atWork.error));
+const addr_notMine = await addrBookAt(addressId, `smoke-addr-other-${Date.now()}`);
+ok("but never to someone else's address", addr_notMine.error?.code === 'ADDRESS_REQUIRED', JSON.stringify(addr_notMine.error));
+
+// Now change everything about the saved addresses.
+const addr_madeDefault = await api(`/api/customer/addresses/${addr_work._id}`, { method: 'PATCH', token: addr_addrToken, body: { isDefault: true } });
+const addr_afterSwap = (await api('/api/customer/addresses', { token: addr_addrToken })).addresses;
+ok('another address can be made the default, and there is still only one',
+  addr_madeDefault.address?.isDefault === true && addr_afterSwap.filter((a) => a.isDefault).map((a) => a._id).join() === addr_work._id,
+  JSON.stringify(addr_afterSwap.map((a) => [a.label, a.isDefault])));
+const addr_edited = await api(`/api/customer/addresses/${addr_work._id}`, {
+  method: 'PATCH', token: addr_addrToken, body: { line1: 'Office 99, Block Z', society: 'rps_palms', label: 'New office' },
+});
+ok('an address can be edited', addr_edited.address?.line1 === 'Office 99, Block Z' && addr_edited.address?.society === 'rps_palms');
+const addr_clearedLine = await api(`/api/customer/addresses/${addr_work._id}`, { method: 'PATCH', token: addr_addrToken, body: { line1: '' } });
+ok('but not emptied', addr_clearedLine.error?.code === 'LINE1_REQUIRED');
+const addr_removedHome = await api(`/api/customer/addresses/${addr_home._id}`, { method: 'DELETE', token: addr_addrToken });
+ok('and a spare one removed', addr_removedHome.ok === true && addr_removedHome.addresses?.length === 1);
+
+const addr_pastDefault = (await api(`/api/customer/tasks/${addr_atDefault.task?.id}`, { token: addr_addrToken })).task;
+const addr_pastWork = (await api(`/api/customer/tasks/${addr_atWork.task?.id}`, { token: addr_addrToken })).task;
+ok('past bookings keep the address as it was when they were made',
+  addr_pastDefault?.address?.line1 === 'Tower B, Flat 702' && addr_pastDefault?.address?.label === 'Home' &&
+  addr_pastWork?.address?.line1 === 'Office 12, Block C' && addr_pastWork?.address?.society === 'rps_auria' && addr_pastWork?.address?.label === 'Work',
+  JSON.stringify({ d: addr_pastDefault?.address, w: addr_pastWork?.address }));
+const addr_atNewDefault = await addrBookAt(null, `smoke-addr-newdefault-${Date.now()}`);
+ok('while new bookings use the new default', addr_atNewDefault.task?.address?.line1 === 'Office 99, Block Z', JSON.stringify(addr_atNewDefault.task?.address));
+ok('a removed address cannot be booked', (await addrBookAt(addr_home._id, `smoke-addr-removed-${Date.now()}`)).error?.code === 'ADDRESS_REQUIRED');
+
+for (const tsk of [addr_atDefault.task, addr_atWork.task, addr_atNewDefault.task]) {
+  if (tsk?.id) await api(`/api/customer/tasks/${tsk.id}/cancel`, { method: 'POST', token: addr_addrToken, body: { reason: 'Smoke test address check' } });
+}
+
+for (let i = 0; i < 9; i += 1) {
+  await api('/api/customer/addresses', { method: 'POST', token: addr_addrToken, body: { label: `Place ${i}`, line1: `Flat ${i}`, society: 'rps_palms' } });
+}
+const addr_tooMany = await api('/api/customer/addresses', { method: 'POST', token: addr_addrToken, body: { label: 'One more', line1: 'Flat 11', society: 'rps_palms' } });
+ok('and there is a sensible limit on how many are kept', addr_tooMany.error?.code === 'ADDRESS_LIMIT', JSON.stringify(addr_tooMany.error));
+
+// ------------------------------------------------- services, questions, pricing
+console.log('\n12e. Services, questions and pricing (UC-C04 / C05 / C07)');
+const svcR2 = (n) => Math.round(n * 100) / 100;
+const svcToken = await login(`7${RUN}0031`.slice(0, 10), 'customer');
+await api('/api/customer/profile', { method: 'PATCH', token: svcToken, body: { name: 'Service Tester' } });
+const svcAddress = (await api('/api/customer/addresses', {
+  method: 'POST', token: svcToken, body: { label: 'Home', line1: 'Tower D, Flat 303', society: 'rps_palms' },
+})).address;
+
+const svcCatalog = (await api('/api/services', { token: svcToken })).services;
+const cooking = svcCatalog.find((sv) => sv.code === 'cooking');
+const petCare = svcCatalog.find((sv) => sv.code === 'pet_care');
+const childCare = svcCatalog.find((sv) => sv.code === 'child_care_day');
+ok('the catalog carries each service\'s own questions, from the database',
+  ['people', 'meals', 'diet', 'ready_by', 'additional_requirements'].every((k) => cooking?.options.some((o) => o.key === k)) &&
+  ['pets', 'pet_types', 'care', 'duration'].every((k) => petCare?.options.some((o) => o.key === k)) &&
+  ['children', 'ages', 'duration', 'end_time'].every((k) => childCare?.options.some((o) => o.key === k)),
+  JSON.stringify({ cooking: cooking?.options.map((o) => o.key), pet: petCare?.options.map((o) => o.key), child: childCare?.options.map((o) => o.key) }));
+ok('in English and Hindi', cooking?.options.find((o) => o.key === 'meals')?.choicesHi?.length === 4 && Boolean(cooking?.options[0].labelHi));
+
+const cookingAnswers = { people: 4, meals: ['Lunch', 'Dinner'], diet: 'Non-vegetarian', ready_by: '13:00', additional_requirements: 'Less oil' };
+const cookQuote = await api('/api/customer/quote', { method: 'POST', token: svcToken, body: { services: [{ code: 'cooking', options: cookingAnswers }] } });
+const cookLine = cookQuote.lines?.[0];
+ok('answers are priced by the server: base price plus what each answer adds',
+  cookLine?.amount === svcR2(cooking.basePrice + 4 * 25 + 80 + 80 + 50) && cookLine?.optionsAmount === 310,
+  JSON.stringify({ amount: cookLine?.amount, base: cooking?.basePrice, options: cookLine?.optionsAmount }));
+ok('and timed: the booking lasts as long as the answers need',
+  cookQuote.durationMins === 30 + 4 * 5 + 45 + 45, JSON.stringify({ minutes: cookQuote.durationMins }));
+ok('each answer is kept readable, with its question and what it added',
+  cookLine?.answers?.find((a) => a.key === 'meals')?.display === 'Lunch, Dinner' &&
+  cookLine?.answers?.find((a) => a.key === 'meals')?.displayHi === 'दोपहर का खाना, रात का खाना' &&
+  cookLine?.answers?.find((a) => a.key === 'people')?.label === 'Number of people',
+  JSON.stringify(cookLine?.answers));
+
+const missing = await api('/api/customer/quote', { method: 'POST', token: svcToken, body: { services: [{ code: 'cooking', options: { people: 2 } }] } });
+ok('a required question left unanswered is refused, naming it', missing.error?.code === 'ANSWER_REQUIRED' && missing.error?.details?.option === 'meals',
+  JSON.stringify(missing.error));
+const tooMany = await api('/api/customer/quote', { method: 'POST', token: svcToken, body: { services: [{ code: 'cooking', options: { ...cookingAnswers, people: 99 } }] } });
+ok('and so is an answer outside what the question allows', tooMany.error?.code === 'INVALID_ANSWER', JSON.stringify(tooMany.error));
+const notAChoice = await api('/api/customer/quote', { method: 'POST', token: svcToken, body: { services: [{ code: 'pet_care', options: { pets: 1, pet_types: ['Dragon'], care: ['Feeding'] } }] } });
+ok('or a choice that is not on the list', notAChoice.error?.code === 'INVALID_ANSWER');
+
+const petAnswers = { pets: 2, pet_types: ['Dog'], care: ['Feeding', 'Walking'], duration: '2 hours' };
+const combo = await api('/api/customer/quote', {
+  method: 'POST', token: svcToken,
+  body: { services: [{ code: 'cooking', options: cookingAnswers }, { code: 'pet_care', options: petAnswers }] },
+});
+const p = combo.pricing;
+ok('more than one service can go on a booking, each priced on its own line',
+  combo.lines?.length === 2 && p?.servicesAmount === svcR2(combo.lines[0].amount + combo.lines[1].amount) &&
+  combo.durationMins === combo.lines[0].minutes + combo.lines[1].minutes,
+  JSON.stringify({ lines: combo.lines?.map((l) => [l.code, l.amount, l.minutes]), s: p?.servicesAmount, d: combo.durationMins }));
+ok('but the same service only once',
+  (await api('/api/customer/quote', { method: 'POST', token: svcToken, body: { services: [{ code: 'dusting' }, { code: 'dusting' }] } })).error?.code === 'DUPLICATE_SERVICE');
+ok('the bill shows every charge: platform fee and GST on by default, discount and surcharge off',
+  p.platformFee === svcR2(p.servicesAmount * 0.05) && p.gstPercent === 18 &&
+  p.gst === svcR2((p.servicesAmount + p.platformFee) * 0.18) && p.discount === 0 && p.surcharge === 0 &&
+  p.total === svcR2(p.servicesAmount + p.platformFee + p.gst),
+  JSON.stringify(p));
+
+// Every charge is the admin's to configure and switch.
+await api('/api/admin/settings', {
+  method: 'PUT', token: adminToken,
+  body: {
+    discount_enabled: true, discount_percent: 10, discount_max: 50, discount_label: 'Festive offer',
+    surcharge_enabled: true, surcharge_flat: 30, surcharge_applies_to: 'instant', surcharge_label: 'Rush hour',
+    gst_base: 'fees', platform_fee_percent: 8,
+  },
+});
+const instantQuote = (await api('/api/customer/quote', { method: 'POST', token: svcToken, body: { services: [{ code: 'cooking', options: cookingAnswers }], bookingType: 'instant' } })).pricing;
+const laterQuote = (await api('/api/customer/quote', { method: 'POST', token: svcToken, body: { services: [{ code: 'cooking', options: cookingAnswers }], bookingType: 'scheduled' } })).pricing;
+const expectDiscount = Math.min(svcR2(instantQuote.servicesAmount * 0.1), 50);
+const expectFee = svcR2((instantQuote.servicesAmount - expectDiscount) * 0.08);
+ok('an admin can turn on a capped discount, change the fee, and add a surcharge for instant bookings only',
+  instantQuote.discount === expectDiscount && instantQuote.discountLabel === 'Festive offer' &&
+  instantQuote.platformFee === expectFee && instantQuote.surcharge === 30 && instantQuote.surchargeLabel === 'Rush hour' &&
+  laterQuote.surcharge === 0,
+  JSON.stringify({ instantQuote, laterSurcharge: laterQuote.surcharge }));
+ok('and charge GST on the platform\'s fees only',
+  instantQuote.gst === svcR2((expectFee + 30) * 0.18) &&
+  instantQuote.total === svcR2(instantQuote.servicesAmount - expectDiscount + expectFee + 30 + instantQuote.gst),
+  JSON.stringify(instantQuote));
+await api('/api/admin/settings', { method: 'PUT', token: adminToken, body: { gst_enabled: false, platform_fee_enabled: false } });
+const bare = (await api('/api/customer/quote', { method: 'POST', token: svcToken, body: { services: [{ code: 'cooking', options: cookingAnswers }], bookingType: 'scheduled' } })).pricing;
+ok('or switch GST and the platform fee off entirely',
+  bare.gst === 0 && bare.platformFee === 0 && bare.total === svcR2(bare.servicesAmount - bare.discount), JSON.stringify(bare));
+await api('/api/admin/settings', {
+  method: 'PUT', token: adminToken,
+  body: { discount_enabled: false, surcharge_enabled: false, surcharge_applies_to: 'all', gst_enabled: true, gst_base: 'all', platform_fee_enabled: true, platform_fee_percent: 5 },
+});
+
+// A question's price is data too: change it in admin, the next quote follows.
+const adminCooking = (await api('/api/admin/services', { token: adminToken })).services.find((sv) => sv.code === 'cooking');
+const repriced = adminCooking.options.map((o) => (o.key === 'diet' ? { ...o, choicePrices: [0, 90, 0] } : o));
+const saved = await api('/api/admin/services/cooking', { method: 'PATCH', token: adminToken, body: { options: repriced } });
+const afterReprice = await api('/api/customer/quote', { method: 'POST', token: svcToken, body: { services: [{ code: 'cooking', options: cookingAnswers }] } });
+ok('editing a question\'s price in admin changes the very next bill',
+  !saved.error && afterReprice.lines?.[0]?.optionsAmount === 350, JSON.stringify({ err: saved.error, amount: afterReprice.lines?.[0]?.optionsAmount }));
+await api('/api/admin/services/cooking', { method: 'PATCH', token: adminToken, body: { options: adminCooking.options } });
+const badQuestion = await api('/api/admin/services/cooking', {
+  method: 'PATCH', token: adminToken, body: { options: [...adminCooking.options, { key: 'spice', label: 'Spice level', type: 'select', choices: ['Mild'] }] },
+});
+ok('and a question that could not be answered is refused', badQuestion.error?.code === 'OPTION_CHOICES_REQUIRED', JSON.stringify(badQuestion.error));
+
+// The booking itself.
+const slot = outOfHoursSlot();
+const svcBooking = await api('/api/customer/tasks', {
+  method: 'POST', token: svcToken,
+  body: {
+    services: [{ code: 'cooking', options: cookingAnswers }, { code: 'pet_care', options: petAnswers }],
+    addressId: svcAddress._id, date: slot.date, time: slot.time, durationMins: 5, instructions: 'Gate code 4411',
+    idempotencyKey: `smoke-svc-${Date.now()}`,
+  },
+});
+const svcTask = svcBooking.task;
+ok('the booking keeps everything: services, answers, address, date, time and duration',
+  svcTask?.services?.length === 2 && svcTask.services[0].answers.length === 5 &&
+  svcTask.address?.line1 === 'Tower D, Flat 303' && svcTask.scheduledDate === slot.date && svcTask.scheduledTime === slot.time &&
+  svcTask.durationMins === combo.durationMins,
+  JSON.stringify({ services: svcTask?.services?.map((sv) => [sv.code, sv.answers?.length, sv.minutes]), d: svcTask?.durationMins, err: svcBooking.error }));
+ok('with the duration worked out by the server, not taken from the app', svcTask?.durationMins !== 5);
+ok('and the full price breakdown, payment status, task status and creation time',
+  ['servicesAmount', 'discount', 'platformFee', 'surcharge', 'gst', 'gstPercent', 'total'].every((k) => typeof svcTask?.pricing?.[k] === 'number') &&
+  svcTask.pricing.total === combo.pricing.total && svcTask.paymentStatus === 'PENDING' &&
+  ['CREATED', 'SEARCHING'].includes(svcTask.status) && Boolean(svcTask.createdAt),
+  JSON.stringify({ pricing: svcTask?.pricing, pay: svcTask?.paymentStatus, status: svcTask?.status }));
+
+await sleep(600);
+const svcAdminView = await api(`/api/admin/bookings/${svcTask?.id}`, { token: adminToken });
+const matchingSteps = svcAdminView.timeline?.filter((e) => e.kind === 'MATCHING') ?? [];
+ok('the moment the search starts, its matching history starts',
+  matchingSteps[0]?.meta?.step === 'SEARCH_STARTED' && Boolean(matchingSteps[0]?.meta?.closesAt),
+  JSON.stringify(matchingSteps.map((e) => [e.reason, e.meta?.step])));
+const customerTimeline = (await api(`/api/customer/tasks/${svcTask?.id}`, { token: svcToken })).timeline;
+ok('it is the admin\'s view — the customer app still gets only status changes',
+  customerTimeline?.length > 0 && !customerTimeline.some((e) => e.kind === 'MATCHING'));
+await api(`/api/customer/tasks/${svcTask?.id}/cancel`, { method: 'POST', token: svcToken, body: { reason: 'Smoke test service check' } });
+const afterCancel = (await api(`/api/admin/bookings/${svcTask?.id}`, { token: adminToken })).timeline?.filter((e) => e.kind === 'MATCHING');
+ok('and records how the search ended', afterCancel?.at(-1)?.meta?.step === 'SEARCH_STOPPED', JSON.stringify(afterCancel?.map((e) => e.reason)));
 
 /* --------------------------------------------------------------- Hindi */
 console.log('\n13. Hindi');
@@ -1353,6 +1622,648 @@ ok('set to 0, the real completed count shows through',
 ok('and the real counter was never touched by the edits', realCount >= 1, String(realCount));
 
 ok('admin actions are audited', audit.logs?.length >= 3, String(audit.logs?.length));
+
+// ------------------------------------ jobs: start, completion, overdue, history, ratings, cancellation, blocking
+console.log('\n14. Start and completion rules, overdue jobs, booking history, ratings, cancellation, rejections');
+
+/*
+ * A few checks move a booking's clock (a job "started" two hours ago) — only
+ * possible straight in the database, and only ever done against the smoke
+ * database.
+ */
+const smokeDb = String(process.env.MONGO_URI || '').includes('/prohelper_smoke');
+let db = null;
+if (smokeDb) {
+  const mongoose = (await import('mongoose')).default;
+  await mongoose.connect(process.env.MONGO_URI);
+  db = { mongoose, ...(await import('../src/models/index.js')), ...(await import('../src/matching.js')) };
+} else {
+  console.log('  (MONGO_URI is not the smoke database — skipping the checks that move a booking\'s clock)');
+}
+
+const setRules = (body) => api('/api/admin/settings', { method: 'PUT', token: adminToken, body });
+
+// Fresh people, so nothing earlier in the run is in the way.
+await api('/api/helper/online', { method: 'POST', token: helperA, body: { isOnline: false } });
+await api('/api/helper/online', { method: 'POST', token: helperB, body: { isOnline: false } });
+const hD = await makeApprovedHelper(`6${RUN}0011`.slice(0, 10), 'Helper D', adminToken);
+const hE = await makeApprovedHelper(`6${RUN}0012`.slice(0, 10), 'Helper E', adminToken);
+for (const h of [hD, hE]) await api('/api/helper/online', { method: 'POST', token: h.token, body: { isOnline: true } });
+
+async function makeCustomer(phone, name) {
+  const token = await login(phone, 'customer');
+  await api('/api/customer/profile', { method: 'PATCH', token, body: { name } });
+  await api('/api/customer/addresses', { method: 'POST', token, body: { label: 'Home', line1: 'Tower B, Flat 7', society: 'rps_auria' } });
+  const who = await api('/api/auth/me', { token });
+  return { token, id: who.user.id, addressId: who.addresses[0]._id };
+}
+const c2 = await makeCustomer(`6${RUN}0021`.slice(0, 10), 'Customer Two');
+
+async function waitForAlert(helperTok, id, tries = 25) {
+  for (let i = 0; i < tries; i += 1) {
+    const r = await api('/api/helper/requests', { token: helperTok });
+    if (r.requests?.some((x) => x.task?.id === id)) return true;
+    await sleep(400);
+  }
+  return false;
+}
+const bookFor = (cust, extra = {}) => api('/api/customer/tasks', {
+  method: 'POST', token: cust.token,
+  body: { services: [{ code: 'kitchen', options: {} }], addressId: cust.addressId, bookingType: 'instant', idempotencyKey: `smoke-14-${Math.random()}`, ...extra },
+});
+async function bookAndAccept(cust, helper, extra) {
+  const booked = await bookFor(cust, extra);
+  const id = booked.task?.id;
+  await waitForAlert(helper.token, id);
+  const took = await api(`/api/helper/requests/${id}/accept`, { method: 'POST', token: helper.token });
+  return { id, status: took.task?.status, error: took.error };
+}
+const forLater = () => ({ bookingType: 'scheduled', ...outOfHoursSlot() });
+
+// ---- UC-C16: a booking for later can't be started hours early
+await setRules({ start_early_minutes: 60 });
+const early = await bookAndAccept(c2, hD, forLater());
+ok('a helper accepts a booking for later', early.status === 'ACCEPTED', JSON.stringify(early.error));
+const earlyDetail = await api(`/api/helper/jobs/${early.id}`, { token: hD.token });
+ok('the job says when it can be started', earlyDetail.startRule?.allowed === false && earlyDetail.startRule?.earlyMinutes === 60,
+  JSON.stringify(earlyDetail.startRule));
+const tooEarly = await startJob(early.id, hD.token, c2.token);
+ok('starting it hours before the slot is refused', tooEarly.error?.code === 'START_TOO_EARLY', JSON.stringify(tooEarly.error));
+await setRules({ start_early_minutes: 0 });
+
+// ---- UC-C22: the helper drops it — the customer keeps the booking
+const noReasonDrop = await api(`/api/helper/jobs/${early.id}/cancel`, { method: 'POST', token: hD.token, body: {} });
+ok('a helper must give a reason to drop a job', noReasonDrop.error?.code === 'REASON_REQUIRED', JSON.stringify(noReasonDrop.error));
+ok('the job shows it can be dropped', earlyDetail.cancelRule?.allowed === true, JSON.stringify(earlyDetail.cancelRule));
+const dropped = await api(`/api/helper/jobs/${early.id}/cancel`, { method: 'POST', token: hD.token, body: { reason: 'Family emergency' } });
+ok('dropping it sends the booking back to searching', dropped.ok && dropped.research === true && dropped.status === 'SEARCHING', JSON.stringify(dropped));
+const c2Notes = await api('/api/notifications', { token: c2.token });
+ok('the customer is told another helper is being found',
+  c2Notes.notifications?.some((n) => n.type === 'HELPER_CANCELLED' && n.data?.taskId === early.id && n.data?.research === '1'));
+const droppedAdmin = await api(`/api/admin/bookings/${early.id}`, { token: adminToken });
+ok('the drop stays on the booking: who, why, and from what state',
+  droppedAdmin.task?.helperCancellations?.[0]?.helperName === 'Helper D' &&
+  droppedAdmin.task.helperCancellations[0].reason === 'Family emergency' &&
+  droppedAdmin.task.helperCancellations[0].previousStatus === 'ACCEPTED',
+  JSON.stringify(droppedAdmin.task?.helperCancellations));
+ok('and in its status history', droppedAdmin.timeline?.some((e) => e.from === 'ACCEPTED' && e.to === 'SEARCHING' && e.meta?.step === 'HELPER_CANCELLED'));
+ok('the other helper is alerted again', await waitForAlert(hE.token, early.id));
+const dRequests = await api('/api/helper/requests', { token: hD.token });
+ok('but the helper who dropped it is not', !dRequests.requests?.some((x) => x.task?.id === early.id));
+const dCancelledTab = await api('/api/helper/jobs?tab=cancelled', { token: hD.token });
+ok("the dropped job stays in the helper's own history", dCancelledTab.tasks?.some((t) => t.id === early.id));
+const dView = await api(`/api/helper/jobs/${early.id}`, { token: hD.token });
+ok('as cancelled, without the customer\'s details any more', dView.task?.status === 'CANCELLED' && dView.task?.customer === null, JSON.stringify(dView.task?.status));
+const dRejections = (await api(`/api/admin/helpers/${hD.id}`, { token: adminToken })).rejections;
+ok('dropping a job is recorded as a rejection', dRejections?.count === 1 && dRejections.recent?.[0]?.kind === 'HELPER_CANCELLED',
+  JSON.stringify(dRejections));
+
+const reTaken = await api(`/api/helper/requests/${early.id}/accept`, { method: 'POST', token: hE.token });
+ok('another helper takes it', reTaken.task?.status === 'ACCEPTED', JSON.stringify(reTaken.error));
+
+// ---- UC-C22: the customer cancels after a helper was assigned
+const custCancel = await api(`/api/customer/tasks/${early.id}/cancel`, { method: 'POST', token: c2.token, body: { reason: 'Plans changed' } });
+ok('the customer cancels', custCancel.task?.status === 'CANCELLED', JSON.stringify(custCancel.error));
+ok('the cancellation records its effect on money',
+  custCancel.task?.cancellation?.financialImpact?.charged === 0 && typeof custCancel.task.cancellation.financialImpact.note === 'string',
+  JSON.stringify(custCancel.task?.cancellation));
+const c2Rejections = (await api(`/api/admin/customers/${c2.id}`, { token: adminToken })).rejections;
+ok('a cancellation after a helper was assigned is a customer rejection',
+  c2Rejections?.count === 1 && c2Rejections.recent?.[0]?.kind === 'CUSTOMER_CANCELLED' && c2Rejections.recent[0].blocked === false,
+  JSON.stringify(c2Rejections));
+
+// ---- admin rules on cancelling
+await setRules({ customer_cancel_until: 'SEARCHING' });
+const locked = await bookAndAccept(c2, hE);
+const lockedDetail = await api(`/api/customer/tasks/${locked.id}`, { token: c2.token });
+ok('with cancelling allowed only while searching, the app is told not to offer it', lockedDetail.canCancel === false, String(lockedDetail.canCancel));
+const lockedCancel = await api(`/api/customer/tasks/${locked.id}/cancel`, { method: 'POST', token: c2.token, body: { reason: 'Too late?' } });
+ok('and the server refuses it', lockedCancel.error?.code === 'NOT_CANCELLABLE', JSON.stringify(lockedCancel.error));
+const badChoice = await setRules({ customer_cancel_until: 'WHENEVER' });
+ok('a rule can only be set to one of its choices', badChoice.error?.code === 'INVALID_SETTING', JSON.stringify(badChoice.error));
+await setRules({ customer_cancel_until: 'IN_PROGRESS', helper_cancel_action: 'cancel' });
+
+const endedByHelper = await api(`/api/helper/jobs/${locked.id}/cancel`, { method: 'POST', token: hE.token, body: { reason: 'Unwell today' } });
+ok('set to "cancel", a helper dropping a job ends the booking', endedByHelper.status === 'CANCELLED' && endedByHelper.research === false, JSON.stringify(endedByHelper));
+await setRules({ helper_cancel_action: 'research', helper_cancel_enabled: false });
+const blockedDrop = await bookAndAccept(c2, hE);
+const cantDrop = await api(`/api/helper/jobs/${blockedDrop.id}/cancel`, { method: 'POST', token: hE.token, body: { reason: 'Not today' } });
+ok('switched off, helpers cannot drop jobs', cantDrop.error?.code === 'NOT_CANCELLABLE', JSON.stringify(cantDrop.error));
+await setRules({ helper_cancel_enabled: true, helper_cancel_min_minutes_before: 60 });
+
+// ---- UC-C17: the completion OTP's limits
+const startedJob = await startJob(blockedDrop.id, hE.token, c2.token);
+ok('the job starts', startedJob.task?.status === 'IN_PROGRESS', JSON.stringify(startedJob.error));
+ok('and its start time is recorded', Boolean(startedJob.task?.startedAt));
+const lateDrop = await api(`/api/helper/jobs/${blockedDrop.id}/cancel`, { method: 'POST', token: hE.token, body: { reason: 'Leaving' } });
+ok('a started job cannot be dropped by the helper', lateDrop.error?.code === 'NOT_CANCELLABLE', JSON.stringify(lateDrop.error));
+
+await setRules({ completion_otp_resend_seconds: 30, completion_otp_max_sends: 2 });
+const send1 = await api(`/api/helper/jobs/${blockedDrop.id}/completion-otp`, { method: 'POST', token: hE.token });
+ok('a completion OTP is sent', send1.sent === true && send1.sendsLeft === 1, JSON.stringify(send1));
+const firstCode = (await api(`/api/customer/tasks/${blockedDrop.id}`, { token: c2.token })).task?.completionOtp;
+const send2 = await api(`/api/helper/jobs/${blockedDrop.id}/completion-otp`, { method: 'POST', token: hE.token });
+ok('another cannot be sent straight away', send2.error?.code === 'OTP_RESEND_TOO_SOON', JSON.stringify(send2.error));
+await setRules({ completion_otp_resend_seconds: 0 });
+const send3 = await api(`/api/helper/jobs/${blockedDrop.id}/completion-otp`, { method: 'POST', token: hE.token });
+const secondCode = (await api(`/api/customer/tasks/${blockedDrop.id}`, { token: c2.token })).task?.completionOtp;
+ok('once the wait is over it can', send3.sent === true, JSON.stringify(send3.error));
+const oldCode = await api(`/api/helper/jobs/${blockedDrop.id}/complete`, { method: 'POST', token: hE.token, body: { otp: firstCode } });
+ok('and the earlier code stops working', firstCode === secondCode || oldCode.error?.code === 'OTP_INVALID', JSON.stringify(oldCode.error));
+const send4 = await api(`/api/helper/jobs/${blockedDrop.id}/completion-otp`, { method: 'POST', token: hE.token });
+ok('the number of codes per job is capped', send4.error?.code === 'OTP_SEND_LIMIT', JSON.stringify(send4.error));
+
+const wrong = secondCode === '000000' ? '111111' : '000000';
+let lastWrong = null;
+for (let i = 0; i < 5; i += 1) {
+  lastWrong = await api(`/api/helper/jobs/${blockedDrop.id}/complete`, { method: 'POST', token: hE.token, body: { otp: wrong } });
+}
+ok('wrong codes run out', lastWrong.error?.code === 'OTP_ATTEMPTS_EXCEEDED', JSON.stringify(lastWrong.error));
+const rightTooLate = await api(`/api/helper/jobs/${blockedDrop.id}/complete`, { method: 'POST', token: hE.token, body: { otp: secondCode } });
+ok('after which even the right code is refused', rightTooLate.error?.code === 'OTP_ATTEMPTS_EXCEEDED', JSON.stringify(rightTooLate.error));
+
+await setRules({ completion_otp_max_sends: 5 });
+await api(`/api/helper/jobs/${blockedDrop.id}/completion-otp`, { method: 'POST', token: hE.token });
+const freshCode = (await api(`/api/customer/tasks/${blockedDrop.id}`, { token: c2.token })).task?.completionOtp;
+const closed = await api(`/api/helper/jobs/${blockedDrop.id}/complete`, { method: 'POST', token: hE.token, body: { otp: freshCode } });
+ok('a new code closes the job', closed.task?.status === 'COMPLETED' && Boolean(closed.task?.completedAt), JSON.stringify(closed.error));
+const reused = await api(`/api/helper/jobs/${blockedDrop.id}/complete`, { method: 'POST', token: hE.token, body: { otp: freshCode } });
+ok('the code is not accepted again once the job is complete', reused.status === 409, JSON.stringify(reused.error));
+
+// A code for a job that is then cancelled
+const toCancel = await bookAndAccept(c2, hE);
+await startJob(toCancel.id, hE.token, c2.token);
+await api(`/api/helper/jobs/${toCancel.id}/completion-otp`, { method: 'POST', token: hE.token });
+const pendingCode = (await api(`/api/customer/tasks/${toCancel.id}`, { token: c2.token })).task?.completionOtp;
+const adminStop = await api(`/api/admin/bookings/${toCancel.id}/cancel`, { method: 'POST', token: adminToken, body: { reason: 'Customer called support' } });
+ok('an admin can cancel a job waiting for its OTP', adminStop.task?.status === 'CANCELLED', JSON.stringify(adminStop.error));
+const otpAfterCancel = await api(`/api/helper/jobs/${toCancel.id}/complete`, { method: 'POST', token: hE.token, body: { otp: pendingCode } });
+ok('and its code no longer closes it', otpAfterCancel.status === 409, JSON.stringify(otpAfterCancel.error));
+
+// ---- UC-C20 / UC-C21: ratings
+const c2AfterClose = await api('/api/notifications', { token: c2.token });
+ok('the customer is asked to rate the helper', c2AfterClose.notifications?.some((n) => n.type === 'RATE_HELPER' && n.data?.taskId === blockedDrop.id));
+const eAfterClose = await api('/api/notifications', { token: hE.token });
+ok('and the helper to rate the customer', eAfterClose.notifications?.some((n) => n.type === 'RATE_CUSTOMER' && n.data?.taskId === blockedDrop.id));
+
+const toRate = await api('/api/customer/ratings', { token: c2.token });
+ok('a skipped rating waits under "rate later"', toRate.pending?.some((t) => t.id === blockedDrop.id), JSON.stringify(toRate.pending?.map((t) => t.id)));
+const badStars = await api(`/api/customer/tasks/${blockedDrop.id}/rate`, { method: 'POST', token: c2.token, body: { stars: 4.5 } });
+ok('ratings are whole stars from 1 to 5', badStars.error?.code === 'INVALID_RATING', JSON.stringify(badStars.error));
+const cancelledRate = await api(`/api/customer/tasks/${toCancel.id}/rate`, { method: 'POST', token: c2.token, body: { stars: 1 } });
+ok('a cancelled booking cannot be rated', cancelledRate.error?.code === 'NOT_COMPLETED', JSON.stringify(cancelledRate.error));
+const rated = await api(`/api/customer/tasks/${blockedDrop.id}/rate`, { method: 'POST', token: c2.token, body: { stars: 4, comment: 'Good, a little late.', tags: ['Friendly'] } });
+ok('the customer rates later, with feedback', rated.status === 201, JSON.stringify(rated.error));
+const afterRate = await api('/api/customer/ratings', { token: c2.token });
+ok('it leaves "rate later" and joins their rating history',
+  !afterRate.pending?.some((t) => t.id === blockedDrop.id) && afterRate.given?.[0]?.comment === 'Good, a little late.',
+  JSON.stringify(afterRate.given?.[0]));
+ok('and the booking shows the rating given', (await api(`/api/customer/tasks/${blockedDrop.id}`, { token: c2.token })).myRating?.stars === 4);
+const helperRated = await api(`/api/helper/jobs/${blockedDrop.id}/rate`, { method: 'POST', token: hE.token, body: { stars: 5, comment: 'Kind and clear.' } });
+const helperTwice = await api(`/api/helper/jobs/${blockedDrop.id}/rate`, { method: 'POST', token: hE.token, body: { stars: 1 } });
+ok('the helper rates the customer once', helperRated.status === 201 && helperTwice.error?.code === 'ALREADY_RATED', JSON.stringify(helperTwice.error));
+const eRatings = await api('/api/helper/ratings', { token: hE.token });
+ok("the helper's rating history has both sides",
+  eRatings.received?.some((r) => r.task?.id === blockedDrop.id && r.stars === 4) && eRatings.given?.some((r) => r.stars === 5),
+  JSON.stringify({ received: eRatings.received?.length, given: eRatings.given?.length }));
+
+// ---- UC-C19: booking history by tab, and a price that stays as booked
+const pricedAt = (await api(`/api/customer/tasks/${blockedDrop.id}`, { token: c2.token })).task?.pricing;
+const oldFee = (await api('/api/admin/settings', { token: adminToken })).settings?.platform_fee_percent;
+await setRules({ platform_fee_percent: 12, gst_percent: 28, helper_commission_percent: 30 });
+const pricedNow = (await api(`/api/customer/tasks/${blockedDrop.id}`, { token: c2.token })).task?.pricing;
+ok('changing fees, tax and commission later leaves a past booking exactly as it was',
+  JSON.stringify(pricedAt) === JSON.stringify(pricedNow) && pricedNow?.helperCommissionPercent !== 30, JSON.stringify(pricedNow));
+await setRules({ platform_fee_percent: oldFee, gst_percent: 18, helper_commission_percent: 15 });
+
+const tabs = {};
+for (const tab of ['upcoming', 'active', 'completed', 'cancelled', 'rejected', 'no_helper']) {
+  tabs[tab] = (await api(`/api/customer/tasks?tab=${tab}`, { token: c2.token })).tasks ?? null;
+}
+ok('the customer has all six history tabs', Object.values(tabs).every(Array.isArray), JSON.stringify(Object.keys(tabs)));
+ok('completed holds the finished job', tabs.completed.some((t) => t.id === blockedDrop.id));
+ok('cancelled holds what the customer called off', tabs.cancelled.some((t) => t.id === early.id) && tabs.cancelled.every((t) => t.cancellation?.by === 'customer'));
+ok('rejected holds what the helper, admin or system called off',
+  tabs.rejected.some((t) => t.id === locked.id) && tabs.rejected.some((t) => t.id === toCancel.id) && tabs.rejected.every((t) => t.cancellation?.by !== 'customer'),
+  JSON.stringify(tabs.rejected.map((t) => t.cancellation?.by)));
+ok('no_helper holds only searches that found nobody', tabs.no_helper.every((t) => t.status === 'NO_HELPER_AVAILABLE'));
+const history = await api(`/api/customer/tasks/${blockedDrop.id}`, { token: c2.token });
+ok('a booking keeps its helper, services, address and status history',
+  history.task?.helper?.name === 'Helper E' && history.task.services?.length === 1 && history.task.address?.line1 &&
+  ['ACCEPTED', 'IN_PROGRESS', 'COMPLETION_PENDING', 'COMPLETED'].every((st) => history.timeline?.some((e) => e.to === st)),
+  JSON.stringify(history.timeline?.map((e) => e.to)));
+
+// ---- UC-C18: overdue jobs, and the system cancelling stale ones
+if (db) {
+  const overdueJob = await bookAndAccept(c2, hE);
+  await startJob(overdueJob.id, hE.token, c2.token);
+  const job = await db.Task.findById(overdueJob.id).lean();
+  // "Started" long enough ago to be past its expected finish plus the 90-minute grace.
+  await db.Task.updateOne({ _id: overdueJob.id }, { $set: { startedAt: new Date(Date.now() - (job.durationMins + 95) * 60_000) } });
+  const first = await db.flagOverdueTasks(new Date());
+  const flagged = await db.Task.findById(overdueJob.id).lean();
+  ok('a job past its expected finish is flagged overdue', flagged.overdueReminders === 1 && Boolean(flagged.overdueNotifiedAt),
+    JSON.stringify({ first, reminders: flagged.overdueReminders }));
+  // (The server runs the same check once a minute, so it may have got there first — the outcome is what counts.)
+  const cOver = (await api('/api/notifications', { token: c2.token })).notifications?.find((n) => n.type === 'TASK_OVERDUE' && n.data?.taskId === overdueJob.id);
+  const hOver = (await api('/api/notifications', { token: hE.token })).notifications?.find((n) => n.type === 'TASK_OVERDUE' && n.data?.taskId === overdueJob.id);
+  ok('the customer and the helper are both reminded', cOver?.data?.role === 'customer' && hOver?.data?.role === 'helper');
+  const adminOver = (await api('/api/notifications', { token: adminToken })).notifications?.find((n) => n.type === 'TASK_OVERDUE_ADMIN' && n.data?.taskId === overdueJob.id);
+  ok('and admins are told', Boolean(adminOver));
+  await db.flagOverdueTasks(new Date());
+  ok('the next reminder waits for the repeat interval', (await db.Task.findById(overdueJob.id).lean()).overdueReminders === 1);
+  await db.Task.updateOne({ _id: overdueJob.id }, { $set: { overdueLastRemindedAt: new Date(Date.now() - 61 * 60_000) } });
+  await db.flagOverdueTasks(new Date());
+  ok('then reminds again', (await db.Task.findById(overdueJob.id).lean()).overdueReminders === 2);
+
+  const open = await api('/api/admin/open-tasks', { token: adminToken });
+  const row = open.tasks?.find((t) => t.id === overdueJob.id);
+  ok("it heads the admin's open-task monitoring", open.tasks?.[0]?.overdue === true && row?.overdue === true && row.reminders === 2 && row.lateMinutes >= 95,
+    JSON.stringify(row));
+  ok('with counts and the rule in force', open.counts?.overdue >= 1 && open.rule?.overdueAfterMinutes === 90, JSON.stringify(open.counts));
+  const nudged = await api(`/api/admin/bookings/${overdueJob.id}/remind`, { method: 'POST', token: adminToken });
+  ok('an admin can send a reminder straight away', nudged.ok === true, JSON.stringify(nudged.error));
+  ok('the booking list marks it too', (await api(`/api/admin/bookings?q=${job.code}`, { token: adminToken })).bookings?.[0]?.overdue === true);
+
+  // Accepted, never started, six hours past the slot → cancelled by the system.
+  // (Helper D: E has a job under way, and a busy helper isn't offered overlapping work.)
+  const stale = await bookAndAccept(c2, hD);
+  await db.Task.updateOne({ _id: stale.id }, { $set: { scheduledAt: new Date(Date.now() - 7 * 3_600_000) } });
+  await db.autoCancelStale(new Date());
+  const staleNow = await api(`/api/customer/tasks/${stale.id}`, { token: c2.token });
+  ok('a job never started long after its slot is cancelled by the system',
+    staleNow.task?.status === 'CANCELLED' && staleNow.task.cancellation?.by === 'system' && staleNow.task.cancellation.previousStatus === 'ACCEPTED',
+    JSON.stringify(staleNow.task?.cancellation));
+  const noOne = await bookFor(c2);
+  await db.Task.updateOne({ _id: noOne.task.id }, { $set: { status: 'NO_HELPER_AVAILABLE', nextDispatchAt: null, searchExpiresAt: new Date(Date.now() - 25 * 3_600_000) } });
+  await db.autoCancelStale(new Date());
+  const noOneNow = await api(`/api/customer/tasks/${noOne.task.id}`, { token: c2.token });
+  ok('and so is a search that found nobody and was never retried',
+    noOneNow.task?.status === 'CANCELLED' && noOneNow.task.cancellation?.by === 'system', JSON.stringify(noOneNow.task?.cancellation));
+
+  // Close the overdue job so it isn't left open.
+  await api(`/api/admin/bookings/${overdueJob.id}/cancel`, { method: 'POST', token: adminToken, body: { reason: 'Smoke test cleanup' } });
+}
+
+// ---- UC-C23: reaching the threshold blocks the account
+await setRules({ rejection_block_threshold: 2 });
+await api('/api/helper/online', { method: 'POST', token: hE.token, body: { isOnline: false } });
+const hF = await makeApprovedHelper(`6${RUN}0013`.slice(0, 10), 'Helper F', adminToken);
+await api('/api/helper/online', { method: 'POST', token: hF.token, body: { isOnline: true } });
+// Lined up for later, so the helper is still free to be offered work now.
+const held = await bookAndAccept(c2, hF, forLater());
+ok('the helper has a job lined up', held.status === 'ACCEPTED', JSON.stringify(held.error));
+const declines = [];
+for (let i = 0; i < 2; i += 1) {
+  const other = await bookFor(c2);
+  await waitForAlert(hF.token, other.task?.id);
+  declines.push(await api(`/api/helper/requests/${other.task?.id}/decline`, { method: 'POST', token: hF.token }));
+  await api(`/api/customer/tasks/${other.task?.id}/cancel`, { method: 'POST', token: c2.token, body: { reason: 'Smoke test cleanup' } });
+}
+ok('the helper declines twice', declines.every((d) => d.ok === true), JSON.stringify(declines));
+const fBlocked = await api('/api/helper/home', { token: hF.token });
+ok('reaching the threshold blocks the account', fBlocked.status === 403 && fBlocked.error?.code === 'ACCOUNT_BLOCKED', JSON.stringify(fBlocked.error));
+const fDetail = await api(`/api/admin/helpers/${hF.id}`, { token: adminToken });
+ok('the record shows what led to it', fDetail.helper?.accountStatus === 'blocked' &&
+  fDetail.rejections?.count === 2 && fDetail.rejections.recent?.[0]?.blocked === true && fDetail.rejections.threshold === 2,
+  JSON.stringify(fDetail.rejections));
+const autoNote = (await api('/api/notifications', { token: adminToken })).notifications?.find((n) => n.type === 'ACCOUNT_AUTO_BLOCKED' && n.data?.userId === hF.id);
+ok('admins are notified', Boolean(autoNote));
+const heldNow = await api(`/api/customer/tasks/${held.id}`, { token: c2.token });
+ok("the blocked helper's job goes back to searching for the customer", heldNow.task?.status === 'SEARCHING' && heldNow.task?.helper === null && heldNow.task?.helperChanges === 1,
+  JSON.stringify(heldNow.task?.status));
+await api(`/api/customer/tasks/${held.id}/cancel`, { method: 'POST', token: c2.token, body: { reason: 'Smoke test cleanup' } });
+
+const selfUnblock = await api(`/api/admin/users/${hF.id}/unblock`, { method: 'POST', token: hF.token });
+ok('the helper cannot unblock themselves', selfUnblock.status === 403);
+const unblocked = await api(`/api/admin/users/${hF.id}/unblock`, { method: 'POST', token: adminToken });
+const fBack = await api('/api/helper/home', { token: hF.token });
+ok('only an admin can unblock, which resets the count',
+  unblocked.status === 'active' && fBack.status === 200 &&
+  (await api(`/api/admin/helpers/${hF.id}`, { token: adminToken })).rejections?.count === 0, JSON.stringify(fBack.error));
+await api('/api/helper/online', { method: 'POST', token: hF.token, body: { isOnline: false } });
+
+// Customers too: a cancellation after a helper was assigned counts.
+await setRules({ customer_rejection_block_threshold: 1 });
+await api('/api/helper/online', { method: 'POST', token: hE.token, body: { isOnline: true } });
+const c3 = await makeCustomer(`6${RUN}0022`.slice(0, 10), 'Customer Three');
+const c3Job = await bookAndAccept(c3, hE);
+await api('/api/helper/online', { method: 'POST', token: hE.token, body: { isOnline: false } });
+const c3Other = await bookFor(c3);
+const c3Cancel = await api(`/api/customer/tasks/${c3Job.id}/cancel`, { method: 'POST', token: c3.token, body: { reason: 'No longer needed' } });
+ok('the customer cancels after a helper was assigned', c3Cancel.task?.status === 'CANCELLED', JSON.stringify(c3Cancel.error));
+const c3Blocked = await api('/api/customer/tasks', { token: c3.token });
+ok('at the threshold the customer is blocked', c3Blocked.error?.code === 'ACCOUNT_BLOCKED', JSON.stringify(c3Blocked.error));
+const c3OtherNow = await api(`/api/admin/bookings/${c3Other.task?.id}`, { token: adminToken });
+ok('and their other open booking is cancelled by the system',
+  c3OtherNow.task?.status === 'CANCELLED' && c3OtherNow.task.cancellation?.by === 'system', JSON.stringify(c3OtherNow.task?.cancellation));
+await api(`/api/admin/users/${c3.id}/unblock`, { method: 'POST', token: adminToken });
+
+await setRules({ rejection_block_threshold: 0, customer_rejection_block_threshold: 0 });
+await api('/api/helper/online', { method: 'POST', token: hD.token, body: { isOnline: false } });
+if (db) await db.mongoose.disconnect();
+
+// ---------------------- KYC, earnings, payments, commission, promos, referral partners, wallet
+console.log('\n15. KYC review, earnings, payments, commission, promo codes, partners and the wallet');
+
+const rules15 = (body) => api('/api/admin/settings', { method: 'PUT', token: adminToken, body });
+const money2 = (n) => Math.round((n || 0) * 100) / 100;
+
+// ---- UC-C25: KYC documents and the admin's decisions
+const kycDocs = (await api('/api/helper/documents', { token: helperA })).documents ?? [];
+ok('a helper only ever gets links to their own documents, never a stored path',
+  kycDocs.every((d) => !('publicId' in d)), JSON.stringify(kycDocs.map((d) => Object.keys(d))[0] || []));
+const strangerDoc = kycDocs[0]
+  ? await api(`/api/admin/helpers/${helperAId}`, { token: helperB })
+  : { status: 403 };
+ok('a helper cannot read another helper\'s KYC through the admin API', strangerDoc.status === 403, String(strangerDoc.status));
+
+const correction = await api(`/api/admin/helpers/${hD.id}/request-correction`, {
+  method: 'POST', token: adminToken, body: { reason: 'The Aadhaar photo is blurred — please upload a clearer one.' },
+});
+ok('an admin can send an application back for correction', correction.profile?.approvalStatus === 'DRAFT', JSON.stringify(correction.error));
+const correctionNote = (await api('/api/notifications', { token: hD.token })).notifications?.find((n) => n.type === 'CORRECTION_REQUESTED');
+ok('the helper is told exactly what to fix', correctionNote?.body?.includes('blurred'), JSON.stringify(correctionNote?.body));
+const noReasonCorrection = await api(`/api/admin/helpers/${hD.id}/request-correction`, { method: 'POST', token: adminToken, body: {} });
+ok('a correction needs a reason', noReasonCorrection.error?.code === 'REASON_REQUIRED', JSON.stringify(noReasonCorrection.error));
+await api(`/api/admin/helpers/${hD.id}/approve`, { method: 'POST', token: adminToken });
+
+const kycAudit = await api('/api/admin/audit?limit=50', { token: adminToken });
+ok('every KYC decision is in the audit log',
+  ['HELPER_CORRECTION_REQUESTED', 'HELPER_APPROVED'].every((a) => kycAudit.logs?.some((l) => l.action === a)),
+  JSON.stringify(kycAudit.logs?.slice(0, 5).map((l) => l.action)));
+
+// ---- UC-C26: the helper's own money, every figure from the records
+const earnings15 = await api('/api/helper/earnings', { token: winnerToken });
+const wallet15 = await api('/api/helper/wallet', { token: winnerToken });
+const sum15 = earnings15.summary ?? {};
+ok('a helper sees completed jobs, gross, commission and what is payable',
+  sum15.completedJobs >= 1 && sum15.gross > 0 && sum15.commission > 0 &&
+  money2(sum15.gross - sum15.commission + sum15.adjustments) === money2(sum15.netEarning),
+  JSON.stringify(sum15));
+ok('and what they have been paid against what they still owe',
+  sum15.paid >= 0 && sum15.outstanding === wallet15.owedToPlatform && sum15.payable === money2(wallet15.payoutDue + sum15.adjustments),
+  JSON.stringify({ paid: sum15.paid, outstanding: sum15.outstanding, payable: sum15.payable }));
+
+const adjustment = await api(`/api/admin/helpers/${winnerId}/adjustment`, {
+  method: 'POST', token: adminToken, body: { amount: 50, direction: 'CREDIT', note: 'Goodwill for a long journey' },
+});
+ok('an admin adjustment is a ledger row, not an edited balance',
+  adjustment.entry?.type === 'ADJUSTMENT' && adjustment.entry?.source === 'ADMIN' && Boolean(adjustment.entry?.txnId),
+  JSON.stringify(adjustment.entry));
+ok('and it moves the figures', adjustment.earnings?.adjustments === money2(sum15.adjustments + 50), JSON.stringify(adjustment.earnings));
+const noNote = await api(`/api/admin/helpers/${winnerId}/adjustment`, { method: 'POST', token: adminToken, body: { amount: 10 } });
+ok('an adjustment must say what it is for', noNote.error?.code === 'REASON_REQUIRED', JSON.stringify(noNote.error));
+
+// ---- UC-C35: every wallet row carries its own id, source and status
+const walletRows = (await api('/api/helper/earnings', { token: winnerToken })).entries ?? [];
+ok('every wallet transaction has an id, a type, a source and a status',
+  walletRows.length > 0 && walletRows.every((e) => e.txnId && e.type && e.source && e.status && e.createdAt),
+  JSON.stringify(walletRows[0]));
+ok('and the ones that belong to a booking say which', walletRows.some((e) => e.task?.code), JSON.stringify(walletRows.find((e) => e.task)?.task));
+
+// ---- UC-C28: the online payment flow, end to end
+await api('/api/helper/online', { method: 'POST', token: helperA, body: { isOnline: true } });
+const payJob = await runFullJob(customerToken, addressId, helperA, { key: `smoke-pay-${Date.now()}` });
+ok('a job is finished and waiting to be paid for', payJob.done?.task?.status === 'COMPLETED', JSON.stringify(payJob.done?.error));
+
+const order = await api(`/api/customer/tasks/${payJob.id}/payment-order`, { method: 'POST', token: customerToken });
+ok('the backend creates the payment order, with the amount off the booking\'s own bill',
+  order.payment?.status === 'CREATED' && order.payment?.orderId && order.amount > 0, JSON.stringify(order.payment));
+const orderAgain = await api(`/api/customer/tasks/${payJob.id}/payment-order`, { method: 'POST', token: customerToken });
+ok('asking again returns the same open order', orderAgain.payment?.orderId === order.payment?.orderId);
+
+const forged = await api('/api/payments/webhook', {
+  method: 'POST',
+  body: { eventId: `forged-${Date.now()}`, orderId: order.payment.orderId, gatewayPaymentId: 'pay_forged', status: 'PAID', signature: 'not-the-signature' },
+});
+ok('a callback without a valid signature is refused', forged.error?.code === 'BAD_SIGNATURE', JSON.stringify(forged.error));
+ok('and the booking is still unpaid',
+  (await api(`/api/customer/tasks/${payJob.id}`, { token: customerToken })).task?.paymentStatus === 'PENDING');
+
+const paidJob = await api(`/api/customer/tasks/${payJob.id}/pay`, { method: 'POST', token: customerToken, body: { method: 'UPI' } });
+ok('paying settles the booking and records the transaction',
+  paidJob.task?.status === 'SETTLED' && paidJob.task?.paymentMode === 'ONLINE' &&
+  paidJob.payment?.status === 'PAID' && Boolean(paidJob.payment?.gatewayPaymentId),
+  JSON.stringify({ status: paidJob.task?.status, payment: paidJob.payment, error: paidJob.error }));
+
+const helperLedger = (await api('/api/helper/earnings', { token: helperA })).entries ?? [];
+const earningRow = helperLedger.find((e) => e.task?.code === paidJob.task?.code && e.type === 'JOB_EARNING');
+ok('the helper\'s share is booked as money the platform owes them',
+  earningRow?.direction === 'CREDIT' && earningRow?.status === 'PENDING' && earningRow?.source === 'GATEWAY',
+  JSON.stringify(earningRow));
+
+// The same callback delivered twice must not pay anyone twice.
+const adminPayments = await api('/api/admin/payments', { token: adminToken });
+const record = adminPayments.payments?.find((p) => p.orderId === order.payment.orderId);
+ok('the payment shows in the admin panel with the gateway\'s ids',
+  record?.status === 'PAID' && record?.gatewayPaymentId === paidJob.payment?.gatewayPaymentId, JSON.stringify(record));
+
+const replay = await api('/api/payments/webhook', {
+  method: 'POST',
+  body: {
+    eventId: `replay-${Date.now()}`, orderId: order.payment.orderId,
+    gatewayPaymentId: paidJob.payment.gatewayPaymentId, status: 'PAID',
+    signature: paymentSignature([order.payment.orderId, paidJob.payment.gatewayPaymentId, 'PAID']),
+  },
+});
+const ledgerAfterReplay = (await api('/api/helper/earnings', { token: helperA })).entries ?? [];
+ok('a repeated callback changes nothing',
+  replay.received === true && replay.duplicate === true &&
+  ledgerAfterReplay.filter((e) => e.task?.code === paidJob.task?.code && e.type === 'JOB_EARNING').length === 1,
+  JSON.stringify({ replay, rows: ledgerAfterReplay.filter((e) => e.task?.code === paidJob.task?.code).length }));
+
+const payTwice = await api(`/api/customer/tasks/${payJob.id}/pay`, { method: 'POST', token: customerToken });
+ok('and a paid booking cannot be paid again', payTwice.status === 409, JSON.stringify(payTwice.error));
+
+await rules15({ online_payment_enabled: false });
+const offJob = await runFullJob(customerToken, addressId, helperA, { key: `smoke-payoff-${Date.now()}` });
+const offOrder = await api(`/api/customer/tasks/${offJob.id}/payment-order`, { method: 'POST', token: customerToken });
+ok('online payment can be switched off entirely', offOrder.error?.code === 'ONLINE_PAYMENT_DISABLED', JSON.stringify(offOrder.error));
+await rules15({ online_payment_enabled: true });
+await api(`/api/helper/jobs/${offJob.id}/confirm-payment`, { method: 'POST', token: helperA });
+
+// ---- UC-C29: both sides of the commission are configuration
+const before29 = (await api('/api/admin/settings', { token: adminToken })).settings;
+await rules15({ platform_fee_type: 'flat', platform_fee_flat: 30, helper_commission_type: 'flat', helper_commission_flat: 40 });
+const flatQuote = await api('/api/customer/quote', { method: 'POST', token: customerToken, body: { services: [{ code: 'full_home' }] } });
+ok('a flat platform fee and a flat helper commission are honoured',
+  flatQuote.pricing?.platformFee === 30 && flatQuote.pricing?.helperCommission === 40 &&
+  flatQuote.pricing?.helperPayout === money2(flatQuote.pricing.servicesAmount - 40),
+  JSON.stringify(flatQuote.pricing));
+await rules15({ platform_fee_enabled: false, helper_commission_enabled: false });
+const freeQuote = await api('/api/customer/quote', { method: 'POST', token: customerToken, body: { services: [{ code: 'full_home' }] } });
+ok('either can be switched off, and a 0% commission means the helper keeps it all',
+  freeQuote.pricing?.platformFee === 0 && freeQuote.pricing?.helperCommission === 0 &&
+  freeQuote.pricing?.helperPayout === freeQuote.pricing?.servicesAmount,
+  JSON.stringify(freeQuote.pricing));
+const badType = await rules15({ platform_fee_type: 'sometimes' });
+ok('a commission type can only be percent or flat', badType.error?.code === 'INVALID_SETTING', JSON.stringify(badType.error));
+await rules15({
+  platform_fee_enabled: true, platform_fee_type: 'percent', platform_fee_percent: before29.platform_fee_percent,
+  helper_commission_enabled: true, helper_commission_type: 'percent', helper_commission_percent: before29.helper_commission_percent,
+});
+
+// ---- UC-C30 / UC-C31: GST and the surcharge, including zero
+await rules15({ gst_percent: 0, surcharge_enabled: true, surcharge_flat: 20, surcharge_applies_to: 'all' });
+const zeroGst = await api('/api/customer/quote', { method: 'POST', token: customerToken, body: { services: [{ code: 'full_home' }] } });
+ok('0% GST is a real setting, and the surcharge lands on every booking',
+  zeroGst.pricing?.gst === 0 && zeroGst.pricing?.surcharge === 20, JSON.stringify(zeroGst.pricing));
+await rules15({ surcharge_applies_to: 'instant' });
+const scheduledQuote = await api('/api/customer/quote', {
+  method: 'POST', token: customerToken, body: { services: [{ code: 'full_home' }], bookingType: 'scheduled' },
+});
+const instantSurcharge = await api('/api/customer/quote', {
+  method: 'POST', token: customerToken, body: { services: [{ code: 'full_home' }], bookingType: 'instant' },
+});
+ok('and it can be limited to instant bookings', scheduledQuote.pricing?.surcharge === 0 && instantSurcharge.pricing?.surcharge === 20,
+  JSON.stringify({ scheduled: scheduledQuote.pricing?.surcharge, instant: instantSurcharge.pricing?.surcharge }));
+await rules15({ gst_percent: 18, surcharge_enabled: false, surcharge_applies_to: 'all' });
+
+// ---- UC-C32: promo codes
+const promoBody = {
+  code: `SMOKE${RUN}`.slice(0, 12), description: 'First booking, ₹50 off', type: 'FLAT', value: 50,
+  minBill: 100, maxUses: 2, maxUsesPerCustomer: 1, taskNumbers: [1],
+};
+const createdPromo = await api('/api/admin/promos', { method: 'POST', token: adminToken, body: promoBody });
+ok('an admin creates a promo code with its own rules', createdPromo.status === 201 && createdPromo.promo?.code === promoBody.code,
+  JSON.stringify(createdPromo.error));
+const dupPromo = await api('/api/admin/promos', { method: 'POST', token: adminToken, body: promoBody });
+ok('the same code cannot be created twice', dupPromo.error?.code === 'CODE_TAKEN', JSON.stringify(dupPromo.error));
+
+const promoCustomer = await makeCustomer(`6${RUN}0031`.slice(0, 10), 'Promo Customer');
+const promoQuote = await api('/api/customer/quote', {
+  method: 'POST', token: promoCustomer.token, body: { services: [{ code: 'full_home' }], promoCode: promoBody.code.toLowerCase() },
+});
+ok('the customer sees the code come off their bill',
+  promoQuote.promo?.applied === true && promoQuote.pricing?.promoDiscount === 50 &&
+  promoQuote.pricing?.promoCode === promoBody.code,
+  JSON.stringify({ promo: promoQuote.promo, discount: promoQuote.pricing?.promoDiscount }));
+ok('the helper is still paid in full — the platform funds the discount',
+  promoQuote.pricing?.helperPayout === money2(promoQuote.pricing.servicesAmount - promoQuote.pricing.helperCommission),
+  JSON.stringify({ payout: promoQuote.pricing?.helperPayout, services: promoQuote.pricing?.servicesAmount }));
+const wrongPromo = await api('/api/customer/quote', {
+  method: 'POST', token: promoCustomer.token, body: { services: [{ code: 'full_home' }], promoCode: 'NOPENOPE' },
+});
+ok('a code that does not exist says so, and the bill still comes back',
+  wrongPromo.promo?.applied === false && wrongPromo.promo?.code === 'NOPENOPE' && wrongPromo.pricing?.total > 0,
+  JSON.stringify(wrongPromo.promo));
+
+await api('/api/helper/online', { method: 'POST', token: helperA, body: { isOnline: true } });
+const promoJob = await runFullJob(promoCustomer.token, promoCustomer.addressId, helperA, {
+  key: `smoke-promo-${Date.now()}`, promoCode: promoBody.code,
+});
+const promoTask = await api(`/api/customer/tasks/${promoJob.id}`, { token: promoCustomer.token });
+ok('a booking made with it keeps the code and the discount',
+  promoTask.task?.pricing?.promoCode === promoBody.code && promoTask.task?.pricing?.promoDiscount === 50,
+  JSON.stringify(promoTask.task?.pricing));
+const promoDetail = await api(`/api/admin/promos/${createdPromo.promo._id}`, { token: adminToken });
+ok('and every use is recorded against the code',
+  promoDetail.redemptions?.[0]?.amount === 50 && promoDetail.redemptions?.[0]?.task?.code === promoTask.task?.code,
+  JSON.stringify(promoDetail.redemptions?.[0]));
+
+const usedAgain = await api('/api/customer/quote', {
+  method: 'POST', token: promoCustomer.token, body: { services: [{ code: 'full_home' }], promoCode: promoBody.code },
+});
+ok('one use per customer is enforced', usedAgain.promo?.applied === false, JSON.stringify(usedAgain.promo));
+ok('and the app is told which rule stopped it',
+  ['PROMO_ALREADY_USED', 'PROMO_TASK_NUMBER'].includes(usedAgain.promo?.reason), JSON.stringify(usedAgain.promo));
+
+const secondCustomer = await makeCustomer(`6${RUN}0032`.slice(0, 10), 'Second Promo');
+const minBillPromo = await api('/api/admin/promos', {
+  method: 'POST', token: adminToken,
+  body: { code: `BIG${RUN}`.slice(0, 12), type: 'PERCENT', value: 10, maxDiscount: 40, minBill: 100000 },
+});
+const tooSmall = await api('/api/customer/quote', {
+  method: 'POST', token: secondCustomer.token, body: { services: [{ code: 'full_home' }], promoCode: minBillPromo.promo.code },
+});
+ok('a minimum bill is enforced', tooSmall.promo?.reason === 'PROMO_MIN_BILL', JSON.stringify(tooSmall.promo));
+
+const expiredPromo = await api('/api/admin/promos', {
+  method: 'POST', token: adminToken,
+  body: { code: `OLD${RUN}`.slice(0, 12), type: 'FLAT', value: 20, endsAt: new Date(Date.now() - 86_400_000).toISOString() },
+});
+const expiredTry = await api('/api/customer/quote', {
+  method: 'POST', token: secondCustomer.token, body: { services: [{ code: 'full_home' }], promoCode: expiredPromo.promo.code },
+});
+ok('an expired code is refused', expiredTry.promo?.reason === 'PROMO_EXPIRED', JSON.stringify(expiredTry.promo));
+
+const percentPromo = await api('/api/admin/promos', {
+  method: 'POST', token: adminToken,
+  body: { code: `PCT${RUN}`.slice(0, 12), type: 'PERCENT', value: 50, maxDiscount: 40 },
+});
+const cappedPromoQuote = await api('/api/customer/quote', {
+  method: 'POST', token: secondCustomer.token, body: { services: [{ code: 'full_home' }], promoCode: percentPromo.promo.code },
+});
+ok('a percentage code is capped by its maximum discount', cappedPromoQuote.pricing?.promoDiscount === 40,
+  JSON.stringify(cappedPromoQuote.pricing?.promoDiscount));
+
+const cancelPromoBooking = await api('/api/customer/tasks', {
+  method: 'POST', token: secondCustomer.token,
+  body: {
+    services: [{ code: 'full_home' }], addressId: secondCustomer.addressId, bookingType: 'instant',
+    promoCode: percentPromo.promo.code, idempotencyKey: `smoke-promo-cancel-${Date.now()}`,
+  },
+});
+await api(`/api/customer/tasks/${cancelPromoBooking.task?.id}/cancel`, {
+  method: 'POST', token: secondCustomer.token, body: { reason: 'Smoke test promo return' },
+});
+const afterCancelPromo = await api('/api/customer/quote', {
+  method: 'POST', token: secondCustomer.token, body: { services: [{ code: 'full_home' }], promoCode: percentPromo.promo.code },
+});
+ok('a cancelled booking gives the promo back', afterCancelPromo.promo?.applied === true, JSON.stringify(afterCancelPromo.promo));
+
+const pausedPromo = await api(`/api/admin/promos/${createdPromo.promo._id}`, { method: 'DELETE', token: adminToken });
+ok('a code that has been used is paused rather than deleted', pausedPromo.paused === true, JSON.stringify(pausedPromo));
+const promoList = await api('/api/admin/promos', { token: adminToken });
+ok('the admin list shows how much each code has been used',
+  promoList.promos?.find((p) => p.code === promoBody.code)?.usage?.used === 1,
+  JSON.stringify(promoList.promos?.find((p) => p.code === promoBody.code)?.usage));
+
+// ---- UC-C34: a referral partner earns their cashback on the first qualifying booking
+await rules15({ partner_reward_amount: 75 });
+const partnerPhone = `6${RUN}0041`.slice(0, 10);
+const createdPartner = await api('/api/admin/partners', { method: 'POST', token: adminToken, body: { name: 'Gate Guard', phone: partnerPhone } });
+ok('an admin sets up a referral partner', Boolean(createdPartner._id || createdPartner.id), JSON.stringify(createdPartner).slice(0, 120));
+const partnerToken = await login(partnerPhone, 'partner');
+const partnerDash = await api('/api/partner/dashboard', { token: partnerToken });
+ok('the partner has a code to share', /^[A-Z2-9]{6}$/.test(String(partnerDash.code)), String(partnerDash.code));
+
+const referredCustomer = await makeCustomer(`6${RUN}0042`.slice(0, 10), 'Guard Referral');
+const partnerApply = await api('/api/referrals/apply', { method: 'POST', token: referredCustomer.token, body: { code: partnerDash.code } });
+ok('someone signs up with the partner\'s code', partnerApply.status === 201, JSON.stringify(partnerApply.error));
+ok('and the partner is paid nothing yet',
+  (await api('/api/partner/dashboard', { token: partnerToken })).balance === 0);
+
+const partnerJob = await runFullJob(referredCustomer.token, referredCustomer.addressId, helperA, { key: `smoke-partner-${Date.now()}` });
+await api(`/api/helper/jobs/${partnerJob.id}/confirm-payment`, { method: 'POST', token: helperA });
+const partnerAfter = await api('/api/partner/dashboard', { token: partnerToken });
+ok('once that person\'s first booking is done, the partner gets the configured cashback',
+  partnerAfter.balance === 75 && partnerAfter.totals?.successfulReferrals === 1 &&
+  partnerAfter.ledger?.[0]?.type === 'REFERRER_REWARD' && partnerAfter.ledger?.[0]?.amount === 75,
+  JSON.stringify({ balance: partnerAfter.balance, totals: partnerAfter.totals, top: partnerAfter.ledger?.[0] }));
+ok('and it is a wallet transaction, with its own id', Boolean(partnerAfter.ledger?.[0]?.id), JSON.stringify(partnerAfter.ledger?.[0]));
+
+const partnerRedeem = await api('/api/partner/redeem', { method: 'POST', token: partnerToken, body: { amount: 75, paymentDetails: 'guard@upi' } });
+ok('a partner can ask for their earnings', partnerRedeem.success === true && partnerRedeem.balance === 0, JSON.stringify(partnerRedeem.error));
+const tooMuch = await api('/api/partner/redeem', { method: 'POST', token: partnerToken, body: { amount: 500, paymentDetails: 'guard@upi' } });
+ok('but never more than they have', tooMuch.error?.code === 'INSUFFICIENT_BALANCE', JSON.stringify(tooMuch.error));
+
+// ---- UC-C33: which event earns the reward is configurable
+const qualifySetting = await rules15({ referral_qualify_event: 'SETTLED' });
+ok('the qualifying event is an admin setting', qualifySetting.settings?.referral_qualify_event === 'SETTLED',
+  String(qualifySetting.settings?.referral_qualify_event));
+const settledOnly = await makeCustomer(`6${RUN}0043`.slice(0, 10), 'Settled Only');
+await api('/api/referrals/apply', { method: 'POST', token: settledOnly.token, body: { code: partnerDash.code } });
+const settledJob = await runFullJob(settledOnly.token, settledOnly.addressId, helperA, { key: `smoke-settled-${Date.now()}` });
+ok('with it set to SETTLED, finishing the job is not enough',
+  (await api('/api/partner/dashboard', { token: partnerToken })).totals?.successfulReferrals === 1);
+await api(`/api/helper/jobs/${settledJob.id}/confirm-payment`, { method: 'POST', token: helperA });
+ok('the reward comes when the money does',
+  (await api('/api/partner/dashboard', { token: partnerToken })).totals?.successfulReferrals === 2,
+  String((await api('/api/partner/dashboard', { token: partnerToken })).totals?.successfulReferrals));
+await rules15({ referral_qualify_event: 'COMPLETED', partner_reward_amount: 100 });
+await api('/api/helper/online', { method: 'POST', token: helperA, body: { isOnline: false } });
 
 // ---------------------------------------------------------------- teardown
 await api('/api/helper/online', { method: 'POST', token: helperA, body: { isOnline: false } });

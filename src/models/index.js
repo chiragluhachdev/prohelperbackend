@@ -15,3 +15,8 @@ export { Setting } from './Setting.js';
 export { AuditLog } from './AuditLog.js';
 export { Otp } from './Otp.js';
 export { RedemptionRequest } from './RedemptionRequest.js';
+export { Rejection } from './Rejection.js';
+export { Payment, PaymentEvent } from './Payment.js';
+export { PromoCode, PromoRedemption } from './PromoCode.js';
+export { Complaint } from './Complaint.js';
+export { PriceZone } from './PriceZone.js';

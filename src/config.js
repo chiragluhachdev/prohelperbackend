@@ -56,7 +56,8 @@ export const TASK_STATUS = {
 export const ALLOWED_TRANSITIONS = {
   CREATED: ['SEARCHING', 'CANCELLED'],
   SEARCHING: ['ACCEPTED', 'NO_HELPER_AVAILABLE', 'CANCELLED'],
-  ACCEPTED: ['IN_PROGRESS', 'CANCELLED'],
+  // ACCEPTED -> SEARCHING: the helper dropped the job (or was blocked), and the search goes on.
+  ACCEPTED: ['IN_PROGRESS', 'SEARCHING', 'CANCELLED'],
   IN_PROGRESS: ['COMPLETION_PENDING', 'CANCELLED'],
   // The self-transition is a re-issued completion OTP, not a state change.
   COMPLETION_PENDING: ['COMPLETED', 'COMPLETION_PENDING', 'IN_PROGRESS', 'CANCELLED'],
@@ -102,27 +103,97 @@ export const DEFAULT_SETTINGS = {
   match_ignore_location: true,
   dispatch_batch_size: 3,         // with location on: new helpers alerted at a time, nearest first
   accept_window_seconds: 60,      // how long each alert rings (never longer than the re-notify interval)
-  // --- money (UC-C29 / UC-C30 / UC-C31) ---
-  platform_fee_percent: 5,        // customer-side service fee
-  helper_commission_percent: 15,  // deducted from the helper's gross
+  /**
+   * Whether a helper may still take a job after their own alert stopped
+   * ringing, as long as the search is open (UC-C52). Off: only a live alert
+   * can be accepted. Either way the phone's countdown decides nothing — the
+   * server's clock and the booking's own state do.
+   */
+  accept_after_ring_enabled: true,
+  // --- money (UC-C29 / UC-C30 / UC-C31) — every charge can be switched off ---
+  // The customer's side of the commission (UC-C29): a share, or a flat amount.
+  platform_fee_enabled: true,
+  platform_fee_type: 'percent',   // percent | flat
+  platform_fee_percent: 5,        // customer-side service fee, on services after discounts
+  platform_fee_flat: 20,          // used when the type is flat
+  platform_fee_label: 'Platform fee',
+  discount_enabled: false,
+  discount_percent: 10,           // off the services amount
+  discount_max: 100,              // ₹ cap per booking (0 = no cap)
+  discount_min_order: 0,          // services amount needed before it applies
+  discount_label: 'Discount',
+  surcharge_enabled: false,
+  surcharge_flat: 20,             // ₹ per booking
+  surcharge_applies_to: 'all',    // all | instant | scheduled
+  surcharge_label: 'Special surcharge',
+  gst_enabled: true,
   gst_percent: 18,
-  surcharge_flat: 20,
+  gst_base: 'all',                // all (the whole bill) | fees (platform fee + surcharge only)
+  gst_label: 'GST',
+  // The helper's side of the commission (UC-C29). Either can be 0, or switched off entirely.
+  helper_commission_enabled: true,
+  helper_commission_type: 'percent', // percent | flat
+  helper_commission_percent: 15,  // deducted from the helper's gross
+  helper_commission_flat: 0,      // used when the type is flat
   currency: 'INR',
+  /**
+   * Locality pricing: where the extra goes when a society is priced above the
+   * catalog. 'helper' — the helper is paid on the price the customer paid.
+   * 'platform' — the helper is paid as if it were the catalog price.
+   */
+  zone_uplift_to: 'helper', // helper | platform
+  // --- promo codes (UC-C32) ---
+  promo_enabled: true,
+  // --- online payment (UC-C28) ---
+  online_payment_enabled: true,
   // --- referrals ---
   referral_enabled: true,
   referral_reward_amount: 100,     // to the person whose code was used
   referral_welcome_amount: 100,    // to the person who joined with it
   referral_apply_window_days: 7,   // a code can only be entered this soon after signing up
   referral_max_booking_percent: 50, // at most this share of a booking's total can be paid with referral balance
-  // --- start (the customer's code before work begins) ---
+  /**
+   * What earns the reward (UC-C33): the referred person's first COMPLETED job,
+   * or their first SETTLED one — settled meaning the money actually changed
+   * hands. Installing the app never earns anything.
+   */
+  referral_qualify_event: 'COMPLETED', // COMPLETED | SETTLED
+  // What a referral partner gets when someone they signed up qualifies (UC-C34).
+  partner_reward_amount: 100,
+  // --- start (UC-C16): the customer's code before work begins ---
   start_otp_enabled: true,
+  start_early_minutes: 60,          // a booking for later can be started at most this long before its slot (0 = any time)
   // --- completion (UC-C17) ---
   completion_otp_ttl_seconds: 900,
-  completion_otp_max_attempts: 5,
-  // --- abuse control (UC-C23) ---
-  rejection_block_threshold: 5,
+  completion_otp_max_attempts: 5,   // wrong codes per issued OTP (also used for the start code)
+  completion_otp_resend_seconds: 30, // wait before another completion OTP can be sent
+  completion_otp_max_sends: 5,      // completion OTPs one job can send in all
   // --- overdue monitoring (UC-C18) ---
-  overdue_reminder_minutes: 90,
+  overdue_reminder_minutes: 90,     // this long past the expected finish, remind both sides
+  overdue_repeat_minutes: 60,       // and again this often (0 = remind once)
+  overdue_max_reminders: 3,
+  // --- cancellation (UC-C22) ---
+  customer_cancel_until: 'IN_PROGRESS', // the last status a customer can cancel in: SEARCHING | ACCEPTED | IN_PROGRESS
+  helper_cancel_enabled: true,
+  helper_cancel_min_minutes_before: 60, // a booking for later can't be dropped closer to its slot than this (0 = any time)
+  helper_cancel_action: 'research', // research (find another helper) | cancel (end the booking)
+  auto_cancel_unstarted_hours: 6,   // accepted but not started this long after the slot → cancelled by the system (0 = off)
+  auto_cancel_no_helper_hours: 24,  // no helper found and not retried for this long → cancelled by the system (0 = off)
+  // --- rejection and blocking (UC-C23) — 0 switches a rule off ---
+  rejection_block_threshold: 5,     // helpers: declined requests + accepted jobs dropped
+  customer_rejection_block_threshold: 5, // customers: bookings cancelled after a helper was assigned
+};
+
+/** Settings that take one of a fixed set of words — anything else is refused on save. */
+export const SETTING_CHOICES = {
+  surcharge_applies_to: ['all', 'instant', 'scheduled'],
+  gst_base: ['all', 'fees'],
+  customer_cancel_until: ['SEARCHING', 'ACCEPTED', 'IN_PROGRESS'],
+  platform_fee_type: ['percent', 'flat'],
+  helper_commission_type: ['percent', 'flat'],
+  zone_uplift_to: ['helper', 'platform'],
+  referral_qualify_event: ['COMPLETED', 'SETTLED'],
+  helper_cancel_action: ['research', 'cancel'],
 };
 
 /**

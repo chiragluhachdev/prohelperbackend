@@ -1,20 +1,28 @@
 import mongoose from 'mongoose';
 import { Router } from 'express';
 import {
-  Address, AuditLog, HelperDocument, HelperProfile, JobRequest,
-  LedgerEntry, Rating, ReferralEntry, Service, Task, TaskEvent, User, Category, RedemptionRequest
+  Address, AuditLog, Complaint, HelperDocument, HelperProfile, JobRequest,
+  LedgerEntry, Payment, PromoCode, PromoRedemption, Rating, ReferralEntry, Rejection,
+  PriceZone, Service, Task, TaskEvent, User, Category, RedemptionRequest
 } from '../models/index.js';
-import { ROLES, TASK_STATUS, HELPER_APPROVAL, BUSINESS_TZ, dayKey } from '../config.js';
+import { ROLES, TASK_STATUS, HELPER_APPROVAL, BUSINESS_TZ, SETTING_CHOICES, dayKey } from '../config.js';
 import { authenticate, requireAdmin } from '../lib/auth.js';
 import { wrap, badRequest, notFound, conflict } from '../lib/http.js';
-import { serializeTask, STATUS_LABELS, jobsLabel, DEFAULT_JOBS_SHOWN } from '../lib/views.js';
+import { serializeTask, STATUS_LABELS, jobsLabel, DEFAULT_JOBS_SHOWN, expectedEndAt } from '../lib/views.js';
+import { ADMIN_CANCELLABLE, cancelBooking } from '../lib/cancellation.js';
+import { blockAccount, notifyAdmins } from '../lib/accounts.js';
+import { OPEN_STATUSES, releaseHelperJob } from '../matching.js';
 import { getSettings, updateSettings } from '../lib/settings.js';
-import { closeJobAlerts, notify } from '../lib/notify.js';
+import { notify } from '../lib/notify.js';
 import { audit } from '../lib/audit.js';
-import { mustTransition } from '../lib/taskflow.js';
-import { DUES_MATCH, PAYOUT_MATCH, PAYOUT_STAGES, SIGNED_DUES, openPayoutEntries } from '../lib/wallet.js';
+import { newTxnId, postEntry, publicEntry } from '../lib/ledger.js';
+import { normaliseOptions } from '../lib/serviceOptions.js';
+import { documentUrl } from '../lib/cloudinary.js';
+import { DUES_MATCH, PAYOUT_MATCH, PAYOUT_STAGES, SIGNED_DUES, helperEarnings, openPayoutEntries } from '../lib/wallet.js';
+import { publicPayment } from '../lib/payments.js';
+import { invalidateZones, zonePrice, zoneRuleText } from '../lib/zones.js';
 import { ensureReferralCode, referralBalance } from '../lib/referral.js';
-import { SOCIETIES } from '../constants/societies.js';
+import { SOCIETIES, societyByCode } from '../constants/societies.js';
 
 const router = Router();
 router.use(authenticate, requireAdmin);
@@ -109,7 +117,7 @@ router.get(
       customers, helpers, pendingApprovals, activeHelpers, onlineHelpers,
       todayBookings, activeTasks, completedTasks, cancelledTasks, noHelperTasks,
       blockedAccounts, revenueAgg, commissionAgg, recentTasks, pendingHelpers,
-      trendAgg,
+      trendAgg, overdueTasks, openComplaints,
     ] = await Promise.all([
       User.countDocuments({ role: ROLES.CUSTOMER }),
       User.countDocuments({ role: ROLES.HELPER }),
@@ -164,6 +172,8 @@ router.get(
           },
         },
       ]),
+      Task.countDocuments({ status: { $in: OPEN_STATUSES }, overdueNotifiedAt: { $ne: null } }),
+      Complaint.countDocuments({ status: { $in: ['OPEN', 'IN_REVIEW'] } }),
     ]);
 
     // Days with no bookings still need a bar, or the chart lies about the shape.
@@ -185,7 +195,7 @@ router.get(
       stats: {
         customers, helpers, pendingApprovals, activeHelpers, onlineHelpers,
         todayBookings, activeTasks, completedTasks, cancelledTasks, noHelperTasks,
-        blockedAccounts,
+        blockedAccounts, overdueTasks, openComplaints,
         revenue: Math.round((revenueAgg[0]?.total || 0) * 100) / 100,
         outstandingCommission: Math.round((commissionAgg[0]?.total || 0) * 100) / 100,
       },
@@ -216,8 +226,40 @@ function adminTask(t) {
     scheduledAt: t.scheduledAt,
     createdAt: t.createdAt,
     customer: t.customerId ? { id: String(t.customerId._id), name: t.customerId.name, phone: t.customerId.phone } : null,
-    helper: t.helperId ? { id: String(t.helperId._id), name: t.helperId.name, phone: t.helperId.phone } : null,
+    helper: t.helperId?._id
+      ? { id: String(t.helperId._id), name: t.helperId.name, phone: t.helperId.phone }
+      : t.helperSnapshot?.name ? { id: t.helperId ? String(t.helperId) : '', name: t.helperSnapshot.name, phone: t.helperSnapshot.phone || '' } : null,
     area: t.address?.label || t.address?.city || '',
+    overdue: Boolean(t.overdueNotifiedAt) && OPEN_STATUSES.includes(t.status),
+    cancelledBy: t.status === TASK_STATUS.CANCELLED ? t.cancellation?.by || null : null,
+  };
+}
+
+/** Complaints this person raised, and complaints about them (UC-C40/C41). */
+async function accountComplaints(userId) {
+  const [raised, about] = await Promise.all([
+    Complaint.find({ byUserId: userId }).populate('taskId', 'code status').sort({ createdAt: -1 }).limit(25).lean(),
+    Complaint.find({ againstUserId: userId }).populate('byUserId', 'name phone').populate('taskId', 'code status').sort({ createdAt: -1 }).limit(25).lean(),
+  ]);
+  return { raised: raised.map(adminComplaint), about: about.map(adminComplaint) };
+}
+
+/** UC-C23 — an account's rejections: the running count, the rule in force, and the latest ones. */
+async function rejectionSummary(user) {
+  const settings = await getSettings();
+  const threshold = Number(user.role === ROLES.HELPER ? settings.rejection_block_threshold : settings.customer_rejection_block_threshold) || 0;
+  const [recent, byKind] = await Promise.all([
+    Rejection.find({ userId: user._id }).sort({ createdAt: -1 }).limit(30).lean(),
+    Rejection.aggregate([{ $match: { userId: user._id } }, { $group: { _id: '$kind', n: { $sum: 1 } } }]),
+  ]);
+  return {
+    count: user.rejectionCount || 0,
+    threshold,
+    lifetime: Object.fromEntries(byKind.map((k) => [k._id, k.n])),
+    recent: recent.map((r) => ({
+      id: String(r._id), kind: r.kind, taskId: r.taskId ? String(r.taskId) : null, taskCode: r.taskCode || '',
+      reason: r.reason, count: r.count, threshold: r.threshold, blocked: r.blocked, at: r.createdAt,
+    })),
   };
 }
 
@@ -325,10 +367,17 @@ router.get(
         referral: await referralSummary(user),
       },
       profile,
-      documents,
+      // KYC files are private: an admin gets a link that works for a few minutes (UC-C25).
+      documents: documents.map((d) => ({ ...d, url: documentUrl(d, 900) })),
       tasks: tasks.map(adminTask),
       ratings,
+      ratingsGiven: await Rating.find({ fromUserId: user._id }).populate('toUserId', 'name role').populate('taskId', 'code').sort({ createdAt: -1 }).limit(50).lean(),
+      rejections: await rejectionSummary(user),
+      complaints: await accountComplaints(user._id),
       earnings: Object.fromEntries(ledger.map((l) => [l._id, Math.round(l.total * 100) / 100])),
+      // UC-C26 — the same figures the helper sees in their own app.
+      money: await helperEarnings(user._id),
+      ledger: (await LedgerEntry.find({ userId: user._id }).populate('taskId', 'code').sort({ createdAt: -1 }).limit(50).lean()).map(publicEntry),
     });
   }),
 );
@@ -444,12 +493,20 @@ router.post(
   }),
 );
 
-/** Approve or reject a single document, with a remark the helper can act on. */
+/**
+ * Approve, reject, or ask for a better copy of one document, with a remark the
+ * helper can act on (UC-C25). Every review is written to the audit log.
+ */
 router.post(
   '/documents/:id/review',
   wrap(async (req, res) => {
     const { status, remark = '' } = req.body;
-    if (!['APPROVED', 'REJECTED'].includes(status)) throw badRequest('Status must be APPROVED or REJECTED.', 'INVALID_STATUS');
+    if (!['APPROVED', 'REJECTED', 'CORRECTION_REQUESTED'].includes(status)) {
+      throw badRequest('Status must be APPROVED, REJECTED or CORRECTION_REQUESTED.', 'INVALID_STATUS');
+    }
+    if (status !== 'APPROVED' && !String(remark).trim()) {
+      throw badRequest('Say what needs fixing, so the helper can act on it.', 'REASON_REQUIRED');
+    }
 
     const doc = await HelperDocument.findById(req.params.id);
     if (!doc) throw notFound('Document not found.');
@@ -461,8 +518,10 @@ router.post(
     doc.reviewedBy = req.user._id;
     await doc.save();
 
-    await notify(doc.helperId, 'DOCUMENT_REVIEWED', `Document ${status.toLowerCase()}`,
-      remark || `Your ${doc.type.replace(/_/g, ' ')} was ${status.toLowerCase()}.`,
+    const readable = doc.type.replace(/_/g, ' ');
+    await notify(doc.helperId, 'DOCUMENT_REVIEWED',
+      status === 'CORRECTION_REQUESTED' ? 'Please re-upload a document' : `Document ${status.toLowerCase()}`,
+      remark || `Your ${readable} was ${status.toLowerCase().replace(/_/g, ' ')}.`,
       { status, docType: doc.type, remark: remark || '' });
     await audit(req, {
       action: 'DOCUMENT_REVIEWED', entity: 'HelperDocument', entityId: doc._id,
@@ -470,6 +529,42 @@ router.post(
     });
 
     res.json({ document: doc });
+  }),
+);
+
+/**
+ * POST /api/admin/helpers/:id/request-correction — UC-C25. Sends the whole
+ * application back for fixing rather than turning it down: the helper can edit
+ * and submit again, and is told exactly what to change.
+ */
+router.post(
+  '/helpers/:id/request-correction',
+  wrap(async (req, res) => {
+    const reason = String(req.body.reason || '').trim();
+    if (!reason) throw badRequest('Say what the helper needs to fix.', 'REASON_REQUIRED');
+
+    const profile = await HelperProfile.findOne({ userId: req.params.id });
+    if (!profile) throw notFound('Helper not found.');
+    if (profile.approvalStatus === HELPER_APPROVAL.APPROVED) {
+      throw conflict('This helper is already approved. Reject the account instead if something is wrong.', 'ALREADY_APPROVED');
+    }
+
+    const before = { approvalStatus: profile.approvalStatus };
+    profile.approvalStatus = HELPER_APPROVAL.DRAFT;
+    profile.rejectionReason = reason;
+    profile.reviewedAt = new Date();
+    profile.reviewedBy = req.user._id;
+    profile.isOnline = false;
+    await profile.save();
+
+    // Documents the admin flagged stay flagged; the rest wait for the new submission.
+    await notify(profile.userId, 'CORRECTION_REQUESTED', 'Please fix your application', reason, { reason });
+    await audit(req, {
+      action: 'HELPER_CORRECTION_REQUESTED', entity: 'HelperProfile', entityId: profile.userId,
+      before, after: { approvalStatus: profile.approvalStatus }, reason,
+    });
+
+    res.json({ profile: profile.toObject() });
   }),
 );
 
@@ -564,6 +659,17 @@ router.get(
       addresses,
       tasks: tasks.map(adminTask),
       ratings,
+      ratingsGiven: await Rating.find({ fromUserId: user._id }).populate('toUserId', 'name role').populate('taskId', 'code').sort({ createdAt: -1 }).limit(50).lean(),
+      rejections: await rejectionSummary(user),
+      complaints: await accountComplaints(user._id),
+      // UC-C40 — what this customer has actually paid, and how.
+      payments: (await Payment.find({ userId: user._id }).populate('taskId', 'code').sort({ createdAt: -1 }).limit(50).lean())
+        .map((pay) => ({ ...publicPayment(pay), taskCode: pay.taskId?.code || '' })),
+      referralLedger: (await ReferralEntry.find({ userId: user._id }).populate('taskId', 'code').sort({ createdAt: -1 }).limit(50).lean())
+        .map((r) => ({
+          id: String(r._id), txnId: r.txnId || String(r._id), type: r.type,
+          amount: round(r.amount), note: r.note || '', taskCode: r.taskId?.code || '', at: r.createdAt,
+        })),
     });
   }),
 );
@@ -581,21 +687,13 @@ router.post(
     if (user.role === ROLES.ADMIN) throw badRequest('Admin accounts cannot be blocked here.', 'CANNOT_BLOCK_ADMIN');
 
     const before = { status: user.status };
-    user.status = 'blocked';
-    user.blockReason = reason;
-    user.blockedAt = new Date();
-    await user.save();
+    if (user.status === 'blocked') throw conflict('This account is already blocked.', 'ALREADY_BLOCKED');
 
-    // A blocked helper must stop receiving work immediately (UC-C23).
-    if (user.role === ROLES.HELPER) {
-      await HelperProfile.updateOne({ userId: user._id }, { $set: { isOnline: false } });
-      await JobRequest.updateMany({ helperId: user._id, status: 'SENT' }, { $set: { status: 'CANCELLED' } });
-    }
-
-    await notify(user._id, 'ACCOUNT_BLOCKED', 'Account blocked', reason, { reason });
+    // Stops everything the account was doing, the same as an automatic block (UC-C23).
+    await blockAccount(user._id, { by: 'admin', actorId: req.user._id, reason });
     await audit(req, { action: 'USER_BLOCKED', entity: 'User', entityId: user._id, before, after: { status: 'blocked' }, reason });
 
-    res.json({ ok: true, status: user.status });
+    res.json({ ok: true, status: 'blocked' });
   }),
 );
 
@@ -709,6 +807,14 @@ router.get(
           ? { id: String(task.customerId._id), name: task.customerId.name, phone: task.customerId.phone }
           : null,
         owedByHelper: owedByHelper ? { amount: round(owedByHelper.amount), settled: owedByHelper.settled } : null,
+        helperCancellations: (task.helperCancellations || []).map((c) => ({
+          helperId: c.helperId ? String(c.helperId) : null, helperName: c.helperName, by: c.by,
+          reason: c.reason, previousStatus: c.previousStatus, at: c.at,
+        })),
+        payment: publicPayment(await Payment.findOne({ taskId: task._id }).sort({ createdAt: -1 }).lean()),
+        overdueSince: task.overdueNotifiedAt || null,
+        overdueReminders: task.overdueReminders || 0,
+        overdueLastRemindedAt: task.overdueLastRemindedAt || null,
         // A cash job has an earning row too, but nothing is owed to the helper for it.
         payoutToHelper: payoutToHelper && task.paymentMode === 'ONLINE'
           ? { amount: round(payoutToHelper.amount), settled: payoutToHelper.settled }
@@ -734,31 +840,126 @@ router.get(
 router.post(
   '/bookings/:id/cancel',
   wrap(async (req, res) => {
-    const reason = String(req.body.reason || '').trim();
+    const reason = String(req.body.reason || '').trim().slice(0, 300);
     if (!reason) throw badRequest('Give a reason for cancelling.', 'REASON_REQUIRED');
 
-    const task = await Task.findById(req.params.id);
-    if (!task) throw notFound('Booking not found.');
-
-    const cancellable = [TASK_STATUS.CREATED, TASK_STATUS.SEARCHING, TASK_STATUS.ACCEPTED, TASK_STATUS.IN_PROGRESS];
-    if (!cancellable.includes(task.status)) throw conflict('This booking can no longer be cancelled.', 'NOT_CANCELLABLE');
-
-    const updated = await mustTransition(task._id, cancellable, TASK_STATUS.CANCELLED, {
-      set: {
-        nextDispatchAt: null,
-        cancellation: { by: 'admin', byUserId: req.user._id, reason, previousStatus: task.status, at: new Date() },
-      },
-      actorType: 'admin', actorId: req.user._id, reason,
+    const { task: updated, previousStatus } = await cancelBooking(req.params.id, {
+      by: 'admin', actorId: req.user._id, reason, from: ADMIN_CANCELLABLE,
     });
-
-    await JobRequest.updateMany({ taskId: task._id, status: 'SENT' }, { $set: { status: 'CANCELLED' } });
-    await closeJobAlerts(task._id);
     const cancelData = { taskId: String(updated._id), code: updated.code, reason, by: 'admin' };
     await notify(updated.customerId, 'BOOKING_CANCELLED', 'Booking cancelled', reason, cancelData);
     if (updated.helperId) await notify(updated.helperId, 'BOOKING_CANCELLED', 'Booking cancelled', reason, cancelData);
-    await audit(req, { action: 'BOOKING_CANCELLED', entity: 'Task', entityId: task._id, before: { status: task.status }, after: { status: 'CANCELLED' }, reason });
+    await audit(req, {
+      action: 'BOOKING_CANCELLED', entity: 'Task', entityId: updated._id,
+      before: { status: previousStatus }, after: { status: 'CANCELLED', financialImpact: updated.cancellation?.financialImpact }, reason,
+    });
 
     res.json({ task: serializeTask(updated) });
+  }),
+);
+
+/**
+ * GET /api/admin/open-tasks — UC-C18 monitoring: every booking a helper has
+ * and nobody has closed, with when it should have finished and how late it
+ * is. Overdue first, latest first.
+ */
+router.get(
+  '/open-tasks',
+  wrap(async (req, res) => {
+    const settings = await getSettings();
+    const graceMs = Math.max(0, Number(settings.overdue_reminder_minutes) || 0) * 60_000;
+    const filter = { status: { $in: OPEN_STATUSES } };
+    const only = statusList(req.query.status).filter((st) => OPEN_STATUSES.includes(st));
+    if (only.length) filter.status = { $in: only };
+
+    const tasks = await Task.find(filter)
+      .populate('customerId', 'name phone')
+      .populate('helperId', 'name phone')
+      .sort({ scheduledAt: 1 })
+      .limit(500)
+      .lean();
+
+    const now = Date.now();
+    let rows = tasks.map((t) => {
+      const end = expectedEndAt(t);
+      const lateMinutes = Math.round((now - end.getTime()) / 60_000);
+      return {
+        ...adminTask(t),
+        startedAt: t.startedAt || null,
+        durationMins: t.durationMins,
+        expectedEndAt: end,
+        lateMinutes,
+        // Overdue by the rule, whether or not the reminder has gone out yet (it runs once a minute).
+        overdue: now >= end.getTime() + graceMs,
+        overdueSince: t.overdueNotifiedAt || null,
+        reminders: t.overdueReminders || 0,
+        lastRemindedAt: t.overdueLastRemindedAt || null,
+      };
+    });
+    if (req.query.overdue === '1') rows = rows.filter((r) => r.overdue);
+    rows.sort((a, b) => Number(b.overdue) - Number(a.overdue) || b.lateMinutes - a.lateMinutes);
+
+    res.json({
+      tasks: rows,
+      counts: {
+        open: tasks.length,
+        overdue: rows.filter((r) => r.overdue).length,
+        ACCEPTED: tasks.filter((t) => t.status === TASK_STATUS.ACCEPTED).length,
+        IN_PROGRESS: tasks.filter((t) => t.status === TASK_STATUS.IN_PROGRESS).length,
+        COMPLETION_PENDING: tasks.filter((t) => t.status === TASK_STATUS.COMPLETION_PENDING).length,
+      },
+      rule: {
+        overdueAfterMinutes: settings.overdue_reminder_minutes,
+        repeatMinutes: settings.overdue_repeat_minutes,
+        maxReminders: settings.overdue_max_reminders,
+      },
+    });
+  }),
+);
+
+/**
+ * POST /api/admin/bookings/:id/reassign — take the job off the helper who has
+ * it and look for another. The booking stays the customer's; the drop is kept
+ * on it, and the helper who lost it is never offered it again (UC-C22/C46).
+ */
+router.post(
+  '/bookings/:id/reassign',
+  wrap(async (req, res) => {
+    const reason = String(req.body.reason || '').trim().slice(0, 300);
+    if (!reason) throw badRequest('Give a reason for moving this booking.', 'REASON_REQUIRED');
+
+    const task = await Task.findById(req.params.id).select('status helperId code').lean();
+    if (!task) throw notFound('Booking not found.');
+
+    const { task: updated, research } = await releaseHelperJob(task._id, {
+      by: 'admin', actorId: req.user._id, reason,
+      action: req.body.cancel ? 'cancel' : 'research',
+      countRejection: false,
+    });
+    await audit(req, {
+      action: 'BOOKING_REASSIGNED', entity: 'Task', entityId: task._id,
+      before: { helperId: String(task.helperId), status: task.status },
+      after: { status: updated.status, research }, reason,
+    });
+    res.json({ task: serializeTask(updated), research });
+  }),
+);
+
+/** POST /api/admin/bookings/:id/remind — nudge both sides of an open booking now. */
+router.post(
+  '/bookings/:id/remind',
+  wrap(async (req, res) => {
+    const task = await Task.findById(req.params.id).lean();
+    if (!task) throw notFound('Booking not found.');
+    if (!OPEN_STATUSES.includes(task.status)) throw conflict('Only an open booking can be reminded about.', 'NOT_OPEN');
+
+    const data = { taskId: String(task._id), code: task.code, status: task.status, byAdmin: '1' };
+    await notify(task.customerId, 'TASK_OVERDUE', 'Booking still open', `${task.code} has not been closed yet.`, { ...data, role: 'customer' });
+    await notify(task.helperId, 'TASK_OVERDUE', 'Please close this job', `${task.code} is still open. Close it with the customer's OTP.`, { ...data, role: 'helper' });
+    await Task.updateOne({ _id: task._id }, { $set: { overdueLastRemindedAt: new Date() } });
+    await TaskEvent.create({ taskId: task._id, kind: 'STATUS', from: task.status, to: task.status, actorType: 'admin', actorId: req.user._id, reason: 'Admin sent a reminder to close the job' });
+    await audit(req, { action: 'BOOKING_REMINDED', entity: 'Task', entityId: task._id, reason: req.body.reason || '' });
+    res.json({ ok: true });
   }),
 );
 
@@ -860,7 +1061,6 @@ router.patch(
  * the catalog that can change a bill, so they are validated here rather than
  * trusted: a bad key or a negative price would reach the quote engine.
  */
-const OPTION_TYPES = ['number', 'text', 'select', 'boolean'];
 
 /** "Extra Bathrooms!" -> "extra_bathrooms": no runs, no edges, no surprises. */
 const slug = (raw) =>
@@ -870,51 +1070,8 @@ const slug = (raw) =>
     .replace(/[^a-z0-9_]+/g, '_')
     .replace(/^_+|_+$/g, '');
 
-function parseOptions(raw) {
-  if (!Array.isArray(raw)) throw badRequest('Options must be a list.', 'INVALID_OPTIONS');
-  if (raw.length > 10) throw badRequest('Ten questions per service is plenty.', 'TOO_MANY_OPTIONS');
-
-  const seen = new Set();
-  return raw.map((o, i) => {
-    const key = slug(o?.key);
-    const label = String(o?.label || '').trim();
-    const type = OPTION_TYPES.includes(o?.type) ? o.type : 'text';
-
-    if (!key) throw badRequest(`Question ${i + 1} needs a key.`, 'OPTION_KEY_REQUIRED');
-    if (!label) throw badRequest(`Question ${i + 1} needs a label.`, 'OPTION_LABEL_REQUIRED');
-    if (seen.has(key)) throw badRequest(`Two questions share the key "${key}".`, 'DUPLICATE_OPTION_KEY');
-    seen.add(key);
-
-    const choices = type === 'select'
-      ? (Array.isArray(o.choices) ? o.choices : String(o.choices || '').split(','))
-          .map((c) => String(c).trim()).filter(Boolean)
-      : [];
-    if (type === 'select' && choices.length < 2) {
-      throw badRequest(`"${label}" needs at least two choices.`, 'OPTION_CHOICES_REQUIRED');
-    }
-
-    const pricePerUnit = Number(o.pricePerUnit || 0);
-    if (!Number.isFinite(pricePerUnit) || pricePerUnit < 0) {
-      throw badRequest(`"${label}" has an invalid price.`, 'INVALID_OPTION_PRICE');
-    }
-
-    // The default has to be the shape the question asks for, or the quote
-    // engine will do arithmetic on a string.
-    let defaultValue = o.defaultValue;
-    if (type === 'number') defaultValue = Number(defaultValue) || 0;
-    else if (type === 'boolean') defaultValue = defaultValue === true || defaultValue === 'true';
-    else if (type === 'select') defaultValue = choices.includes(defaultValue) ? defaultValue : choices[0];
-    else defaultValue = defaultValue == null ? '' : String(defaultValue);
-
-    return {
-      key, label, type, choices,
-      unit: String(o.unit || '').trim(),
-      required: Boolean(o.required),
-      defaultValue,
-      pricePerUnit: Math.round(pricePerUnit * 100) / 100,
-    };
-  });
-}
+/** The questions a service asks — validated by the same rules pricing reads them with. */
+const parseOptions = (raw) => normaliseOptions(raw);
 
 /** Add a service to the catalog. It appears in both apps immediately. */
 router.post(
@@ -993,6 +1150,9 @@ router.get(
             commission: { $sum: '$pricing.helperCommission' },
             payout: { $sum: '$pricing.helperPayout' },
             referralCredit: { $sum: { $ifNull: ['$pricing.referralCredit', 0] } },
+            discount: { $sum: { $ifNull: ['$pricing.discount', 0] } },
+            surcharge: { $sum: { $ifNull: ['$pricing.surcharge', 0] } },
+            gst: { $sum: { $ifNull: ['$pricing.gst', 0] } },
           },
         },
       ]),
@@ -1006,8 +1166,8 @@ router.get(
             platformEarned: {
               $sum: {
                 $subtract: [
-                  { $add: ['$pricing.platformFee', '$pricing.helperCommission'] },
-                  { $ifNull: ['$pricing.referralCredit', 0] },
+                  { $add: ['$pricing.platformFee', '$pricing.helperCommission', { $ifNull: ['$pricing.surcharge', 0] }] },
+                  { $add: [{ $ifNull: ['$pricing.referralCredit', 0] }, { $ifNull: ['$pricing.discount', 0] }] },
                 ],
               },
             },
@@ -1079,9 +1239,15 @@ router.get(
         platformFee: round(t.platformFee),
         commission: round(t.commission),
         helperPayout: round(t.payout),
-        // Referral balance customers spent is paid for by the platform.
+        // Referral balance customers spent and discounts are paid for by the platform.
         referralCredit: round(t.referralCredit),
-        platformEarned: round((t.platformFee || 0) + (t.commission || 0) - (t.referralCredit || 0)),
+        discount: round(t.discount),
+        surcharge: round(t.surcharge),
+        // Tax collected on the platform's behalf — owed to the government, not revenue.
+        gst: round(t.gst),
+        platformEarned: round(
+          (t.platformFee || 0) + (t.commission || 0) + (t.surcharge || 0) - (t.referralCredit || 0) - (t.discount || 0),
+        ),
         awaitingPayment: awaiting,
         online: methodTotals.ONLINE || { bookings: 0, gross: 0 },
         cash: methodTotals.CASH || { bookings: 0, gross: 0 },
@@ -1223,7 +1389,7 @@ router.post(
     if (!open.length || total <= 0) throw conflict('Nothing is outstanding for this helper.', 'NOTHING_OWED');
     await LedgerEntry.updateMany(
       { _id: { $in: open.map((e) => e._id) } },
-      { $set: { settled: true } },
+      { $set: { settled: true, status: 'SETTLED' } },
     );
 
     await audit(req, {
@@ -1258,7 +1424,7 @@ router.post(
     const total = round(open.reduce((sum, e) => sum + e.amount, 0));
     await LedgerEntry.updateMany(
       { _id: { $in: open.map((e) => e._id) } },
-      { $set: { settled: true } },
+      { $set: { settled: true, status: 'SETTLED' } },
     );
 
     await audit(req, {
@@ -1427,6 +1593,9 @@ router.put(
         patch[key] = value === true || value === 'true' || value === 1 || value === '1';
       } else {
         patch[key] = String(value);
+        if (SETTING_CHOICES[key] && !SETTING_CHOICES[key].includes(patch[key])) {
+          throw badRequest(`"${key}" must be one of: ${SETTING_CHOICES[key].join(', ')}.`, 'INVALID_SETTING');
+        }
       }
     }
     const settings = await updateSettings(patch, req.user._id);
@@ -1524,6 +1693,610 @@ router.delete(
   }),
 );
 
+/**
+ * POST /api/admin/helpers/:id/adjustment — UC-C26. A correction to a helper's
+ * money: a bonus, a deduction, a fix for something that went wrong. Written as
+ * its own ledger row with a reason, never as an edit to a balance.
+ */
+router.post(
+  '/helpers/:id/adjustment',
+  wrap(async (req, res) => {
+    const amount = round(Number(req.body.amount));
+    const direction = req.body.direction === 'DEBIT' ? 'DEBIT' : 'CREDIT';
+    const note = String(req.body.note || '').trim();
+    if (!(amount > 0)) throw badRequest('Enter an amount above zero.', 'INVALID_AMOUNT');
+    if (!note) throw badRequest('Say what this adjustment is for.', 'REASON_REQUIRED');
+
+    const helper = await User.findOne({ _id: req.params.id, role: ROLES.HELPER }).lean();
+    if (!helper) throw notFound('Helper not found.');
+
+    const entry = await postEntry({
+      userId: helper._id, type: 'ADJUSTMENT', direction, amount,
+      note, source: 'ADMIN', ref: `adjustment:${helper._id}:${Date.now()}`,
+    });
+
+    await notify(helper._id, 'ADJUSTMENT_POSTED',
+      direction === 'CREDIT' ? 'Money added to your account' : 'Deduction from your account',
+      `₹${amount} — ${note}`, { amount: String(amount), direction, note });
+    await audit(req, {
+      action: 'HELPER_ADJUSTMENT', entity: 'LedgerEntry', entityId: entry?._id,
+      after: { amount, direction, note }, reason: note,
+    });
+
+    res.status(201).json({ entry: entry ? publicEntry(entry) : null, earnings: await helperEarnings(helper._id) });
+  }),
+);
+
+/* ----------------------------------------------------------------- price zones */
+
+/** Every field of a zone, checked — including that a society is only priced once. */
+async function zoneBody(body, existing = {}) {
+  const code = String(body.code ?? existing.code ?? '').trim().toLowerCase().replace(/\s+/g, '_');
+  if (!/^[a-z0-9_]{2,30}$/.test(code)) throw badRequest('A zone code is 2–30 letters, numbers or underscores.', 'INVALID_CODE');
+  const name = String(body.name ?? existing.name ?? '').trim();
+  if (!name) throw badRequest('Give the zone a name.', 'NAME_REQUIRED');
+
+  const adjustType = ['percent', 'flat', 'none'].includes(body.adjustType) ? body.adjustType : existing.adjustType || 'percent';
+  const adjustValue = round(Number(body.adjustValue ?? existing.adjustValue ?? 0));
+  if (!Number.isFinite(adjustValue)) throw badRequest('The adjustment must be a number.', 'INVALID_VALUE');
+  if (adjustType === 'percent' && (adjustValue <= -100 || adjustValue > 500)) {
+    throw badRequest('A percentage adjustment must be above −100 and at most 500.', 'INVALID_VALUE');
+  }
+
+  const societies = [...new Set((body.societies ?? existing.societies ?? []).map((c) => String(c)))]
+    .filter((c) => SOCIETIES.some((sc) => sc.code === c));
+
+  // A society priced twice would make the bill depend on which zone was read first.
+  if (societies.length) {
+    const clash = await PriceZone.findOne({
+      societies: { $in: societies },
+      ...(existing._id ? { _id: { $ne: existing._id } } : {}),
+    }).lean();
+    if (clash) {
+      const taken = societies.filter((c) => (clash.societies || []).includes(c)).map((c) => societyByCode(c)?.name || c);
+      throw conflict(`${taken.join(', ')} already belongs to "${clash.name}".`, 'SOCIETY_TAKEN');
+    }
+  }
+
+  const codes = (body.overrides ?? existing.overrides ?? [])
+    .map((o) => ({ serviceCode: String(o.serviceCode || '').trim(), price: round(Number(o.price)) }))
+    .filter((o) => o.serviceCode);
+  for (const o of codes) {
+    if (!Number.isFinite(o.price) || o.price < 0) throw badRequest(`"${o.serviceCode}" needs a price of zero or more.`, 'INVALID_VALUE');
+  }
+  const known = await Service.find({ code: { $in: codes.map((o) => o.serviceCode) } }).select('code').lean();
+  const knownCodes = new Set(known.map((k) => k.code));
+  const overrides = codes.filter((o) => knownCodes.has(o.serviceCode));
+
+  return {
+    code, name, adjustType, adjustValue, societies, overrides,
+    description: String(body.description ?? existing.description ?? '').trim().slice(0, 200),
+    active: body.active === undefined ? existing.active !== false : Boolean(body.active),
+  };
+}
+
+/** GET /api/admin/zones — the zones, the societies each covers, and what they price. */
+router.get(
+  '/zones',
+  wrap(async (_req, res) => {
+    const [zones, services] = await Promise.all([
+      PriceZone.find().sort({ name: 1 }).lean(),
+      Service.find({ active: true }).select('code name basePrice').sort({ sortOrder: 1, name: 1 }).lean(),
+    ]);
+    const taken = new Set(zones.filter((z) => z.active).flatMap((z) => z.societies || []));
+    res.json({
+      zones: zones.map((z) => ({
+        ...z,
+        id: String(z._id),
+        rule: zoneRuleText(z),
+        // What this zone actually charges, so the page can show it without doing the sums.
+        prices: services.map((sv) => {
+          const { price, listPrice, source } = zonePrice(z, sv);
+          return { code: sv.code, name: sv.name, listPrice, price, source };
+        }),
+      })),
+      services: services.map((sv) => ({ code: sv.code, name: sv.name, basePrice: sv.basePrice })),
+      // Every society we serve, and whether another zone already prices it.
+      societies: SOCIETIES.map((sc) => ({
+        code: sc.code, name: sc.name, area: sc.area, city: sc.city,
+        zone: zones.find((z) => (z.societies || []).includes(sc.code))?.name || null,
+        taken: taken.has(sc.code),
+      })),
+    });
+  }),
+);
+
+router.post(
+  '/zones',
+  wrap(async (req, res) => {
+    const body = await zoneBody(req.body);
+    if (await PriceZone.exists({ code: body.code })) throw conflict('A zone with that code already exists.', 'CODE_TAKEN');
+    const zone = await PriceZone.create({ ...body, createdBy: req.user._id });
+    invalidateZones();
+    await audit(req, { action: 'ZONE_CREATED', entity: 'PriceZone', entityId: zone._id, after: zone.toObject(), reason: req.body.reason || '' });
+    res.status(201).json({ zone: zone.toObject() });
+  }),
+);
+
+router.put(
+  '/zones/:id',
+  wrap(async (req, res) => {
+    const zone = await PriceZone.findById(req.params.id);
+    if (!zone) throw notFound('Zone not found.');
+    const before = zone.toObject();
+    const body = await zoneBody(req.body, before);
+    if (body.code !== zone.code && (await PriceZone.exists({ code: body.code }))) {
+      throw conflict('A zone with that code already exists.', 'CODE_TAKEN');
+    }
+    Object.assign(zone, body);
+    await zone.save();
+    invalidateZones();
+    await audit(req, {
+      action: 'ZONE_UPDATED', entity: 'PriceZone', entityId: zone._id,
+      before, after: zone.toObject(), reason: req.body.reason || '',
+    });
+    res.json({ zone: zone.toObject() });
+  }),
+);
+
+router.delete(
+  '/zones/:id',
+  wrap(async (req, res) => {
+    const zone = await PriceZone.findById(req.params.id);
+    if (!zone) throw notFound('Zone not found.');
+    await zone.deleteOne();
+    invalidateZones();
+    // Bookings keep the prices they were made with, so removing a zone is safe.
+    await audit(req, { action: 'ZONE_DELETED', entity: 'PriceZone', entityId: zone._id, before: zone.toObject(), reason: req.body.reason || '' });
+    res.json({ ok: true });
+  }),
+);
+
+/* ------------------------------------------------------------------ complaints */
+
+const adminComplaint = (c) => ({
+  id: String(c._id),
+  code: c.code,
+  category: c.category,
+  message: c.message,
+  status: c.status,
+  resolution: c.resolution || '',
+  at: c.createdAt,
+  handledAt: c.handledAt || null,
+  escalated: Boolean(c.escalated),
+  escalatedAt: c.escalatedAt || null,
+  escalationReason: c.escalationReason || '',
+  assignedTo: c.assignedTo?._id
+    ? { id: String(c.assignedTo._id), name: c.assignedTo.name, email: c.assignedTo.email }
+    : c.assignedTo ? { id: String(c.assignedTo), name: '', email: '' } : null,
+  assignedAt: c.assignedAt || null,
+  notes: (c.notes || []).map((n) => ({ kind: n.kind, text: n.text, byName: n.byName || '', at: n.at })),
+  by: c.byUserId?._id
+    ? { id: String(c.byUserId._id), name: c.byUserId.name, phone: c.byUserId.phone, email: c.byUserId.email || '', role: c.byRole }
+    : null,
+  against: c.againstUserId?._id
+    ? { id: String(c.againstUserId._id), name: c.againstUserId.name, phone: c.againstUserId.phone }
+    : null,
+  task: c.taskId?._id ? { id: String(c.taskId._id), code: c.taskId.code, status: c.taskId.status } : null,
+  taskCode: c.taskCode || c.taskId?.code || '',
+});
+
+/** Loads a complaint with everyone on it, the way every complaint route returns it. */
+const loadComplaint = (id) =>
+  Complaint.findById(id)
+    .populate('byUserId', 'name phone email')
+    .populate('againstUserId', 'name phone')
+    .populate('assignedTo', 'name email')
+    .populate('taskId', 'code status')
+    .lean();
+
+/** GET /api/admin/complaints — UC-C39/C40: the queue, newest first. */
+router.get(
+  '/complaints',
+  wrap(async (req, res) => {
+    const filter = { ...dateRange(req.query, 'createdAt') };
+    if (['OPEN', 'IN_REVIEW', 'RESOLVED', 'DISMISSED'].includes(req.query.status)) filter.status = req.query.status;
+    if (req.query.category) filter.category = String(req.query.category);
+    if (req.query.role) filter.byRole = String(req.query.role);
+    if (req.query.escalated === '1') filter.escalated = true;
+    if (req.query.assigned === 'me') filter.assignedTo = req.user._id;
+    if (req.query.assigned === 'none') filter.assignedTo = null;
+    if (req.query.assigned && mongoose.isValidObjectId(req.query.assigned)) filter.assignedTo = req.query.assigned;
+    if (req.query.user && mongoose.isValidObjectId(req.query.user)) {
+      filter.$or = [{ byUserId: req.query.user }, { againstUserId: req.query.user }];
+    }
+    if (req.query.q) {
+      const people = await userIdsMatching(req.query.q);
+      const q = escapeRegex(String(req.query.q));
+      filter.$and = [
+        {
+          $or: [
+            { code: { $regex: q, $options: 'i' } },
+            { taskCode: { $regex: q, $options: 'i' } },
+            { message: { $regex: q, $options: 'i' } },
+            ...(people.length ? [{ byUserId: { $in: people } }, { againstUserId: { $in: people } }] : []),
+          ],
+        },
+      ];
+    }
+
+    const pg = pageOf(req.query, 50);
+    const [complaints, total, counts] = await Promise.all([
+      Complaint.find(filter)
+        .populate('byUserId', 'name phone email')
+        .populate('againstUserId', 'name phone')
+        .populate('assignedTo', 'name email')
+        .populate('taskId', 'code status')
+        // Escalated first: they are the ones that cannot wait their turn.
+        .sort({ escalated: -1, createdAt: -1 })
+        .skip(pg.skip)
+        .limit(pg.limit)
+        .lean(),
+      Complaint.countDocuments(filter),
+      Complaint.aggregate([{ $group: { _id: '$status', n: { $sum: 1 } } }]),
+    ]);
+
+    const [escalated, mine, unassigned, admins] = await Promise.all([
+      Complaint.countDocuments({ escalated: true, status: { $in: ['OPEN', 'IN_REVIEW'] } }),
+      Complaint.countDocuments({ assignedTo: req.user._id, status: { $in: ['OPEN', 'IN_REVIEW'] } }),
+      Complaint.countDocuments({ assignedTo: null, status: { $in: ['OPEN', 'IN_REVIEW'] } }),
+      User.find({ role: ROLES.ADMIN, status: 'active' }).select('name email').sort({ name: 1 }).lean(),
+    ]);
+
+    res.json({
+      complaints: complaints.map(adminComplaint),
+      counts: { ...Object.fromEntries(counts.map((c) => [c._id, c.n])), escalated, mine, unassigned },
+      admins: admins.map((a) => ({ id: String(a._id), name: a.name || a.email, email: a.email })),
+      me: String(req.user._id),
+      ...paged(total, pg),
+    });
+  }),
+);
+
+/** GET /api/admin/complaints/:id — the complaint, both sides, and the working notes. */
+router.get(
+  '/complaints/:id',
+  wrap(async (req, res) => {
+    const complaint = await loadComplaint(req.params.id);
+    if (!complaint) throw notFound('Complaint not found.');
+    res.json({ complaint: adminComplaint(complaint) });
+  }),
+);
+
+/** POST /api/admin/complaints/:id/assign — give it to an admin, or take it yourself. */
+router.post(
+  '/complaints/:id/assign',
+  wrap(async (req, res) => {
+    const complaint = await Complaint.findById(req.params.id);
+    if (!complaint) throw notFound('Complaint not found.');
+
+    const raw = req.body.adminId;
+    const target = raw === 'me' || raw === undefined ? req.user._id : raw === null || raw === '' ? null : raw;
+    let admin = null;
+    if (target) {
+      admin = await User.findOne({ _id: target, role: ROLES.ADMIN }).select('name email').lean();
+      if (!admin) throw badRequest('That is not an admin account.', 'INVALID_ADMIN');
+    }
+
+    const before = { assignedTo: complaint.assignedTo ? String(complaint.assignedTo) : null };
+    complaint.assignedTo = admin?._id ?? undefined;
+    complaint.assignedAt = admin ? new Date() : undefined;
+    // Picking it up means it is being looked at.
+    if (admin && complaint.status === 'OPEN') complaint.status = 'IN_REVIEW';
+    complaint.notes.push({
+      byId: req.user._id, byName: req.user.name || req.user.email, kind: 'ASSIGN',
+      text: admin ? `Assigned to ${admin.name || admin.email}` : 'Unassigned',
+      at: new Date(),
+    });
+    await complaint.save();
+
+    await audit(req, {
+      action: 'COMPLAINT_ASSIGNED', entity: 'Complaint', entityId: complaint._id,
+      before, after: { assignedTo: admin ? String(admin._id) : null }, reason: req.body.reason || '',
+    });
+    res.json({ complaint: adminComplaint(await loadComplaint(complaint._id)) });
+  }),
+);
+
+/**
+ * POST /api/admin/complaints/:id/notes — the working record: what was tried,
+ * who was spoken to, what they said. Internal; the reporter never sees it.
+ */
+router.post(
+  '/complaints/:id/notes',
+  wrap(async (req, res) => {
+    const text = String(req.body.text || '').trim().slice(0, 1000);
+    if (!text) throw badRequest('Write the note first.', 'NOTE_REQUIRED');
+    const kind = ['NOTE', 'CONTACT'].includes(req.body.kind) ? req.body.kind : 'NOTE';
+
+    const complaint = await Complaint.findById(req.params.id);
+    if (!complaint) throw notFound('Complaint not found.');
+    complaint.notes.push({ byId: req.user._id, byName: req.user.name || req.user.email, kind, text, at: new Date() });
+    await complaint.save();
+
+    await audit(req, {
+      action: kind === 'CONTACT' ? 'COMPLAINT_CONTACT_LOGGED' : 'COMPLAINT_NOTE_ADDED',
+      entity: 'Complaint', entityId: complaint._id, after: { kind, text }, reason: text,
+    });
+    res.json({ complaint: adminComplaint(await loadComplaint(complaint._id)) });
+  }),
+);
+
+/** POST /api/admin/complaints/:id/escalate — raise it above the queue, with a reason. */
+router.post(
+  '/complaints/:id/escalate',
+  wrap(async (req, res) => {
+    const reason = String(req.body.reason || '').trim().slice(0, 500);
+    const escalated = req.body.escalated === false ? false : true;
+    if (escalated && !reason) throw badRequest('Say why this needs escalating.', 'REASON_REQUIRED');
+
+    const complaint = await Complaint.findById(req.params.id);
+    if (!complaint) throw notFound('Complaint not found.');
+
+    const before = { escalated: complaint.escalated };
+    complaint.escalated = escalated;
+    complaint.escalatedAt = escalated ? new Date() : undefined;
+    complaint.escalationReason = escalated ? reason : '';
+    if (escalated && complaint.status === 'OPEN') complaint.status = 'IN_REVIEW';
+    complaint.notes.push({
+      byId: req.user._id, byName: req.user.name || req.user.email, kind: 'ESCALATE',
+      text: escalated ? `Escalated: ${reason}` : 'Escalation cleared', at: new Date(),
+    });
+    await complaint.save();
+
+    if (escalated) {
+      await notifyAdmins('COMPLAINT_ESCALATED', 'Complaint escalated',
+        `${complaint.code} was escalated: ${reason}`,
+        { complaintId: String(complaint._id), code: complaint.code });
+    }
+    await audit(req, {
+      action: escalated ? 'COMPLAINT_ESCALATED' : 'COMPLAINT_DE_ESCALATED',
+      entity: 'Complaint', entityId: complaint._id, before, after: { escalated }, reason,
+    });
+    res.json({ complaint: adminComplaint(await loadComplaint(complaint._id)) });
+  }),
+);
+
+/**
+ * POST /api/admin/complaints/:id/status — take it up, settle it, or set it
+ * aside. Whoever raised it is told what was decided, and it stays on both
+ * accounts' history either way.
+ */
+router.post(
+  '/complaints/:id/status',
+  wrap(async (req, res) => {
+    const { status } = req.body;
+    if (!['IN_REVIEW', 'RESOLVED', 'DISMISSED'].includes(status)) {
+      throw badRequest('Status must be IN_REVIEW, RESOLVED or DISMISSED.', 'INVALID_STATUS');
+    }
+    const resolution = String(req.body.resolution || '').trim().slice(0, 1000);
+    if (status !== 'IN_REVIEW' && !resolution) {
+      throw badRequest('Say what was decided — the person who reported it is told this.', 'REASON_REQUIRED');
+    }
+
+    const complaint = await Complaint.findById(req.params.id);
+    if (!complaint) throw notFound('Complaint not found.');
+
+    const before = { status: complaint.status };
+    complaint.status = status;
+    if (resolution) complaint.resolution = resolution;
+    complaint.handledBy = req.user._id;
+    complaint.handledAt = new Date();
+    // Closing it clears the escalation: it is no longer waiting on anyone.
+    if (['RESOLVED', 'DISMISSED'].includes(status)) complaint.escalated = false;
+    complaint.notes.push({
+      byId: req.user._id, byName: req.user.name || req.user.email, kind: 'STATUS',
+      text: resolution ? `${status}: ${resolution}` : status, at: new Date(),
+    });
+    await complaint.save();
+
+    await notify(complaint.byUserId, 'COMPLAINT_UPDATED',
+      status === 'IN_REVIEW' ? 'We are looking into it' : status === 'RESOLVED' ? 'Your complaint is resolved' : 'About your complaint',
+      resolution || `${complaint.code} is being looked at.`,
+      { complaintId: String(complaint._id), code: complaint.code, status, taskId: complaint.taskId ? String(complaint.taskId) : '' });
+    await audit(req, {
+      action: 'COMPLAINT_UPDATED', entity: 'Complaint', entityId: complaint._id,
+      before, after: { status }, reason: resolution,
+    });
+
+    res.json({ complaint: adminComplaint(await loadComplaint(complaint._id)) });
+  }),
+);
+
+/* ------------------------------------------------------------------ promo codes */
+
+const promoBody = (body, existing = {}) => {
+  const code = String(body.code ?? existing.code ?? '').trim().toUpperCase();
+  if (!/^[A-Z0-9]{3,20}$/.test(code)) throw badRequest('A promo code is 3–20 letters or numbers.', 'INVALID_CODE');
+  const type = body.type === 'PERCENT' ? 'PERCENT' : body.type === 'FLAT' ? 'FLAT' : existing.type || 'FLAT';
+  const value = Number(body.value ?? existing.value);
+  if (!Number.isFinite(value) || value <= 0) throw badRequest('Enter a discount above zero.', 'INVALID_VALUE');
+  if (type === 'PERCENT' && value > 100) throw badRequest('A percentage discount cannot be above 100.', 'INVALID_VALUE');
+
+  const numbers = (body.taskNumbers ?? existing.taskNumbers ?? [])
+    .map((n) => Number(n))
+    .filter((n) => Number.isInteger(n) && n > 0 && n < 100);
+  const eligibility = ['ALL', 'NEW', 'SELECTED'].includes(body.eligibility) ? body.eligibility : existing.eligibility || 'ALL';
+  const customerIds = (body.customerIds ?? existing.customerIds ?? []).filter((id) => mongoose.isValidObjectId(id));
+  if (eligibility === 'SELECTED' && customerIds.length === 0) {
+    throw badRequest('Choose at least one customer for a code limited to selected customers.', 'NO_CUSTOMERS');
+  }
+
+  const dates = {};
+  for (const key of ['startsAt', 'endsAt']) {
+    const raw = body[key] ?? existing[key];
+    if (raw === '' || raw === null) dates[key] = null;
+    else if (raw !== undefined) {
+      const d = new Date(raw);
+      if (Number.isNaN(d.getTime())) throw badRequest(`"${key}" is not a date.`, 'INVALID_DATE');
+      dates[key] = d;
+    }
+  }
+  if (dates.startsAt && dates.endsAt && dates.startsAt > dates.endsAt) {
+    throw badRequest('The end date is before the start date.', 'INVALID_DATE');
+  }
+
+  return {
+    code, type, value: round(value),
+    description: String(body.description ?? existing.description ?? '').trim().slice(0, 120),
+    maxDiscount: Math.max(0, round(Number(body.maxDiscount ?? existing.maxDiscount ?? 0))),
+    minBill: Math.max(0, round(Number(body.minBill ?? existing.minBill ?? 0))),
+    maxUses: Math.max(0, Math.round(Number(body.maxUses ?? existing.maxUses ?? 0))),
+    maxUsesPerCustomer: Math.max(0, Math.round(Number(body.maxUsesPerCustomer ?? existing.maxUsesPerCustomer ?? 1))),
+    eligibility,
+    customerIds,
+    taskNumbers: numbers,
+    active: body.active === undefined ? existing.active !== false : Boolean(body.active),
+    ...dates,
+  };
+};
+
+/** GET /api/admin/promos — every code with how much it has been used (UC-C32). */
+router.get(
+  '/promos',
+  wrap(async (req, res) => {
+    const filter = {};
+    if (req.query.status === 'active') filter.active = true;
+    if (req.query.status === 'paused') filter.active = false;
+    if (req.query.q) filter.code = { $regex: escapeRegex(String(req.query.q).toUpperCase()), $options: 'i' };
+
+    const promos = await PromoCode.find(filter).sort({ createdAt: -1 }).limit(200).lean();
+    const usage = await PromoRedemption.aggregate([
+      { $match: { promoId: { $in: promos.map((p) => p._id) } } },
+      { $group: { _id: { promoId: '$promoId', status: '$status' }, n: { $sum: 1 }, amount: { $sum: '$amount' } } },
+    ]);
+    const byPromo = new Map();
+    for (const row of usage) {
+      const key = String(row._id.promoId);
+      const entry = byPromo.get(key) || { used: 0, reversed: 0, discountGiven: 0 };
+      if (row._id.status === 'APPLIED') {
+        entry.used = row.n;
+        entry.discountGiven = round(row.amount);
+      } else entry.reversed = row.n;
+      byPromo.set(key, entry);
+    }
+
+    res.json({
+      promos: promos.map((p) => ({
+        ...p,
+        id: String(p._id),
+        usage: byPromo.get(String(p._id)) || { used: 0, reversed: 0, discountGiven: 0 },
+      })),
+    });
+  }),
+);
+
+/** GET /api/admin/promos/:id — the code, and every booking it was used on. */
+router.get(
+  '/promos/:id',
+  wrap(async (req, res) => {
+    const promo = await PromoCode.findById(req.params.id).populate('customerIds', 'name phone').lean();
+    if (!promo) throw notFound('Promo code not found.');
+    const redemptions = await PromoRedemption.find({ promoId: promo._id })
+      .populate('userId', 'name phone')
+      .populate('taskId', 'code status')
+      .sort({ createdAt: -1 })
+      .limit(200)
+      .lean();
+    res.json({
+      promo: { ...promo, id: String(promo._id) },
+      redemptions: redemptions.map((r) => ({
+        id: String(r._id), amount: round(r.amount), status: r.status, at: r.createdAt,
+        customer: r.userId ? { id: String(r.userId._id), name: r.userId.name, phone: r.userId.phone } : null,
+        task: r.taskId ? { id: String(r.taskId._id), code: r.taskId.code, status: r.taskId.status } : null,
+      })),
+    });
+  }),
+);
+
+router.post(
+  '/promos',
+  wrap(async (req, res) => {
+    const body = promoBody(req.body);
+    if (await PromoCode.exists({ code: body.code })) throw conflict('That code already exists.', 'CODE_TAKEN');
+    const promo = await PromoCode.create({ ...body, createdBy: req.user._id });
+    await audit(req, { action: 'PROMO_CREATED', entity: 'PromoCode', entityId: promo._id, after: promo.toObject() });
+    res.status(201).json({ promo: promo.toObject() });
+  }),
+);
+
+router.put(
+  '/promos/:id',
+  wrap(async (req, res) => {
+    const promo = await PromoCode.findById(req.params.id);
+    if (!promo) throw notFound('Promo code not found.');
+    const before = promo.toObject();
+    const body = promoBody(req.body, before);
+    if (body.code !== promo.code && (await PromoCode.exists({ code: body.code }))) {
+      throw conflict('That code already exists.', 'CODE_TAKEN');
+    }
+    Object.assign(promo, body);
+    await promo.save();
+    await audit(req, { action: 'PROMO_UPDATED', entity: 'PromoCode', entityId: promo._id, before, after: promo.toObject(), reason: req.body.reason || '' });
+    res.json({ promo: promo.toObject() });
+  }),
+);
+
+router.delete(
+  '/promos/:id',
+  wrap(async (req, res) => {
+    const promo = await PromoCode.findById(req.params.id);
+    if (!promo) throw notFound('Promo code not found.');
+    // Codes that have been used are switched off, never deleted — the history must stay.
+    const used = await PromoRedemption.countDocuments({ promoId: promo._id });
+    if (used > 0) {
+      promo.active = false;
+      await promo.save();
+      await audit(req, { action: 'PROMO_PAUSED', entity: 'PromoCode', entityId: promo._id, after: { active: false }, reason: 'Used codes are paused, not deleted' });
+      return res.json({ ok: true, paused: true });
+    }
+    await promo.deleteOne();
+    await audit(req, { action: 'PROMO_DELETED', entity: 'PromoCode', entityId: promo._id, before: promo.toObject() });
+    res.json({ ok: true, deleted: true });
+  }),
+);
+
+/* -------------------------------------------------------------------- payments */
+
+/** GET /api/admin/payments — UC-C28: every online payment, whatever became of it. */
+router.get(
+  '/payments',
+  wrap(async (req, res) => {
+    const filter = { ...dateRange(req.query, 'createdAt') };
+    if (['CREATED', 'PAID', 'FAILED', 'REFUNDED'].includes(req.query.status)) filter.status = req.query.status;
+    if (req.query.q) {
+      const q = escapeRegex(String(req.query.q));
+      filter.$or = [
+        { orderId: { $regex: q, $options: 'i' } },
+        { gatewayPaymentId: { $regex: q, $options: 'i' } },
+        { gatewayOrderId: { $regex: q, $options: 'i' } },
+      ];
+    }
+    const pg = pageOf(req.query, 50);
+    const [payments, total, counts] = await Promise.all([
+      Payment.find(filter)
+        .populate('taskId', 'code status')
+        .populate('userId', 'name phone')
+        .sort({ createdAt: -1 })
+        .skip(pg.skip)
+        .limit(pg.limit)
+        .lean(),
+      Payment.countDocuments(filter),
+      Payment.aggregate([{ $group: { _id: '$status', n: { $sum: 1 }, amount: { $sum: '$amount' } } }]),
+    ]);
+
+    res.json({
+      payments: payments.map((p) => ({
+        ...publicPayment(p),
+        task: p.taskId ? { id: String(p.taskId._id), code: p.taskId.code, status: p.taskId.status } : null,
+        customer: p.userId ? { id: String(p.userId._id), name: p.userId.name, phone: p.userId.phone } : null,
+      })),
+      counts: Object.fromEntries(counts.map((c) => [c._id, { count: c.n, amount: round(c.amount) }])),
+      ...paged(total, pg),
+    });
+  }),
+);
+
 /* ------------------------------------------------------------ referral partners & redemptions */
 
 router.get(
@@ -1602,6 +2375,7 @@ router.put(
       // Refund the partner's referral balance
       await ReferralEntry.create({
         userId: request.userId,
+        txnId: newTxnId(),
         type: 'PARTNER_REDEMPTION', // Reuse type, but positive amount
         amount: request.amount,
         ref: `refund_req:${request._id}`,

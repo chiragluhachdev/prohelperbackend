@@ -9,7 +9,12 @@ import { sendDataPush } from './fcm.js';
  * ending without one — arrive as ordinary notifications. Everything else
  * stays in the in-app list.
  */
-const PUSHED = new Set(['JOB_REQUEST', 'BOOKING_ACCEPTED', 'NO_HELPER_AVAILABLE', 'PAYMENT_RECEIVED', 'PAYMENT_CONFIRMED', 'REFERRAL_REWARD']);
+const PUSHED = new Set([
+  'JOB_REQUEST', 'BOOKING_ACCEPTED', 'NO_HELPER_AVAILABLE', 'PAYMENT_RECEIVED', 'PAYMENT_CONFIRMED', 'REFERRAL_REWARD',
+  // The completion code has to reach the customer while the helper is standing there (UC-C17),
+  // and these are things someone has to act on now.
+  'COMPLETION_OTP', 'TASK_OVERDUE', 'BOOKING_CANCELLED', 'HELPER_CANCELLED', 'RATE_HELPER', 'RATE_CUSTOMER', 'ACCOUNT_BLOCKED',
+]);
 
 async function pushTo(userIds, type, title, body, data) {
   if (!PUSHED.has(type)) return;

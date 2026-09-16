@@ -18,6 +18,22 @@ const addressSnapshotSchema = new mongoose.Schema(
   { _id: false },
 );
 
+/** One answered question, as the customer saw it — kept readable even if the question later changes. */
+const taskAnswerSchema = new mongoose.Schema(
+  {
+    key: String,
+    label: String,
+    labelHi: String,
+    type: String,
+    value: mongoose.Schema.Types.Mixed,
+    display: String,
+    displayHi: String,
+    amount: { type: Number, default: 0 },
+    minutes: { type: Number, default: 0 },
+  },
+  { _id: false },
+);
+
 /** A frozen copy of the service + its answers + the price it carried (UC-C19). */
 const taskServiceSchema = new mongoose.Schema(
   {
@@ -27,9 +43,18 @@ const taskServiceSchema = new mongoose.Schema(
     // even if the catalog's Hindi copy is later changed or removed.
     nameHi: { type: String, default: '' },
     icon: String,
+    /** What this service cost here, and what the catalog asks for it. */
     basePrice: Number,
+    listPrice: Number,
+    /** key → value, for code that needs the raw answer. */
     options: { type: mongoose.Schema.Types.Mixed, default: {} },
+    /** The same answers with their question text and what each added — what people read (UC-C05). */
+    answers: { type: [taskAnswerSchema], default: [] },
+    /** What the answers added to the base price. */
+    optionsAmount: { type: Number, default: 0 },
     amount: { type: Number, required: true },
+    /** How long this service is expected to take, answers included. */
+    minutes: { type: Number, default: 0 },
   },
   { _id: false },
 );
@@ -41,12 +66,32 @@ const taskServiceSchema = new mongoose.Schema(
 const pricingSchema = new mongoose.Schema(
   {
     servicesAmount: { type: Number, default: 0 },
+    /** The same booking at catalog prices, and what the locality's rule added. */
+    listServicesAmount: { type: Number, default: 0 },
+    zoneUplift: { type: Number, default: 0 },
+    zoneCode: { type: String, default: '' },
+    zoneName: { type: String, default: '' },
+    zoneRule: { type: String, default: '' },
+    discount: { type: Number, default: 0 },
+    discountPercent: { type: Number, default: 0 },
+    discountLabel: { type: String, default: '' },
     platformFeePercent: { type: Number, default: 0 },
     platformFee: { type: Number, default: 0 },
-    discount: { type: Number, default: 0 },
+    platformFeeLabel: { type: String, default: '' },
+    surcharge: { type: Number, default: 0 },
+    surchargeLabel: { type: String, default: '' },
+    gst: { type: Number, default: 0 },
+    gstPercent: { type: Number, default: 0 },
+    /** 'all' — on the whole bill; 'fees' — on platform fee + surcharge only. */
+    gstBase: { type: String, default: 'all' },
+    gstLabel: { type: String, default: '' },
+    taxableAmount: { type: Number, default: 0 },
     /** Paid from the customer's referral balance — the platform covers it, the helper is never short. */
     referralCredit: { type: Number, default: 0 },
+    /** UC-C32 — the code used, what it took off, and how it read on the bill. */
     promoCode: { type: String, default: '' },
+    promoDiscount: { type: Number, default: 0 },
+    promoLabel: { type: String, default: '' },
     total: { type: Number, default: 0 },
     helperCommissionPercent: { type: Number, default: 0 },
     helperCommission: { type: Number, default: 0 },
@@ -111,6 +156,8 @@ const taskSchema = new mongoose.Schema(
       expiresAt: Date,
       attempts: { type: Number, default: 0 },
       issuedAt: Date,
+      /** OTPs sent for this job in all — capped, so re-sending can't reset the attempt limit forever. */
+      sends: { type: Number, default: 0 },
     },
 
     // --- matching bookkeeping ---
@@ -141,9 +188,40 @@ const taskSchema = new mongoose.Schema(
       reason: String,
       previousStatus: String,
       at: Date,
+      /** What the cancellation did to money: referral balance given back, anything charged. */
+      financialImpact: {
+        referralRefunded: { type: Number, default: 0 },
+        charged: { type: Number, default: 0 },
+        note: { type: String, default: '' },
+      },
     },
 
+    /**
+     * Helpers who took this booking and then dropped it (UC-C22). The booking
+     * itself goes on — back to searching — so this is where that is kept.
+     */
+    helperCancellations: [
+      {
+        _id: false,
+        helperId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        helperName: String,
+        by: { type: String, enum: ['helper', 'admin', 'system'] },
+        reason: String,
+        previousStatus: String,
+        at: Date,
+      },
+    ],
+
+    /** Who did the job, as they were when they took it — kept even if the account changes later (UC-C19). */
+    helperSnapshot: {
+      name: String,
+      phone: String,
+    },
+
+    /** UC-C18: first flagged overdue, reminders sent, and the latest one. */
     overdueNotifiedAt: Date,
+    overdueReminders: { type: Number, default: 0 },
+    overdueLastRemindedAt: Date,
     ratedByCustomer: { type: Boolean, default: false },
     ratedByHelper: { type: Boolean, default: false },
   },

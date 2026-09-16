@@ -42,6 +42,31 @@ export function uploadBuffer(buffer, { folder, publicId, resourceType = 'auto', 
   });
 }
 
+/**
+ * A short-lived link to a private file (UC-C25). KYC documents are uploaded as
+ * `authenticated`, so their URL is not guessable and not usable without this
+ * signature; the link is issued per request, to the owner or an admin, and
+ * stops working shortly afterwards.
+ */
+export function signedUrl(publicId, { resourceType = 'image', seconds = 600 } = {}) {
+  if (!CLOUDINARY_ENABLED || !publicId) return '';
+  return cloudinary.url(publicId, {
+    resource_type: resourceType,
+    type: 'authenticated',
+    sign_url: true,
+    secure: true,
+    expires_at: Math.floor(Date.now() / 1000) + seconds,
+  });
+}
+
+/** The link to show for a document, whichever way it was stored. */
+export function documentUrl(doc, seconds = 600) {
+  if (!doc) return '';
+  const resourceType = doc.mimeType === 'application/pdf' ? 'raw' : 'image';
+  // Documents uploaded before private storage keep their stored URL.
+  return doc.private ? signedUrl(doc.publicId, { resourceType, seconds }) : doc.url;
+}
+
 export async function destroyAsset(publicId, resourceType = 'image') {
   if (!CLOUDINARY_ENABLED || !publicId) return;
   try {

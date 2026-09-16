@@ -59,13 +59,78 @@ export async function helperBalances(userId) {
 }
 
 /**
+ * UC-C26 — the whole of a helper's money in one place, every figure read off
+ * the ledger and the bills frozen on their bookings, never a running total
+ * kept in a field.
+ *
+ *  gross        what their jobs were worth (the services, before charges)
+ *  commission   the platform's share of that
+ *  adjustments  anything an admin added or took off, signed
+ *  paid         money already in their hands: cash jobs, and payouts sent
+ *  payable      what the platform still owes them
+ *  outstanding  what they owe the platform, from cash they collected
+ */
+export async function helperEarnings(userId) {
+  const uid = asId(userId);
+  const done = { $in: [TASK_STATUS.COMPLETED, TASK_STATUS.SETTLED] };
+
+  const [jobs] = await Task.aggregate([
+    { $match: { helperId: uid, status: done } },
+    {
+      $group: {
+        _id: null,
+        completedJobs: { $sum: 1 },
+        gross: { $sum: '$pricing.servicesAmount' },
+        commission: { $sum: '$pricing.helperCommission' },
+        payout: { $sum: '$pricing.helperPayout' },
+      },
+    },
+  ]);
+
+  const [adjusted] = await LedgerEntry.aggregate([
+    { $match: { userId: uid, type: 'ADJUSTMENT' } },
+    {
+      $group: {
+        _id: null,
+        total: { $sum: { $cond: [{ $eq: ['$direction', 'CREDIT'] }, '$amount', { $multiply: ['$amount', -1] }] } },
+      },
+    },
+  ]);
+
+  // Paid: a cash job (the customer handed it over), a payout the platform has
+  // settled, or a payout row written by hand.
+  const [paid] = await LedgerEntry.aggregate([
+    { $match: { userId: uid, type: { $in: ['JOB_EARNING', 'PAYOUT'] } } },
+    { $lookup: { from: Task.collection.name, localField: 'taskId', foreignField: '_id', as: 'task' } },
+    { $addFields: { mode: { $first: '$task.paymentMode' } } },
+    { $match: { $or: [{ type: 'PAYOUT' }, { mode: 'CASH' }, { settled: true }] } },
+    { $group: { _id: null, total: { $sum: '$amount' } } },
+  ]);
+
+  const balances = await helperBalances(userId);
+  const adjustments = round2(adjusted?.total);
+  return {
+    completedJobs: jobs?.completedJobs || 0,
+    gross: round2(jobs?.gross),
+    commission: round2(jobs?.commission),
+    netEarning: round2((jobs?.payout || 0) + adjustments),
+    adjustments,
+    paid: round2(paid?.total),
+    payable: round2(balances.payoutDue + adjustments),
+    outstanding: balances.owedToPlatform,
+    balance: round2(balances.payoutDue + adjustments - balances.owedToPlatform),
+  };
+}
+
+/**
  * The lines a paid booking puts on the helper's wallet statement, from the
  * bill frozen on the booking:
  *  - online: the job value comes in, the helper's commission goes out
- *  - cash:   what the customer handed over comes in, then the commission and
- *            the customer's service fee go out — both are the platform's. If
- *            the customer paid part with referral balance, the platform makes
- *            that part up to the helper.
+ *  - cash:   what the customer handed over comes in; then everything that is
+ *            the platform's goes out — commission, platform fee, surcharge,
+ *            GST — and anything the platform gave the customer (a discount,
+ *            their referral balance) comes back in, since the helper was
+ *            handed that much less.
  * Either way the lines add up to the helper's payout.
  */
 export function walletLines(task) {
@@ -77,6 +142,9 @@ export function walletLines(task) {
   const credit = round2(p.referralCredit);
   const lines = [{ kind: 'PAID_CASH', amount: round2((p.total || 0) - credit) }, commission];
   if (p.platformFee > 0) lines.push({ kind: 'PLATFORM_FEE', percent: p.platformFeePercent || 0, amount: -round2(p.platformFee) });
+  if (p.surcharge > 0) lines.push({ kind: 'SURCHARGE', label: p.surchargeLabel || '', amount: -round2(p.surcharge) });
+  if (p.gst > 0) lines.push({ kind: 'GST', percent: p.gstPercent || 0, amount: -round2(p.gst) });
+  if (p.discount > 0) lines.push({ kind: 'DISCOUNT', amount: round2(p.discount) });
   if (credit > 0) lines.push({ kind: 'REFERRAL_CREDIT', amount: credit });
   return lines;
 }
@@ -101,23 +169,11 @@ export async function walletStatement(userId, { limit = 100 } = {}) {
     helperBalances(helperId),
   ]);
 
-  // The bottom line covers every paid booking, not just the ones listed.
+  // The bottom line covers every paid booking, not just the ones listed. Each
+  // booking's lines add up to its payout, so the net is simply the payouts.
   const [all] = await Task.aggregate([
     { $match: filter },
-    {
-      $group: {
-        _id: null,
-        net: {
-          $sum: {
-            $cond: [
-              { $eq: ['$paymentMode', 'ONLINE'] },
-              { $subtract: ['$pricing.servicesAmount', '$pricing.helperCommission'] },
-              { $subtract: ['$pricing.total', { $add: ['$pricing.helperCommission', '$pricing.platformFee'] }] },
-            ],
-          },
-        },
-      },
-    },
+    { $group: { _id: null, net: { $sum: '$pricing.helperPayout' } } },
   ]);
 
   return {

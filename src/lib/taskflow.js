@@ -2,6 +2,8 @@ import { Task, TaskEvent } from '../models/index.js';
 import { ALLOWED_TRANSITIONS } from '../config.js';
 import { conflict } from './http.js';
 import { refundBookingCredit, triggerFirstBookingRewards } from './referral.js';
+import { releasePromoUse } from './promo.js';
+import { getSettings } from './settings.js';
 
 /**
  * The single door through which a task changes status.
@@ -26,6 +28,10 @@ export async function transition(taskId, from, to, options = {}) {
 
   const update = { $set: { status: to, ...set } };
   if (unset) update.$unset = unset;
+  // A cancelled booking's codes stop working with it — they can never start or close it (UC-C17).
+  if (to === 'CANCELLED' || to === 'EXPIRED') {
+    update.$unset = { ...(update.$unset || {}), 'startOtp.code': '', 'completionOtp.code': '' };
+  }
 
   const before = await Task.findOne({ _id: taskId }).select('status').lean();
   const task = await Task.findOneAndUpdate(
@@ -45,17 +51,51 @@ export async function transition(taskId, from, to, options = {}) {
     meta,
   });
 
-  // Referral balance spent on a booking comes back if the booking never happens.
+  if (to === 'CANCELLED' && ['SEARCHING', 'NO_HELPER_AVAILABLE'].includes(before?.status)) {
+    await TaskEvent.create({
+      taskId: task._id, kind: 'MATCHING', actorType, actorId,
+      reason: before.status === 'SEARCHING' ? 'Search stopped — booking cancelled' : 'Booking cancelled after no helper was found',
+      meta: { step: 'SEARCH_STOPPED' },
+    }).catch(() => {});
+  }
+
+  // Referral balance spent on a booking comes back if the booking never happens,
+  // and the cancellation records what it did to money (UC-C22).
   if (to === 'CANCELLED' || to === 'EXPIRED') {
-    await refundBookingCredit(task).catch((err) => console.error('[referral] refund failed', task.code, err.message));
+    const refund = await refundBookingCredit(task).catch((err) => {
+      console.error('[referral] refund failed', task.code, err.message);
+      return null;
+    });
+    const referralRefunded = refund ? Math.round((task.pricing?.referralCredit || 0) * 100) / 100 : 0;
+    const financialImpact = {
+      referralRefunded,
+      charged: 0,
+      note: [
+        'Nothing charged — payment is only taken once a job is completed.',
+        referralRefunded > 0 ? `₹${referralRefunded} of referral balance returned to the customer.` : '',
+      ].filter(Boolean).join(' '),
+    };
+    await Task.updateOne({ _id: task._id }, { $set: { 'cancellation.financialImpact': financialImpact } });
+    task.set('cancellation.financialImpact', financialImpact);
+    // A promo used on a booking that never happened is given back (UC-C32).
+    await releasePromoUse(task._id).catch((err) => console.error('[promo] release failed', task.code, err.message));
   }
   
-  if (to === 'COMPLETED') {
-    // Both customer and helper might be completing their first booking
-    Promise.all([
-      triggerFirstBookingRewards(task.customerId, task),
-      task.helperId ? triggerFirstBookingRewards(task.helperId, task) : Promise.resolve(),
-    ]).catch(err => console.error('[referral] first booking rewards failed', task.code, err.message));
+  /*
+   * UC-C33 — the referral reward is earned by a real job, never by installing
+   * the app. Which job counts is the admin's rule: the first one completed, or
+   * the first one actually paid for (settled).
+   */
+  if (to === 'COMPLETED' || to === 'SETTLED') {
+    const settings = await getSettings();
+    const qualifying = settings.referral_qualify_event === 'SETTLED' ? 'SETTLED' : 'COMPLETED';
+    if (to === qualifying) {
+      // Both the customer and the helper may be finishing their own first booking.
+      Promise.all([
+        triggerFirstBookingRewards(task.customerId, task),
+        task.helperId ? triggerFirstBookingRewards(task.helperId, task) : Promise.resolve(),
+      ]).catch((err) => console.error('[referral] first booking rewards failed', task.code, err.message));
+    }
   }
   return task;
 }

@@ -10,7 +10,10 @@ const auditLogSchema = new mongoose.Schema(
     before: { type: mongoose.Schema.Types.Mixed },
     after: { type: mongoose.Schema.Types.Mixed },
     reason: { type: String, default: '' },
+    /** Where the action came from — the address, the device, and the call itself (UC-C46). */
     ip: { type: String, default: '' },
+    userAgent: { type: String, default: '' },
+    route: { type: String, default: '' },
   },
   { timestamps: true, versionKey: false },
 );
