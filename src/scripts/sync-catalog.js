@@ -12,11 +12,12 @@ import '../lib/env.js';
  *    questions if it has none, so an admin's own questions are never replaced
  *  - "Bathroom Cleaning" becomes "Washroom Cleaning", if it still has its
  *    original name
+ *  - Hindi copy left from when the apps had a second language is removed
  */
 import mongoose from 'mongoose';
 import { connectDb } from '../lib/db.js';
 import { ensureSettings } from '../lib/settings.js';
-import { Service } from '../models/index.js';
+import { Category, Service } from '../models/index.js';
 import { CATALOG } from './catalog.js';
 import { normaliseOptions } from '../lib/serviceOptions.js';
 
@@ -40,7 +41,6 @@ async function run() {
     const set = {};
     if (entry.code === 'bathroom' && existing.name === 'Bathroom Cleaning') {
       set.name = entry.name;
-      set.nameHi = entry.nameHi;
     }
     if (!(existing.options || []).length && options.length) {
       set.options = options;
@@ -49,6 +49,28 @@ async function run() {
     if (Object.keys(set).length) {
       plan.push([`update ${entry.code}: ${Object.keys(set).join(', ')}`, () => Service.updateOne({ code: entry.code }, { $set: set })]);
     }
+  }
+
+  /*
+   * The apps are English only. Straight to the collections: the models no
+   * longer know these fields, so Mongoose would drop them from an $unset.
+   */
+  const hindi = { nameHi: '', descriptionHi: '', durationLabelHi: '', inclusionsHi: '' };
+  const hindiQuestion = { 'options.$[].labelHi': '', 'options.$[].helpHi': '', 'options.$[].placeholderHi': '', 'options.$[].choicesHi': '', 'options.$[].unitHi': '' };
+  const hasHindi = {
+    $or: [...Object.keys(hindi), ...Object.keys(hindiQuestion).map((k) => k.replace('.$[]', ''))].map((k) => ({ [k]: { $exists: true } })),
+  };
+  const servicesWithHindi = await Service.collection.countDocuments(hasHindi);
+  if (servicesWithHindi) {
+    plan.push([`remove Hindi copy from ${servicesWithHindi} services`, async () => {
+      await Service.collection.updateMany({}, { $unset: hindi });
+      await Service.collection.updateMany({ 'options.0': { $exists: true } }, { $unset: hindiQuestion });
+    }]);
+  }
+  const categoriesWithHindi = await Category.collection.countDocuments({ nameHi: { $exists: true } });
+  if (categoriesWithHindi) {
+    plan.push([`remove Hindi names from ${categoriesWithHindi} categories`, () =>
+      Category.collection.updateMany({}, { $unset: { nameHi: '' } })]);
   }
 
   if (!plan.length) console.log('[catalog] already up to date');

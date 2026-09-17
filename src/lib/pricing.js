@@ -109,7 +109,6 @@ export async function quote(selections, ctx = {}) {
     return {
       code: service.code,
       name: service.name,
-      nameHi: service.nameHi || '',
       icon: service.icon,
       basePrice: price,
       /** The catalog price, and whether this one was fixed for the locality or came from its fallback. */

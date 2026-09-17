@@ -1353,7 +1353,6 @@ ok('the catalog carries each service\'s own questions, from the database',
   ['pets', 'pet_types', 'care', 'duration'].every((k) => petCare?.options.some((o) => o.key === k)) &&
   ['children', 'ages', 'duration', 'end_time'].every((k) => childCare?.options.some((o) => o.key === k)),
   JSON.stringify({ cooking: cooking?.options.map((o) => o.key), pet: petCare?.options.map((o) => o.key), child: childCare?.options.map((o) => o.key) }));
-ok('in English and Hindi', cooking?.options.find((o) => o.key === 'meals')?.choicesHi?.length === 4 && Boolean(cooking?.options[0].labelHi));
 
 const cookingAnswers = { people: 4, meals: ['Lunch', 'Dinner'], diet: 'Non-vegetarian', ready_by: '13:00', additional_requirements: 'Less oil' };
 const cookQuote = await api('/api/customer/quote', { method: 'POST', token: svcToken, body: { services: [{ code: 'cooking', options: cookingAnswers }] } });
@@ -1365,7 +1364,6 @@ ok('and timed: the booking lasts as long as the answers need',
   cookQuote.durationMins === 30 + 4 * 5 + 45 + 45, JSON.stringify({ minutes: cookQuote.durationMins }));
 ok('each answer is kept readable, with its question and what it added',
   cookLine?.answers?.find((a) => a.key === 'meals')?.display === 'Lunch, Dinner' &&
-  cookLine?.answers?.find((a) => a.key === 'meals')?.displayHi === 'दोपहर का खाना, रात का खाना' &&
   cookLine?.answers?.find((a) => a.key === 'people')?.label === 'Number of people',
   JSON.stringify(cookLine?.answers));
 
@@ -1475,30 +1473,10 @@ await api(`/api/customer/tasks/${svcTask?.id}/cancel`, { method: 'POST', token: 
 const afterCancel = (await api(`/api/admin/bookings/${svcTask?.id}`, { token: adminToken })).timeline?.filter((e) => e.kind === 'MATCHING');
 ok('and records how the search ended', afterCancel?.at(-1)?.meta?.step === 'SEARCH_STOPPED', JSON.stringify(afterCancel?.map((e) => e.reason)));
 
-/* --------------------------------------------------------------- Hindi */
-console.log('\n13. Hindi');
+/* ------------------------------------------------- notification values */
+console.log('\n13. Notification values');
 
-// A fresh catalog ships Hindi copy for every service.
-const hiCatalog = await api('/api/services');
-const hiKitchen = hiCatalog.services?.find((sv) => sv.code === 'kitchen');
-ok('the catalog carries Hindi names, durations and checklists',
-  hiKitchen?.nameHi === 'किचन की सफ़ाई' && hiKitchen?.durationLabelHi && hiKitchen?.inclusionsHi?.length === 5,
-  JSON.stringify({ nameHi: hiKitchen?.nameHi, dur: hiKitchen?.durationLabelHi, n: hiKitchen?.inclusionsHi?.length }));
-
-const hiEdit = await api('/api/admin/services/bathroom', {
-  method: 'PATCH', token: adminToken,
-  body: { nameHi: 'बाथरूम की गहरी सफ़ाई', inclusionsHi: ['कमोड की सफ़ाई', '', 'टाइल्स'] },
-});
-ok('an admin can edit the Hindi copy', hiEdit.service?.nameHi === 'बाथरूम की गहरी सफ़ाई' && hiEdit.service?.inclusionsHi?.length === 2,
-  JSON.stringify(hiEdit.error ?? hiEdit.service?.inclusionsHi));
-
-// A booking keeps the Hindi name it was made with.
-const hiBooking = await api(`/api/customer/tasks/${taskId}`, { token: customerToken });
-ok('a booking snapshot carries the Hindi service name',
-  typeof hiBooking.task?.services?.[0]?.nameHi === 'string' && hiBooking.task.services[0].nameHi.length > 0,
-  JSON.stringify(hiBooking.task?.services?.[0]));
-
-// Notifications are stored with the values the app rebuilds sentences from.
+// Notifications are stored with the values the app builds sentences from.
 const custNotes = await api('/api/notifications', { token: customerToken });
 const acceptedNote = custNotes.notifications?.find((n) => n.type === 'BOOKING_ACCEPTED');
 ok('a notification stores the values its sentence needs',
@@ -1506,18 +1484,14 @@ ok('a notification stores the values its sentence needs',
 
 const winnerNotes = await api('/api/notifications', { token: winnerToken });
 const jobReq = winnerNotes.notifications?.find((n) => n.type === 'JOB_REQUEST');
-ok('a job request stores the service name in Hindi too',
-  Boolean(jobReq?.data?.serviceNameHi), JSON.stringify(jobReq?.data));
+ok('a job request stores the service name', Boolean(jobReq?.data?.serviceName), JSON.stringify(jobReq?.data));
 
-const hiEarnings = await api('/api/helper/earnings', { token: winnerToken });
-const earnRow = hiEarnings.entries?.find((e) => e.type === 'JOB_EARNING');
-ok('earnings rows carry service objects with the Hindi name',
-  earnRow?.task?.services?.[0]?.code && 'nameHi' in earnRow.task.services[0],
-  JSON.stringify(earnRow?.task));
+const jobEarnings = await api('/api/helper/earnings', { token: winnerToken });
+const earnRow = jobEarnings.entries?.find((e) => e.type === 'JOB_EARNING');
+ok('earnings rows carry service objects', Boolean(earnRow?.task?.services?.[0]?.code), JSON.stringify(earnRow?.task));
 
-// An error the app shows in Hindi is keyed by a stable code.
 const noLine = await api('/api/customer/addresses', { method: 'POST', token: customerToken, body: { society: 'rps_savana' } });
-ok('errors carry a code the app can translate', noLine.status === 400 && noLine.error?.code === 'LINE1_REQUIRED',
+ok('errors carry a stable code', noLine.status === 400 && noLine.error?.code === 'LINE1_REQUIRED',
   JSON.stringify(noLine.error));
 
 /* ------------------------------------------------------- change number */

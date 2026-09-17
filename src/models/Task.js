@@ -25,11 +25,9 @@ const taskAnswerSchema = new mongoose.Schema(
   {
     key: String,
     label: String,
-    labelHi: String,
     type: String,
     value: mongoose.Schema.Types.Mixed,
     display: String,
-    displayHi: String,
     amount: { type: Number, default: 0 },
     minutes: { type: Number, default: 0 },
   },
@@ -41,9 +39,6 @@ const taskServiceSchema = new mongoose.Schema(
   {
     code: { type: String, required: true },
     name: { type: String, required: true },
-    // Snapshotted with the English name, so a booking reads the same in Hindi
-    // even if the catalog's Hindi copy is later changed or removed.
-    nameHi: { type: String, default: '' },
     icon: String,
     /** What this service cost here, and what the catalog asks for it. */
     basePrice: Number,

@@ -95,7 +95,6 @@ export function serializeTask(task, { audience = 'customer', helperProfile = nul
     services: (t.services || []).map((s) => ({
       code: s.code,
       name: s.name,
-      nameHi: s.nameHi || '',
       icon: s.icon,
       options: s.options || {},
       answers: s.answers || [],

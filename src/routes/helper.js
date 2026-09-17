@@ -912,7 +912,7 @@ router.get(
     ]);
     const row = (r) => ({
       id: String(r._id), stars: r.stars, comment: r.comment, tags: r.tags || [], at: r.createdAt,
-      task: r.taskId ? { id: String(r.taskId._id), code: r.taskId.code, services: (r.taskId.services || []).map((sv) => ({ code: sv.code, name: sv.name, nameHi: sv.nameHi || '' })) } : null,
+      task: r.taskId ? { id: String(r.taskId._id), code: r.taskId.code, services: (r.taskId.services || []).map((sv) => ({ code: sv.code, name: sv.name })) } : null,
     });
     res.json({
       average: req.profile.ratingAvg, count: req.profile.ratingCount,
@@ -975,8 +975,8 @@ router.get(
         task: e.taskId
           ? {
               code: e.taskId.code,
-              // Objects, not bare names: the app shows the Hindi name when it has one.
-              services: (e.taskId.services || []).map((s) => ({ code: s.code, name: s.name, nameHi: s.nameHi || '' })),
+              // Objects, not bare names: the app fills a missing name from the catalog by code.
+              services: (e.taskId.services || []).map((s) => ({ code: s.code, name: s.name })),
             }
           : null,
       })),

@@ -278,7 +278,6 @@ export async function dispatchTask(taskId) {
       // What the ringing notification draws. The helper sees their payout,
       // never the customer's bill — the same rule as every helper screen.
       serviceName: serviceNames,
-      serviceNameHi: task.services.map((sv) => sv.nameHi || sv.name).join(', '),
       location: task.address?.society
         ? `${task.address.label || 'Home'} · ${task.address.line2 || ''}`.trim()
         : task.address?.label || task.address?.city || 'Nearby',
@@ -370,7 +369,6 @@ async function exhaust(task, reason) {
         taskId: String(task._id),
         code: task.code,
         serviceName: task.services.map((sv) => sv.name).join(', '),
-        serviceNameHi: task.services.map((sv) => sv.nameHi || sv.name).join(', '),
       },
     );
     const asked = await JobRequest.distinct('helperId', { taskId: task._id });
@@ -475,7 +473,6 @@ export async function acceptJob(taskId, helperId) {
       startCode: startCode || '',
       helperName: helper?.name || '',
       serviceName: task.services.map((sv) => sv.name).join(', '),
-      serviceNameHi: task.services.map((sv) => sv.nameHi || sv.name).join(', '),
     },
   );
 

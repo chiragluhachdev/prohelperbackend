@@ -9,8 +9,8 @@ import { badRequest } from './http.js';
  * and the server is the only thing that prices it, so a new question — or a new
  * service — never needs an app release.
  *
- * Choice lists are stored as parallel arrays (choices / choicesHi /
- * choicePrices / choiceMinutes), which keeps questions saved before per-choice
+ * Choice lists are stored as parallel arrays (choices / choicePrices /
+ * choiceMinutes), which keeps questions saved before per-choice
  * pricing existed readable exactly as they were.
  */
 export const OPTION_TYPES = ['select', 'multiselect', 'number', 'boolean', 'text', 'textarea', 'time', 'date'];
@@ -51,7 +51,6 @@ export function normaliseOption(o, index) {
   }
   // Per-choice extras line up with the choices by position; missing ones are 0 / blank.
   const aligned = (arr, fn) => choices.map((_, i) => fn((Array.isArray(arr) ? arr : [])[i]));
-  const choicesHi = aligned(o.choicesHi, (v) => clean(v, 60));
   const choicePrices = aligned(o.choicePrices, (v) => round2(nonNegative(v, 'choice price', label)));
   const choiceMinutes = aligned(o.choiceMinutes, (v) => Math.round(nonNegative(v, 'choice duration', label)));
 
@@ -83,14 +82,10 @@ export function normaliseOption(o, index) {
 
   return {
     key, label, type,
-    labelHi: clean(o.labelHi, 80),
     help: clean(o.help, 160),
-    helpHi: clean(o.helpHi, 160),
     placeholder: clean(o.placeholder, 80),
-    placeholderHi: clean(o.placeholderHi, 80),
-    choices, choicesHi, choicePrices, choiceMinutes,
+    choices, choicePrices, choiceMinutes,
     unit: clean(o.unit, 24),
-    unitHi: clean(o.unitHi, 24),
     min, max,
     step: type === 'number' && Number(o.step) > 0 ? Number(o.step) : 1,
     required: Boolean(o.required),
@@ -114,8 +109,6 @@ export function normaliseOptions(raw) {
 }
 
 const isBlank = (v) => v == null || v === '' || (Array.isArray(v) && v.length === 0);
-const YES = { en: 'Yes', hi: 'हाँ' };
-const NO = { en: 'No', hi: 'नहीं' };
 
 /**
  * A customer's answers to one service's questions: validated, priced, timed,
@@ -148,7 +141,6 @@ export function evaluateAnswers(service, raw = {}) {
     let amount = 0;
     let minutes = 0;
     let display = '';
-    let displayHi = '';
 
     switch (o.type) {
       case 'number': {
@@ -161,15 +153,13 @@ export function evaluateAnswers(service, raw = {}) {
         amount = (o.pricePerUnit || 0) * n;
         minutes = (o.minutesPerUnit || 0) * n;
         display = [n, o.unit].filter((x) => x !== '' && x != null).join(' ');
-        displayHi = [n, o.unitHi || o.unit].filter((x) => x !== '' && x != null).join(' ');
         break;
       }
       case 'boolean': {
         value = value === true || value === 'true' || value === 1;
         amount = value ? o.pricePerUnit || 0 : 0;
         minutes = value ? o.minutesPerUnit || 0 : 0;
-        display = value ? YES.en : NO.en;
-        displayHi = value ? YES.hi : NO.hi;
+        display = value ? 'Yes' : 'No';
         break;
       }
       case 'select': {
@@ -179,7 +169,6 @@ export function evaluateAnswers(service, raw = {}) {
         amount = o.choicePrices?.[i] || 0;
         minutes = o.choiceMinutes?.[i] || 0;
         display = choices[i];
-        displayHi = o.choicesHi?.[i] || choices[i];
         break;
       }
       case 'multiselect': {
@@ -192,7 +181,6 @@ export function evaluateAnswers(service, raw = {}) {
         amount = ordered.reduce((s, i) => s + (o.choicePrices?.[i] || 0), 0) + (o.pricePerUnit || 0) * ordered.length;
         minutes = ordered.reduce((s, i) => s + (o.choiceMinutes?.[i] || 0), 0) + (o.minutesPerUnit || 0) * ordered.length;
         display = value.join(', ');
-        displayHi = ordered.map((i) => o.choicesHi?.[i] || choices[i]).join(', ');
         break;
       }
       case 'time': {
@@ -200,7 +188,6 @@ export function evaluateAnswers(service, raw = {}) {
         if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(v)) throw invalid('must be a time like 18:30');
         value = v;
         display = v;
-        displayHi = v;
         break;
       }
       case 'date': {
@@ -210,7 +197,6 @@ export function evaluateAnswers(service, raw = {}) {
         }
         value = v;
         display = v;
-        displayHi = v;
         break;
       }
       default: {
@@ -221,7 +207,6 @@ export function evaluateAnswers(service, raw = {}) {
         }
         value = v;
         display = v;
-        displayHi = v;
       }
     }
 
@@ -234,11 +219,9 @@ export function evaluateAnswers(service, raw = {}) {
     out.answers.push({
       key: o.key,
       label: o.label,
-      labelHi: o.labelHi || '',
       type: o.type,
       value,
       display,
-      displayHi,
       amount: round2(amount),
       minutes: Math.round(minutes),
     });

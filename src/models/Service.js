@@ -8,11 +8,8 @@ const serviceOptionSchema = new mongoose.Schema(
   {
     key: { type: String, required: true },
     label: { type: String, required: true },
-    labelHi: { type: String, default: '' },
     help: { type: String, default: '' },
-    helpHi: { type: String, default: '' },
     placeholder: { type: String, default: '' },
-    placeholderHi: { type: String, default: '' },
     type: {
       type: String,
       enum: ['select', 'multiselect', 'number', 'boolean', 'text', 'textarea', 'time', 'date'],
@@ -20,11 +17,9 @@ const serviceOptionSchema = new mongoose.Schema(
     },
     // Choice lists: parallel arrays, lined up by position.
     choices: [{ type: String }],
-    choicesHi: [{ type: String }],
     choicePrices: [{ type: Number }],
     choiceMinutes: [{ type: Number }],
     unit: { type: String, default: '' },
-    unitHi: { type: String, default: '' },
     min: { type: Number, default: null },
     max: { type: Number, default: null },
     step: { type: Number, default: 1 },
@@ -50,14 +45,6 @@ const serviceSchema = new mongoose.Schema(
     /** The "what's included" checklist the app shows. Data, not app copy. */
     inclusions: { type: [String], default: [] },
 
-    /*
-     * Hindi copy. Optional: an empty field falls back to the English one, so a
-     * service added in a hurry still shows *something* to a Hindi reader.
-     */
-    nameHi: { type: String, default: '' },
-    descriptionHi: { type: String, default: '' },
-    durationLabelHi: { type: String, default: '' },
-    inclusionsHi: { type: [String], default: [] },
     defaultDurationMins: { type: Number, default: 60 },
     options: [serviceOptionSchema],
     /**

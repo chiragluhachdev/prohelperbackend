@@ -3,9 +3,9 @@ import { Category } from './models/index.js';
 import { MONGO_URI } from './config.js';
 
 const CATEGORIES = [
-  { name: 'Maid Service', nameHi: 'कामवाली बाई', icon: 'home', color: 'forest700', active: true, sortOrder: 1, comingSoon: false },
-  { name: 'Plumber', nameHi: 'प्लम्बर', icon: 'build', color: 'forest700', active: true, sortOrder: 2, comingSoon: true },
-  { name: 'Electrician', nameHi: 'इलेक्ट्रीशियन', icon: 'bulb', color: 'ember', active: true, sortOrder: 3, comingSoon: true },
+  { name: 'Maid Service', icon: 'home', color: 'forest700', active: true, sortOrder: 1, comingSoon: false },
+  { name: 'Plumber', icon: 'build', color: 'forest700', active: true, sortOrder: 2, comingSoon: true },
+  { name: 'Electrician', icon: 'bulb', color: 'ember', active: true, sortOrder: 3, comingSoon: true },
 ];
 
 async function seedCategories() {

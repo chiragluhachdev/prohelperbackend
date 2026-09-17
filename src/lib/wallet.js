@@ -186,7 +186,7 @@ export async function walletStatement(userId, { limit = 100 } = {}) {
       code: t.code,
       at: t.paidAt || t.completedAt,
       method: t.paymentMode === 'ONLINE' ? 'ONLINE' : 'CASH',
-      services: (t.services || []).map((s) => ({ code: s.code, name: s.name, nameHi: s.nameHi || '' })),
+      services: (t.services || []).map((s) => ({ code: s.code, name: s.name })),
       lines: walletLines(t),
     })),
   };

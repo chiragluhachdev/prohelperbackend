@@ -264,7 +264,10 @@ async function rejectionSummary(user) {
 
 /* ------------------------------------------------------------------ helpers */
 
-/** GET /api/admin/helpers?status=PENDING_VERIFICATION&q= */
+/**
+ * GET /api/admin/helpers?status=PENDING_VERIFICATION&q=
+ * `status=BLOCKED` lists blocked accounts, whatever their verification.
+ */
 router.get(
   '/helpers',
   wrap(async (req, res) => {
@@ -283,11 +286,14 @@ router.get(
     const profiles = await HelperProfile.find(profileFilter).lean();
     const byUser = new Map(profiles.map((p) => [String(p.userId), p]));
 
-    const counts = { DRAFT: 0, PENDING_VERIFICATION: 0, APPROVED: 0, REJECTED: 0 };
+    const counts = { DRAFT: 0, PENDING_VERIFICATION: 0, APPROVED: 0, REJECTED: 0, BLOCKED: 0 };
     for (const p of profiles) counts[p.approvalStatus] = (counts[p.approvalStatus] || 0) + 1;
+    counts.BLOCKED = users.filter((u) => u.status === 'blocked' && byUser.has(String(u._id))).length;
 
+    const inTab = (u) =>
+      !status || (status === 'BLOCKED' ? u.status === 'blocked' : byUser.get(String(u._id)).approvalStatus === status);
     const rows = users
-      .filter((u) => byUser.has(String(u._id)) && (!status || byUser.get(String(u._id)).approvalStatus === status))
+      .filter((u) => byUser.has(String(u._id)) && inTab(u))
       .map((u) => {
         const p = byUser.get(String(u._id));
         return {
@@ -489,45 +495,6 @@ router.post(
     });
 
     res.json({ profile: profile.toObject() });
-  }),
-);
-
-/**
- * Approve, reject, or ask for a better copy of one document, with a remark the
- * helper can act on (UC-C25). Every review is written to the audit log.
- */
-router.post(
-  '/documents/:id/review',
-  wrap(async (req, res) => {
-    const { status, remark = '' } = req.body;
-    if (!['APPROVED', 'REJECTED', 'CORRECTION_REQUESTED'].includes(status)) {
-      throw badRequest('Status must be APPROVED, REJECTED or CORRECTION_REQUESTED.', 'INVALID_STATUS');
-    }
-    if (status !== 'APPROVED' && !String(remark).trim()) {
-      throw badRequest('Say what needs fixing, so the helper can act on it.', 'REASON_REQUIRED');
-    }
-
-    const doc = await HelperDocument.findById(req.params.id);
-    if (!doc) throw notFound('Document not found.');
-
-    const before = { status: doc.status };
-    doc.status = status;
-    doc.remark = remark;
-    doc.reviewedAt = new Date();
-    doc.reviewedBy = req.user._id;
-    await doc.save();
-
-    const readable = doc.type.replace(/_/g, ' ');
-    await notify(doc.helperId, 'DOCUMENT_REVIEWED',
-      status === 'CORRECTION_REQUESTED' ? 'Please re-upload a document' : `Document ${status.toLowerCase()}`,
-      remark || `Your ${readable} was ${status.toLowerCase().replace(/_/g, ' ')}.`,
-      { status, docType: doc.type, remark: remark || '' });
-    await audit(req, {
-      action: 'DOCUMENT_REVIEWED', entity: 'HelperDocument', entityId: doc._id,
-      before, after: { status }, reason: remark,
-    });
-
-    res.json({ document: doc });
   }),
 );
 
@@ -1011,15 +978,6 @@ router.patch(
     if (req.body.durationLabel != null) service.durationLabel = String(req.body.durationLabel);
     if (req.body.category != null) service.category = String(req.body.category);
     if (req.body.icon != null) service.icon = String(req.body.icon);
-    for (const field of ['nameHi', 'descriptionHi', 'durationLabelHi']) {
-      if (req.body[field] != null) service[field] = String(req.body[field]).trim();
-    }
-    if (req.body.inclusionsHi != null) {
-      const list = Array.isArray(req.body.inclusionsHi)
-        ? req.body.inclusionsHi
-        : String(req.body.inclusionsHi).split('\n');
-      service.inclusionsHi = list.map((line) => String(line).trim()).filter(Boolean).slice(0, 12);
-    }
     if (req.body.inclusions != null) {
       const list = Array.isArray(req.body.inclusions)
         ? req.body.inclusions
@@ -1093,13 +1051,6 @@ router.post(
       durationLabel: req.body.durationLabel || '1 - 2 hours',
       defaultDurationMins: Number(req.body.defaultDurationMins) || 90,
       sortOrder: Number(req.body.sortOrder) || 99,
-      nameHi: String(req.body.nameHi || '').trim(),
-      descriptionHi: String(req.body.descriptionHi || '').trim(),
-      durationLabelHi: String(req.body.durationLabelHi || '').trim(),
-      inclusionsHi: (Array.isArray(req.body.inclusionsHi) ? req.body.inclusionsHi : [])
-        .map((line) => String(line).trim())
-        .filter(Boolean)
-        .slice(0, 12),
       inclusions: (Array.isArray(req.body.inclusions) ? req.body.inclusions : [])
         .map((line) => String(line).trim())
         .filter(Boolean)
@@ -1349,7 +1300,7 @@ router.get(
           id: String(task._id),
           code: task.code,
           status: task.status,
-          services: (task.services || []).map((sv) => ({ name: sv.name, nameHi: sv.nameHi, amount: sv.amount })),
+          services: (task.services || []).map((sv) => ({ name: sv.name, amount: sv.amount })),
           customer: task.customerId ? { id: String(task.customerId._id), name: task.customerId.name, phone: task.customerId.phone } : null,
           helper: task.helperId ? { id: String(task.helperId._id), name: task.helperId.name, phone: task.helperId.phone } : null,
           createdAt: task.createdAt,
@@ -1647,13 +1598,13 @@ router.get(
 router.post(
   '/categories',
   wrap(async (req, res) => {
-    const { name, nameHi, icon, color, active, sortOrder, comingSoon } = req.body;
+    const { name, icon, color, active, sortOrder, comingSoon } = req.body;
     if (!name) throw badRequest('Category name is required.');
     
     const existing = await Category.findOne({ name });
     if (existing) throw conflict('Category with this name already exists.');
 
-    const category = await Category.create({ name, nameHi, icon, color, active, sortOrder, comingSoon });
+    const category = await Category.create({ name, icon, color, active, sortOrder, comingSoon });
     await audit(req, { action: 'CATEGORY_CREATED', entity: 'Category', entityId: category._id, after: category.toObject() });
     res.json(category);
   }),
@@ -1665,9 +1616,8 @@ router.put(
     const category = await Category.findById(req.params.id);
     if (!category) throw notFound('Category not found');
 
-    const { name, nameHi, icon, color, active, sortOrder, comingSoon } = req.body;
+    const { name, icon, color, active, sortOrder, comingSoon } = req.body;
     if (name) category.name = name;
-    if (nameHi !== undefined) category.nameHi = nameHi;
     if (icon !== undefined) category.icon = icon;
     if (color !== undefined) category.color = color;
     if (active !== undefined) category.active = active;

@@ -711,7 +711,7 @@ router.get(
         id: String(r._id), stars: r.stars, comment: r.comment, tags: r.tags || [], at: r.createdAt,
         helperName: r.toUserId?.name || r.taskId?.helperSnapshot?.name || '',
         task: r.taskId
-          ? { id: String(r.taskId._id), code: r.taskId.code, services: (r.taskId.services || []).map((sv) => ({ code: sv.code, name: sv.name, nameHi: sv.nameHi || '' })) }
+          ? { id: String(r.taskId._id), code: r.taskId.code, services: (r.taskId.services || []).map((sv) => ({ code: sv.code, name: sv.name })) }
           : null,
       })),
     });
