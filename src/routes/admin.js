@@ -8,7 +8,7 @@ import {
 import { ROLES, TASK_STATUS, HELPER_APPROVAL, BUSINESS_TZ, SETTING_CHOICES, dayKey } from '../config.js';
 import { authenticate, requireAdmin } from '../lib/auth.js';
 import { wrap, badRequest, notFound, conflict } from '../lib/http.js';
-import { serializeTask, STATUS_LABELS, jobsLabel, DEFAULT_JOBS_SHOWN, expectedEndAt } from '../lib/views.js';
+import { serializeTask, STATUS_LABELS, expectedEndAt } from '../lib/views.js';
 import { ADMIN_CANCELLABLE, cancelBooking } from '../lib/cancellation.js';
 import { blockAccount, notifyAdmins } from '../lib/accounts.js';
 import { OPEN_STATUSES, releaseHelperJob } from '../matching.js';
@@ -310,8 +310,6 @@ router.get(
           rating: p.ratingAvg,
           ratingCount: p.ratingCount,
           completedJobs: p.completedJobs,
-          jobsShown: p.jobsShown ?? DEFAULT_JOBS_SHOWN,
-          jobsLabel: jobsLabel(p),
           submittedAt: p.submittedAt,
           createdAt: u.createdAt,
         };
@@ -383,57 +381,6 @@ router.get(
       // UC-C26 — the same figures the helper sees in their own app.
       money: await helperEarnings(user._id),
       ledger: (await LedgerEntry.find({ userId: user._id }).populate('taskId', 'code').sort({ createdAt: -1 }).limit(50).lean()).map(publicEntry),
-    });
-  }),
-);
-
-/**
- * PATCH /api/admin/helpers/:id/profile — the figures customers see on a helper:
- * years of experience, and the job count shown alongside their name.
- *
- * The real completed-jobs counter is deliberately not editable here: earnings
- * and reporting depend on it matching the bookings that actually happened.
- */
-router.patch(
-  '/helpers/:id/profile',
-  wrap(async (req, res) => {
-    const profile = await HelperProfile.findOne({ userId: req.params.id });
-    if (!profile) throw notFound('Helper not found.');
-
-    const before = { experienceYears: profile.experienceYears, jobsShown: profile.jobsShown };
-
-    if (req.body.experienceYears !== undefined) {
-      const years = Number(req.body.experienceYears);
-      if (!Number.isFinite(years) || years < 0 || years > 60) {
-        throw badRequest('Experience must be between 0 and 60 years.', 'INVALID_EXPERIENCE');
-      }
-      profile.experienceYears = Math.round(years * 2) / 2; // half-years are fine
-    }
-    if (req.body.jobsShown !== undefined) {
-      const jobs = Number(req.body.jobsShown);
-      if (!Number.isInteger(jobs) || jobs < 0 || jobs > 100000) {
-        throw badRequest('Jobs shown must be a whole number, 0 or more.', 'INVALID_JOBS');
-      }
-      profile.jobsShown = jobs;
-    }
-    await profile.save();
-
-    await audit(req, {
-      action: 'HELPER_PROFILE_EDITED',
-      entity: 'HelperProfile',
-      entityId: profile.userId,
-      before,
-      after: { experienceYears: profile.experienceYears, jobsShown: profile.jobsShown },
-      reason: req.body.reason || '',
-    });
-
-    res.json({
-      profile: {
-        experienceYears: profile.experienceYears,
-        jobsShown: profile.jobsShown,
-        completedJobs: profile.completedJobs,
-        jobsLabel: jobsLabel(profile),
-      },
     });
   }),
 );

@@ -466,7 +466,7 @@ router.get(
     }
 
     const helperProfile = task.helperId
-      ? await HelperProfile.findOne({ userId: task.helperId._id }).select('ratingAvg completedJobs jobsShown experienceYears').lean()
+      ? await HelperProfile.findOne({ userId: task.helperId._id }).select('ratingAvg completedJobs').lean()
       : null;
     const timeline = await TaskEvent.find({ taskId: task._id, kind: { $ne: 'MATCHING' } }).sort({ at: 1 }).lean();
 

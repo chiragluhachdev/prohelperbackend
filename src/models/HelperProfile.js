@@ -11,7 +11,6 @@ const helperProfileSchema = new mongoose.Schema(
 
     gender: { type: String, enum: ['female', 'male', 'other', ''], default: '' },
     dob: { type: Date },
-    experienceYears: { type: Number, default: 0 },
     bio: { type: String, default: '' },
 
     // --- identity (UC-C24 / UC-C25). Never store the full Aadhaar number. ---
@@ -64,14 +63,8 @@ const helperProfileSchema = new mongoose.Schema(
     // --- reputation & stats ---
     ratingAvg: { type: Number, default: 0 },
     ratingCount: { type: Number, default: 0 },
+    /** Counted by the platform as jobs are completed — never set by hand. */
     completedJobs: { type: Number, default: 0 },
-    /*
-     * The job count customers are shown, set by an admin — e.g. to include work
-     * a helper did before joining. Kept apart from completedJobs, which only the
-     * platform increments and which earnings and admin reporting rely on. The
-     * customer sees whichever is higher, so real work always shows through.
-     */
-    jobsShown: { type: Number, default: 50, min: 0 },
 
     // --- payment details ---
     paymentDetails: {
@@ -89,7 +82,7 @@ helperProfileSchema.index({ 'serviceArea.lat': 1, 'serviceArea.lng': 1 });
 /** Onboarding checklist shown on the helper's "Verification status" screen. */
 helperProfileSchema.methods.checklist = function checklist(docCount) {
   return {
-    profile: this.experienceYears >= 0 && this.bio !== undefined,
+    profile: this.bio !== undefined,
     identity: this.kycStatus === 'VERIFIED',
     documents: docCount > 0,
     services: (this.services || []).length > 0,

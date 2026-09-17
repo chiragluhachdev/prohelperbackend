@@ -1557,43 +1557,20 @@ ok('the admin sees the new number and the one it replaced',
   adminCustomer.customer?.previousPhones?.some((p) => p.phone === PHONE.customer),
   JSON.stringify({ phone: adminCustomer.customer?.phone, previous: adminCustomer.customer?.previousPhones }));
 
-/* --------------------------------------------- customer-facing helper stats */
-console.log('\n15. Helper experience and job count');
+/* -------------------------------------------------- the real job counter */
+console.log('\n15. Helper job count');
 
 // The completed booking from section 7 belongs to the race winner.
-const shownBefore = await api(`/api/customer/tasks/${taskId}`, { token: customerToken });
-ok('a helper shows 50+ jobs by default',
-  shownBefore.task?.helper?.jobsLabel === '50+', JSON.stringify(shownBefore.task?.helper));
-
-const badYears = await api(`/api/admin/helpers/${winnerId}/profile`, {
-  method: 'PATCH', token: adminToken, body: { experienceYears: 99 },
-});
-ok('an impossible experience is refused', badYears.status === 400, JSON.stringify(badYears.error));
-
-const badJobs = await api(`/api/admin/helpers/${winnerId}/profile`, {
-  method: 'PATCH', token: adminToken, body: { jobsShown: -5 },
-});
-ok('a negative job count is refused', badJobs.status === 400, JSON.stringify(badJobs.error));
-
-const edited = await api(`/api/admin/helpers/${winnerId}/profile`, {
-  method: 'PATCH', token: adminToken, body: { experienceYears: 4, jobsShown: 120 },
-});
-ok('an admin can set experience and jobs shown',
-  edited.profile?.experienceYears === 4 && edited.profile?.jobsShown === 120 && edited.profile?.jobsLabel === '120+',
-  JSON.stringify(edited.error ?? edited.profile));
-
-const shownAfter = await api(`/api/customer/tasks/${taskId}`, { token: customerToken });
-ok('the customer sees the new figures',
-  shownAfter.task?.helper?.jobsLabel === '120+' && shownAfter.task?.helper?.experienceYears === 4,
-  JSON.stringify(shownAfter.task?.helper));
-
-// Zero means "show only what really happened".
-await api(`/api/admin/helpers/${winnerId}/profile`, { method: 'PATCH', token: adminToken, body: { jobsShown: 0 } });
-const honest = await api(`/api/customer/tasks/${taskId}`, { token: customerToken });
+const shown = await api(`/api/customer/tasks/${taskId}`, { token: customerToken });
 const realCount = (await api(`/api/admin/helpers/${winnerId}`, { token: adminToken })).profile?.completedJobs;
-ok('set to 0, the real completed count shows through',
-  honest.task?.helper?.jobsLabel === String(realCount), JSON.stringify({ label: honest.task?.helper?.jobsLabel, realCount }));
-ok('and the real counter was never touched by the edits', realCount >= 1, String(realCount));
+ok('the customer sees the jobs the helper really completed',
+  shown.task?.helper?.completedJobs === realCount && realCount >= 1,
+  JSON.stringify({ shown: shown.task?.helper?.completedJobs, realCount }));
+
+const noSuchRoute = await api(`/api/admin/helpers/${winnerId}/profile`, {
+  method: 'PATCH', token: adminToken, body: { experienceYears: 4 },
+});
+ok('the job count cannot be set by hand any more', noSuchRoute.status === 404, String(noSuchRoute.status));
 
 ok('admin actions are audited', audit.logs?.length >= 3, String(audit.logs?.length));
 

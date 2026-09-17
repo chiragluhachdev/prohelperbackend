@@ -103,7 +103,7 @@ router.get(
 router.patch(
   '/profile',
   wrap(async (req, res) => {
-    const { name, gender, dob, experienceYears, bio } = req.body;
+    const { name, gender, dob, bio } = req.body;
     if (name !== undefined) {
       if (!String(name).trim()) throw badRequest('Name cannot be empty.', 'NAME_REQUIRED');
       req.user.name = String(name).trim();
@@ -111,7 +111,6 @@ router.patch(
     }
     if (gender !== undefined) req.profile.gender = gender;
     if (dob !== undefined) req.profile.dob = dob ? new Date(dob) : undefined;
-    if (experienceYears !== undefined) req.profile.experienceYears = Number(experienceYears) || 0;
     if (bio !== undefined) req.profile.bio = String(bio);
     if (req.body.paymentDetails !== undefined) {
       req.profile.paymentDetails = parsePaymentDetails(req.body.paymentDetails, req.profile.paymentDetails);
