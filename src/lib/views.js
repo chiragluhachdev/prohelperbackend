@@ -62,6 +62,14 @@ export const STATUS_LABELS = {
   NO_HELPER_AVAILABLE: 'No helper available',
 };
 
+/**
+ * Who a booking was with, for reading. A deleted account leaves the reference
+ * empty, so the name kept on the booking stands in and the history still reads.
+ */
+export const bookingPerson = (populated, snapshot) =>
+  person(populated) ||
+  (snapshot?.name ? { id: '', name: snapshot.name, phone: snapshot.phone || '', photoUrl: '' } : null);
+
 const person = (u) =>
   u && typeof u === 'object' && u._id
     ? { id: String(u._id), name: u.name || '', phone: u.phone || '', photoUrl: u.photoUrl || '' }
@@ -139,10 +147,8 @@ export function serializeTask(task, { audience = 'customer', helperProfile = nul
             rating: helperProfile?.ratingAvg ?? null,
             completedJobs: helperProfile?.completedJobs ?? null,
           }
-        : t.helperId && t.helperSnapshot?.name
-          // The account is gone or wasn't loaded: the booking still says who did it.
-          ? { id: String(t.helperId), name: t.helperSnapshot.name, phone: '', photoUrl: '' }
-          : null,
+        // The account is gone or wasn't loaded: the booking still says who did it.
+        : bookingPerson(t.helperId, t.helperSnapshot),
       // How many helpers took this booking and then dropped it.
       helperChanges: (t.helperCancellations || []).length,
       rated: Boolean(t.ratedByCustomer),
@@ -159,7 +165,8 @@ export function serializeTask(task, { audience = 'customer', helperProfile = nul
   // customer owes, not just their own share of it.
   return {
     ...base,
-    customer: person(t.customerId),
+    // The account may have been deleted; the booking still says who it was for.
+    customer: bookingPerson(t.customerId, t.customerSnapshot),
     earning: t.pricing?.helperPayout ?? 0,
     commission: t.pricing?.helperCommission ?? 0,
     gross: t.pricing?.servicesAmount ?? 0,

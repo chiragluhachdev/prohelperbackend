@@ -3,12 +3,12 @@ import { Router } from 'express';
 import {
   Address, AuditLog, Complaint, HelperDocument, HelperProfile, JobRequest,
   LedgerEntry, Payment, PromoCode, PromoRedemption, Rating, ReferralEntry, Rejection,
-  Locality, PriceHistory, Service, Task, TaskEvent, User, Category, RedemptionRequest
+  Locality, Otp, PriceHistory, Service, Task, TaskEvent, User, Category, RedemptionRequest
 } from '../models/index.js';
 import { ROLES, TASK_STATUS, HELPER_APPROVAL, BUSINESS_TZ, SETTING_CHOICES, dayKey } from '../config.js';
-import { authenticate, requireAdmin } from '../lib/auth.js';
-import { wrap, badRequest, notFound, conflict } from '../lib/http.js';
-import { serializeTask, STATUS_LABELS, expectedEndAt } from '../lib/views.js';
+import { authenticate, requireAdmin, verifyPassword } from '../lib/auth.js';
+import { wrap, badRequest, notFound, conflict, unauthorized } from '../lib/http.js';
+import { serializeTask, STATUS_LABELS, expectedEndAt, bookingPerson } from '../lib/views.js';
 import { ADMIN_CANCELLABLE, cancelBooking } from '../lib/cancellation.js';
 import { blockAccount, notifyAdmins } from '../lib/accounts.js';
 import { OPEN_STATUSES, releaseHelperJob } from '../matching.js';
@@ -224,10 +224,8 @@ function adminTask(t) {
     bookingType: t.bookingType || 'scheduled',
     scheduledAt: t.scheduledAt,
     createdAt: t.createdAt,
-    customer: t.customerId ? { id: String(t.customerId._id), name: t.customerId.name, phone: t.customerId.phone } : null,
-    helper: t.helperId?._id
-      ? { id: String(t.helperId._id), name: t.helperId.name, phone: t.helperId.phone }
-      : t.helperSnapshot?.name ? { id: t.helperId ? String(t.helperId) : '', name: t.helperSnapshot.name, phone: t.helperSnapshot.phone || '' } : null,
+    customer: bookingPerson(t.customerId, t.customerSnapshot),
+    helper: bookingPerson(t.helperId, t.helperSnapshot),
     area: t.address?.label || t.address?.city || '',
     overdue: Boolean(t.overdueNotifiedAt) && OPEN_STATUSES.includes(t.status),
     cancelledBy: t.status === TASK_STATUS.CANCELLED ? t.cancellation?.by || null : null,
@@ -589,6 +587,66 @@ router.get(
 
 /* ------------------------------------------------------ block / unblock ⛔ */
 
+/**
+ * POST /api/admin/users/:id/delete — permanently remove one account.
+ *
+ * Only the account itself goes: bookings, earnings, ratings, complaints and
+ * every other record of what this person did stay exactly as they are. Their
+ * name and number are copied onto their bookings first, so the history still
+ * reads the same afterwards. The phone number is then free to sign up again.
+ *
+ * It asks for the signed-in admin's own password, and refuses while the person
+ * still has a booking under way — cancel or finish those first.
+ */
+router.post(
+  '/users/:id/delete',
+  wrap(async (req, res) => {
+    const password = String(req.body.password || '');
+    if (!password) throw badRequest('Enter your admin password to confirm.', 'PASSWORD_REQUIRED');
+    const admin = await User.findById(req.user._id).select('+passwordHash');
+    if (!admin || !verifyPassword(password, admin.passwordHash)) {
+      throw unauthorized('That password is not right.');
+    }
+
+    const user = await User.findById(req.params.id);
+    if (!user) throw notFound('Account not found.');
+    if (user.role === ROLES.ADMIN) throw badRequest('Admin accounts cannot be deleted here.', 'CANNOT_DELETE_ADMIN');
+
+    const live = [TASK_STATUS.CREATED, TASK_STATUS.SEARCHING, ...OPEN_STATUSES];
+    const open = await Task.countDocuments({
+      status: { $in: live },
+      $or: [{ customerId: user._id }, { helperId: user._id }],
+    });
+    if (open) {
+      throw conflict(
+        `This account has ${open} booking${open === 1 ? '' : 's'} under way. Cancel or finish ${open === 1 ? 'it' : 'them'} first.`,
+        'OPEN_BOOKINGS',
+      );
+    }
+
+    // The bookings keep the name and number, so nothing in the history goes blank.
+    const who = { name: user.name || '', phone: user.phone || '' };
+    await Task.updateMany({ helperId: user._id, 'helperSnapshot.name': { $in: [null, ''] } }, { $set: { helperSnapshot: who } });
+    await Task.updateMany({ customerId: user._id, 'customerSnapshot.name': { $in: [null, ''] } }, { $set: { customerSnapshot: who } });
+
+    const before = {
+      id: String(user._id), role: user.role, name: user.name, phone: user.phone,
+      email: user.email || '', status: user.status, referralCode: user.referralCode || '',
+      joinedAt: user.createdAt,
+    };
+    await user.deleteOne();
+    // Sign-in codes are part of the account, not its history.
+    await Otp.deleteMany({ phone: before.phone });
+
+    await audit(req, {
+      action: 'ACCOUNT_DELETED', entity: 'User', entityId: before.id,
+      before, after: null, reason: String(req.body.reason || '').trim(),
+    });
+
+    res.json({ ok: true, deleted: before });
+  }),
+);
+
 router.post(
   '/users/:id/block',
   wrap(async (req, res) => {
@@ -716,9 +774,7 @@ router.get(
     res.json({
       task: {
         ...serializeTask(task, { audience: 'customer' }),
-        customer: task.customerId
-          ? { id: String(task.customerId._id), name: task.customerId.name, phone: task.customerId.phone }
-          : null,
+        customer: bookingPerson(task.customerId, task.customerSnapshot),
         owedByHelper: owedByHelper ? { amount: round(owedByHelper.amount), settled: owedByHelper.settled } : null,
         helperCancellations: (task.helperCancellations || []).map((c) => ({
           helperId: c.helperId ? String(c.helperId) : null, helperName: c.helperName, by: c.by,
@@ -1169,8 +1225,8 @@ router.get(
         paidByRole: task.paidByRole,
         paymentStatus: task.paymentStatus,
         paymentMode: task.paymentMode,
-        customer: task.customerId?.name || '—',
-        helper: task.helperId?.name || '—',
+        customer: task.customerId?.name || task.customerSnapshot?.name || '—',
+        helper: task.helperId?.name || task.helperSnapshot?.name || '—',
         services: (task.services || []).map((sv) => sv.name),
         pricing: task.pricing,
       })),
@@ -1248,8 +1304,8 @@ router.get(
           code: task.code,
           status: task.status,
           services: (task.services || []).map((sv) => ({ name: sv.name, amount: sv.amount })),
-          customer: task.customerId ? { id: String(task.customerId._id), name: task.customerId.name, phone: task.customerId.phone } : null,
-          helper: task.helperId ? { id: String(task.helperId._id), name: task.helperId.name, phone: task.helperId.phone } : null,
+          customer: bookingPerson(task.customerId, task.customerSnapshot),
+          helper: bookingPerson(task.helperId, task.helperSnapshot),
           createdAt: task.createdAt,
           scheduledAt: task.scheduledAt,
           acceptedAt: task.acceptedAt,
@@ -1446,8 +1502,8 @@ router.get(
           bookingType: task.bookingType,
           searchMode: task.searchMode,
           services: (task.services || []).map((sv) => sv.name),
-          customer: task.customerId ? { id: String(task.customerId._id), name: task.customerId.name, phone: task.customerId.phone } : null,
-          helper: task.helperId ? { id: String(task.helperId._id), name: task.helperId.name, phone: task.helperId.phone } : null,
+          customer: bookingPerson(task.customerId, task.customerSnapshot),
+          helper: bookingPerson(task.helperId, task.helperSnapshot),
           createdAt: task.createdAt,
           scheduledAt: task.scheduledAt,
           searchStartedAt: task.searchStartedAt,

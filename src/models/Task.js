@@ -218,6 +218,12 @@ const taskSchema = new mongoose.Schema(
       phone: String,
     },
 
+    /** The same for who booked it, written when an account is deleted so the history still reads. */
+    customerSnapshot: {
+      name: String,
+      phone: String,
+    },
+
     /** UC-C18: first flagged overdue, reminders sent, and the latest one. */
     overdueNotifiedAt: Date,
     overdueReminders: { type: Number, default: 0 },
