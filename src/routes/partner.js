@@ -4,7 +4,9 @@ import { ROLES } from '../config.js';
 import { authenticate, requireRole } from '../lib/auth.js';
 import { wrap, badRequest, conflict } from '../lib/http.js';
 import { getSettings } from '../lib/settings.js';
-import { ensureReferralCode, referralBalance, rewardFor } from '../lib/referral.js';
+import {
+  ensureReferralCode, REFERRAL_EARNING_TYPES, REFERRAL_POINT_TYPES, referralBalance, rewardFor,
+} from '../lib/referral.js';
 import { newTxnId } from '../lib/ledger.js';
 import { upload, uploadBuffer } from '../lib/cloudinary.js';
 import { publicUser } from './auth.js';
@@ -81,34 +83,26 @@ router.get(
       .limit(50)
       .lean();
 
-    /*
-     * A partner is paid at their own rate, and signing up a helper can be
-     * worth more than signing up a customer (UC-C34).
-     */
-    const rates = {
-      customer: rewardFor(settings, ROLES.PARTNER, ROLES.CUSTOMER),
-      helper: rewardFor(settings, ROLES.PARTNER, ROLES.HELPER),
-    };
-    const rateFor = (role) => (role === ROLES.HELPER ? rates.helper : rates.customer);
+    // A referral partner is paid as a helper for every referral (UC-C34).
+    const rewardAmount = rewardFor(settings, ROLES.PARTNER);
     // What each referral really paid, so changing the rate never rewrites history.
     const paidFor = new Map(
-      ledger.filter((r) => r.type === 'REFERRER_REWARD' && r.counterpartyId)
+      ledger.filter((r) => REFERRAL_POINT_TYPES.includes(r.type) && r.counterpartyId)
         .map((r) => [String(r.counterpartyId._id || r.counterpartyId), round2(r.amount)]),
     );
 
     const sum = (types) => round2(ledger.filter((r) => types.includes(r.type)).reduce((t, r) => t + r.amount, 0));
-    const earned = sum(['REFERRER_REWARD', 'WELCOME_REWARD']);
+    const earned = sum(REFERRAL_EARNING_TYPES);
     const redeemed = round2(-sum(['BOOKING_REDEMPTION', 'DUES_SETTLEMENT', 'BOOKING_REFUND', 'PARTNER_REDEMPTION']));
     
     // Total pending from referred users who haven't completed a booking
-    const pending = referredUsers.filter((u) => !u.referralRewardEarned);
-    const pendingReferrals = pending.length;
-    const pendingRewards = round2(pending.reduce((sum, u) => sum + rateFor(u.role), 0));
+    const pendingReferrals = referredUsers.filter((u) => !u.referralRewardEarned).length;
+    const pendingRewards = round2(pendingReferrals * rewardAmount);
 
     res.json({
       code,
       enabled: Boolean(settings.referral_enabled),
-      rates,
+      rewardAmount,
       balance,
       totals: {
         totalReferrals: referredUsers.length,
@@ -123,7 +117,7 @@ router.get(
         name: firstName(u.name),
         role: u.role,
         status: u.referralRewardEarned ? 'Completed' : 'Pending',
-        reward: u.referralRewardEarned ? paidFor.get(String(u._id)) ?? rateFor(u.role) : 0,
+        reward: u.referralRewardEarned ? paidFor.get(String(u._id)) ?? rewardAmount : 0,
       })),
       ledger: ledger.map(r => ({
         id: String(r._id),

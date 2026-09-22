@@ -146,20 +146,21 @@ export const DEFAULT_SETTINGS = {
   // --- referrals ---
   referral_enabled: true,
   /*
-   * What a referral pays, by who referred and what kind of account joined — a
-   * new helper is usually worth more to the platform than a new customer, and
-   * a referral partner (a guard, society staff) is paid at their own rate.
-   * Nothing is paid until the person who joined finishes their first booking.
+   * Referral money comes in two kinds, and they are never the same thing:
+   *
+   *   Referral points — paid to the person whose code was used.
+   *   Joining bonus   — paid to the person who joined with it.
+   *
+   * Each is set per role, and the rate follows the role of whoever is being
+   * paid: a helper who refers earns helper referral points, a customer who
+   * joins earns the customer joining bonus. A referral partner counts as a
+   * helper on both sides. Nothing is paid until the person who joined
+   * finishes their first booking.
    */
-  referral_reward_customer_refers_customer: 100,
-  referral_reward_customer_refers_helper: 300,
-  referral_reward_helper_refers_customer: 100,
-  referral_reward_helper_refers_helper: 300,
-  referral_reward_partner_refers_customer: 150,
-  referral_reward_partner_refers_helper: 500,
-  /** What the person who joined with a code gets, by the kind of account they opened. */
-  referral_welcome_customer: 100,
-  referral_welcome_helper: 200,
+  helper_referral_points: 300,
+  helper_joining_bonus: 200,
+  customer_referral_points: 100,
+  customer_joining_bonus: 100,
   referral_apply_window_days: 7,   // a code can only be entered this soon after signing up
   referral_max_booking_percent: 50, // at most this share of a booking's total can be paid with referral balance
   /**

@@ -6,12 +6,18 @@ import { wrap, forbidden } from '../lib/http.js';
 import { getSettings } from '../lib/settings.js';
 import { helperDues } from '../lib/wallet.js';
 import {
-  applyReferral, checkReferralCode, ensureReferralCode, maxBookingPercent, referralBalance, rewardFor,
-  settleDuesFromReferral, welcomeFor,
+  applyReferral, checkReferralCode, ensureReferralCode, maxBookingPercent, referralBalance,
+  REFERRAL_EARNING_TYPES, REFERRAL_POINT_TYPES, rewardFor, settleDuesFromReferral, welcomeFor,
 } from '../lib/referral.js';
 
 const router = Router();
-router.use(authenticate, requireRole(ROLES.CUSTOMER, ROLES.HELPER));
+/*
+ * Partners belong here too: they can join with someone else's code like
+ * anyone, and are paid at the helper rate for it. Spending is still each
+ * role's own business — a partner takes their money out through a payout
+ * request, not by settling dues.
+ */
+router.use(authenticate, requireRole(ROLES.CUSTOMER, ROLES.HELPER, ROLES.PARTNER));
 
 const round2 = (n) => Math.round((n || 0) * 100) / 100;
 const firstName = (name) => String(name || '').trim().split(/\s+/)[0] || '';
@@ -37,7 +43,7 @@ router.get(
     ]);
 
     const sum = (types) => round2(rows.filter((r) => types.includes(r.type)).reduce((t, r) => t + r.amount, 0));
-    const earned = sum(['REFERRER_REWARD', 'WELCOME_REWARD']);
+    const earned = sum(REFERRAL_EARNING_TYPES);
     const windowDays = Number(settings.referral_apply_window_days) || 0;
     const withinWindow = !windowDays || Date.now() - new Date(req.user.createdAt).getTime() <= windowDays * 86_400_000;
 
@@ -45,24 +51,20 @@ router.get(
       code,
       role: req.user.role,
       enabled: Boolean(settings.referral_enabled),
-      // What this person earns, by the kind of account their friend opens.
-      rewards: {
-        customer: rewardFor(settings, req.user.role, ROLES.CUSTOMER),
-        helper: rewardFor(settings, req.user.role, ROLES.HELPER),
-      },
-      // And what their friend gets for joining.
+      // Referral points at this person's own rate, whoever ends up joining.
+      rewardAmount: rewardFor(settings, req.user.role),
+      // The joining bonus their friend gets depends on the friend's own role.
       welcome: {
         customer: welcomeFor(settings, ROLES.CUSTOMER),
         helper: welcomeFor(settings, ROLES.HELPER),
       },
-      // The single figures older app versions read.
-      rewardAmount: rewardFor(settings, req.user.role, ROLES.CUSTOMER),
+      // The single figure older app versions read.
       welcomeAmount: welcomeFor(settings, ROLES.CUSTOMER),
       // Customers: the most of any one booking the balance can pay.
       maxBookingPercent: maxBookingPercent(settings),
       balance,
       totals: {
-        referrals: rows.filter((r) => r.type === 'REFERRER_REWARD').length,
+        referrals: rows.filter((r) => REFERRAL_POINT_TYPES.includes(r.type)).length,
         earned,
         // Spent on bookings or dues, less anything a cancelled booking gave back.
         used: round2(-sum(['BOOKING_REDEMPTION', 'DUES_SETTLEMENT', 'BOOKING_REFUND'])),

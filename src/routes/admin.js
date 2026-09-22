@@ -10,6 +10,7 @@ import { authenticate, requireAdmin, verifyPassword } from '../lib/auth.js';
 import { wrap, badRequest, notFound, conflict, unauthorized } from '../lib/http.js';
 import { serializeTask, STATUS_LABELS, expectedEndAt, bookingPerson } from '../lib/views.js';
 import { ADMIN_CANCELLABLE, cancelBooking } from '../lib/cancellation.js';
+import { REFERRAL_POINT_TYPES } from '../lib/referral.js';
 import { blockAccount, notifyAdmins } from '../lib/accounts.js';
 import { OPEN_STATUSES, releaseHelperJob } from '../matching.js';
 import { getSettings, updateSettings } from '../lib/settings.js';
@@ -31,7 +32,7 @@ async function referralSummary(user) {
   const [code, balance, referrals, referredBy] = await Promise.all([
     ensureReferralCode(user),
     referralBalance(user._id),
-    ReferralEntry.countDocuments({ userId: user._id, type: 'REFERRER_REWARD' }),
+    ReferralEntry.countDocuments({ userId: user._id, type: { $in: REFERRAL_POINT_TYPES } }),
     user.referredBy ? User.findById(user.referredBy).select('name phone role').lean() : null,
   ]);
   return {

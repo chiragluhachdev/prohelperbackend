@@ -66,21 +66,34 @@ async function post(entry) {
 
 const firstName = (name) => String(name || '').trim().split(/\s+/)[0] || '';
 
-const side = (role) => (role === ROLES.PARTNER ? 'partner' : role === ROLES.HELPER ? 'helper' : 'customer');
+/** Every way referral money is earned: points for referring, a bonus for joining. */
+export const REFERRAL_POINT_TYPES = ['HELPER_REFERRAL_REWARD', 'CUSTOMER_REFERRAL_REWARD'];
+export const JOINING_BONUS_TYPES = ['HELPER_JOINING_BONUS', 'CUSTOMER_JOINING_BONUS'];
+export const REFERRAL_EARNING_TYPES = [...REFERRAL_POINT_TYPES, ...JOINING_BONUS_TYPES];
 
 /**
- * What a referral pays the person who referred: set per pair, so signing up a
- * helper can be worth more than signing up a customer, and a referral partner
- * can be paid at their own rate (UC-C33 / UC-C34).
+ * Which rate card a person is paid from. A referral partner is a helper for
+ * every referral calculation there is (UC-C34) — they never earn a customer's
+ * rate, whoever they signed up.
  */
-export function rewardFor(settings, referrerRole, joinerRole) {
-  return Number(settings[`referral_reward_${side(referrerRole)}_refers_${side(joinerRole)}`]) || 0;
+export const rateSide = (role) => (role === ROLES.CUSTOMER ? 'customer' : 'helper');
+
+/**
+ * Referral points: what the person whose code was used earns, at their own
+ * role's rate — not the rate of whoever joined.
+ */
+export function rewardFor(settings, referrerRole) {
+  return Number(settings[`${rateSide(referrerRole)}_referral_points`]) || 0;
 }
 
-/** What the person who joined with a code gets, by the kind of account they opened. */
+/** Joining bonus: what the person who joined earns, at their own role's rate. */
 export function welcomeFor(settings, joinerRole) {
-  return Number(settings[`referral_welcome_${side(joinerRole)}`]) || 0;
+  return Number(settings[`${rateSide(joinerRole)}_joining_bonus`]) || 0;
 }
+
+/** The transaction each side is written as, so the two kinds can never be confused. */
+export const referralPointsType = (role) => `${rateSide(role).toUpperCase()}_REFERRAL_REWARD`;
+export const joiningBonusType = (role) => `${rateSide(role).toUpperCase()}_JOINING_BONUS`;
 
 /**
  * Whether `user` may join with `code`. Throws a coded error when not, so the
@@ -109,7 +122,7 @@ export async function checkReferralCode(user, rawCode) {
 
   return {
     referrer, code,
-    reward: rewardFor(settings, referrer.role, user.role),
+    reward: rewardFor(settings, referrer.role),
     welcome: welcomeFor(settings, user.role),
   };
 }
@@ -148,9 +161,9 @@ export async function triggerFirstBookingRewards(userId, task) {
   const settings = await getSettings();
   if (!settings.referral_enabled) return;
 
-  // The rate depends on who referred and what kind of account joined.
+  // Each side is paid from their own role's rate card.
   const isPartner = referrer.role === ROLES.PARTNER;
-  const reward = rewardFor(settings, referrer.role, user.role);
+  const reward = rewardFor(settings, referrer.role);
   const welcome = welcomeFor(settings, user.role);
 
   // Mark the reward as earned atomically so we don't double-pay
@@ -162,14 +175,14 @@ export async function triggerFirstBookingRewards(userId, task) {
 
   if (reward > 0) {
     await post({
-      userId: referrer._id, type: 'REFERRER_REWARD', amount: reward, counterpartyId: user._id, taskId: task?._id,
+      userId: referrer._id, type: referralPointsType(referrer.role), amount: reward, counterpartyId: user._id, taskId: task?._id,
       ref: `referral:${user._id}:referrer`,
       note: isPartner ? `Cashback — ${firstName(user.name) || 'someone'} you signed up finished their first booking` : `Joined with code ${referrer.referralCode || ''}`,
     });
   }
   if (welcome > 0) {
     await post({
-      userId: user._id, type: 'WELCOME_REWARD', amount: welcome, counterpartyId: referrer._id, taskId: task?._id,
+      userId: user._id, type: joiningBonusType(user.role), amount: welcome, counterpartyId: referrer._id, taskId: task?._id,
       ref: `referral:${user._id}:welcome`, note: `Joined with code ${referrer.referralCode || ''}`,
     });
   }
