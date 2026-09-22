@@ -1538,7 +1538,15 @@ router.put(
       // Coerce to the shape the setting already has. A boolean arriving as the
       // string "false" would otherwise be stored as a string, and every
       // `if (setting)` in the codebase would read it as true.
-      if (typeof before[key] === 'number') {
+      if (Array.isArray(before[key])) {
+        // A list arrives either as lines from a textarea or as an array.
+        const lines = Array.isArray(value) ? value : String(value).split('\n');
+        const cleaned = lines.map((line) => String(line).replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 12);
+        if (cleaned.some((line) => line.length > 80)) {
+          throw badRequest(`Each line of "${key}" must be 80 characters or fewer.`, 'INVALID_SETTING');
+        }
+        patch[key] = cleaned;
+      } else if (typeof before[key] === 'number') {
         const n = Number(value);
         if (!Number.isFinite(n)) throw badRequest(`"${key}" must be a number.`, 'INVALID_SETTING');
         patch[key] = n;

@@ -66,6 +66,22 @@ async function post(entry) {
 
 const firstName = (name) => String(name || '').trim().split(/\s+/)[0] || '';
 
+const side = (role) => (role === ROLES.PARTNER ? 'partner' : role === ROLES.HELPER ? 'helper' : 'customer');
+
+/**
+ * What a referral pays the person who referred: set per pair, so signing up a
+ * helper can be worth more than signing up a customer, and a referral partner
+ * can be paid at their own rate (UC-C33 / UC-C34).
+ */
+export function rewardFor(settings, referrerRole, joinerRole) {
+  return Number(settings[`referral_reward_${side(referrerRole)}_refers_${side(joinerRole)}`]) || 0;
+}
+
+/** What the person who joined with a code gets, by the kind of account they opened. */
+export function welcomeFor(settings, joinerRole) {
+  return Number(settings[`referral_welcome_${side(joinerRole)}`]) || 0;
+}
+
 /**
  * Whether `user` may join with `code`. Throws a coded error when not, so the
  * app can say exactly why; returns the referrer when it may.
@@ -91,7 +107,11 @@ export async function checkReferralCode(user, rawCode) {
     throw badRequest('Referral codes can only be used when you first sign up.', 'REFERRAL_WINDOW_CLOSED');
   }
 
-  return { referrer, code, reward: Number(settings.referral_reward_amount) || 0, welcome: Number(settings.referral_welcome_amount) || 0 };
+  return {
+    referrer, code,
+    reward: rewardFor(settings, referrer.role, user.role),
+    welcome: welcomeFor(settings, user.role),
+  };
 }
 
 /**
@@ -128,10 +148,10 @@ export async function triggerFirstBookingRewards(userId, task) {
   const settings = await getSettings();
   if (!settings.referral_enabled) return;
 
-  // A referral partner (a guard, a society contact) has their own rate (UC-C34).
+  // The rate depends on who referred and what kind of account joined.
   const isPartner = referrer.role === ROLES.PARTNER;
-  const reward = Number(isPartner ? settings.partner_reward_amount : settings.referral_reward_amount) || 0;
-  const welcome = Number(settings.referral_welcome_amount) || 0;
+  const reward = rewardFor(settings, referrer.role, user.role);
+  const welcome = welcomeFor(settings, user.role);
 
   // Mark the reward as earned atomically so we don't double-pay
   const marked = await User.findOneAndUpdate(

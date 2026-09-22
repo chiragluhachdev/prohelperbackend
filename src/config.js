@@ -145,8 +145,21 @@ export const DEFAULT_SETTINGS = {
   online_payment_enabled: true,
   // --- referrals ---
   referral_enabled: true,
-  referral_reward_amount: 100,     // to the person whose code was used
-  referral_welcome_amount: 100,    // to the person who joined with it
+  /*
+   * What a referral pays, by who referred and what kind of account joined — a
+   * new helper is usually worth more to the platform than a new customer, and
+   * a referral partner (a guard, society staff) is paid at their own rate.
+   * Nothing is paid until the person who joined finishes their first booking.
+   */
+  referral_reward_customer_refers_customer: 100,
+  referral_reward_customer_refers_helper: 300,
+  referral_reward_helper_refers_customer: 100,
+  referral_reward_helper_refers_helper: 300,
+  referral_reward_partner_refers_customer: 150,
+  referral_reward_partner_refers_helper: 500,
+  /** What the person who joined with a code gets, by the kind of account they opened. */
+  referral_welcome_customer: 100,
+  referral_welcome_helper: 200,
   referral_apply_window_days: 7,   // a code can only be entered this soon after signing up
   referral_max_booking_percent: 50, // at most this share of a booking's total can be paid with referral balance
   /**
@@ -155,8 +168,6 @@ export const DEFAULT_SETTINGS = {
    * hands. Installing the app never earns anything.
    */
   referral_qualify_event: 'COMPLETED', // COMPLETED | SETTLED
-  // What a referral partner gets when someone they signed up qualifies (UC-C34).
-  partner_reward_amount: 100,
   // --- start (UC-C16): the customer's code before work begins ---
   start_otp_enabled: true,
   start_early_minutes: 60,          // a booking for later can be started at most this long before its slot (0 = any time)
@@ -169,7 +180,81 @@ export const DEFAULT_SETTINGS = {
   overdue_reminder_minutes: 90,     // this long past the expected finish, remind both sides
   overdue_repeat_minutes: 60,       // and again this often (0 = remind once)
   overdue_max_reminders: 3,
+  /*
+   * What each side can tick when rating the other (UC-C20 / UC-C21). Which
+   * list they see follows the stars they gave, so the words always match the
+   * mood: 1-2 low, 3 middling, 4-5 high. "Other", with the note box under it,
+   * is always offered on top of these, so a list can never be a dead end.
+   *
+   * `_helper_` is what a customer says about a helper; `_customer_` is what a
+   * helper says about the household they worked in.
+   */
+  rating_reasons_helper_low: [
+    'Service quality was poor',
+    'Helper was late',
+    'Helper was unprofessional',
+    'Work was incomplete',
+    'Behaviour was not good',
+    'Not satisfied',
+  ],
+  rating_reasons_helper_mid: [
+    'Service was okay',
+    'Could be improved',
+    'Some issues with the service',
+    'Helper was slightly late',
+    'Expected better',
+  ],
+  rating_reasons_helper_high: [
+    'Excellent service',
+    'Helper was professional',
+    'Work was done well',
+    'Helper was punctual',
+    'Good behaviour',
+    'Very satisfied',
+  ],
+  rating_reasons_customer_low: [
+    'Home was not ready',
+    'Instructions were unclear',
+    'Behaviour was not good',
+    'Kept me waiting',
+    'Asked for much more than booked',
+    'Would rather not go back',
+  ],
+  rating_reasons_customer_mid: [
+    'It was okay',
+    'Instructions came late',
+    'Took longer than expected',
+    'Home could have been readier',
+    'Expected better',
+  ],
+  rating_reasons_customer_high: [
+    'Clear instructions',
+    'Home was ready',
+    'Polite and respectful',
+    'Fair about the work',
+    'Paid without fuss',
+    'Would happily go back',
+  ],
+
   // --- cancellation (UC-C22) ---
+  /*
+   * The reasons each app offers when someone cancels, in the order shown.
+   * "Something else", with a written note, is always offered last and is not
+   * listed here. An empty list leaves only that.
+   */
+  cancel_reasons_customer: [
+    'My plans changed',
+    'Wrong date or time',
+    'Booked by mistake',
+    'The price is too high',
+    'Not happy with the helper',
+  ],
+  cancel_reasons_helper: [
+    'I am unwell',
+    'Family emergency',
+    'The address is too far',
+    'I have another job at this time',
+  ],
   customer_cancel_until: 'IN_PROGRESS', // the last status a customer can cancel in: SEARCHING | ACCEPTED | IN_PROGRESS
   helper_cancel_enabled: true,
   helper_cancel_min_minutes_before: 60, // a booking for later can't be dropped closer to its slot than this (0 = any time)

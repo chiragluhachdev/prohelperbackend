@@ -6,7 +6,8 @@ import { wrap, forbidden } from '../lib/http.js';
 import { getSettings } from '../lib/settings.js';
 import { helperDues } from '../lib/wallet.js';
 import {
-  applyReferral, checkReferralCode, ensureReferralCode, maxBookingPercent, referralBalance, settleDuesFromReferral,
+  applyReferral, checkReferralCode, ensureReferralCode, maxBookingPercent, referralBalance, rewardFor,
+  settleDuesFromReferral, welcomeFor,
 } from '../lib/referral.js';
 
 const router = Router();
@@ -44,8 +45,19 @@ router.get(
       code,
       role: req.user.role,
       enabled: Boolean(settings.referral_enabled),
-      rewardAmount: Number(settings.referral_reward_amount) || 0,
-      welcomeAmount: Number(settings.referral_welcome_amount) || 0,
+      // What this person earns, by the kind of account their friend opens.
+      rewards: {
+        customer: rewardFor(settings, req.user.role, ROLES.CUSTOMER),
+        helper: rewardFor(settings, req.user.role, ROLES.HELPER),
+      },
+      // And what their friend gets for joining.
+      welcome: {
+        customer: welcomeFor(settings, ROLES.CUSTOMER),
+        helper: welcomeFor(settings, ROLES.HELPER),
+      },
+      // The single figures older app versions read.
+      rewardAmount: rewardFor(settings, req.user.role, ROLES.CUSTOMER),
+      welcomeAmount: welcomeFor(settings, ROLES.CUSTOMER),
       // Customers: the most of any one booking the balance can pay.
       maxBookingPercent: maxBookingPercent(settings),
       balance,

@@ -12,6 +12,38 @@ import { notifyAdmins } from '../lib/accounts.js';
 const router = Router();
 
 /**
+ * GET /api/app-config — the admin-set lists the apps only display: the reasons
+ * offered when a booking is cancelled, and the ones offered when a customer
+ * rates a helper. "Something else" and "Other" are always added by the app on
+ * top of these, so a list can never be emptied into a dead end.
+ */
+router.get(
+  '/app-config',
+  wrap(async (_req, res) => {
+    const settings = await getSettings();
+    res.json({
+      cancelReasons: {
+        customer: settings.cancel_reasons_customer || [],
+        helper: settings.cancel_reasons_helper || [],
+      },
+      // What each side can tick when rating the other, by how many stars they gave.
+      ratingReasons: {
+        helper: {
+          low: settings.rating_reasons_helper_low || [],
+          mid: settings.rating_reasons_helper_mid || [],
+          high: settings.rating_reasons_helper_high || [],
+        },
+        customer: {
+          low: settings.rating_reasons_customer_low || [],
+          mid: settings.rating_reasons_customer_mid || [],
+          high: settings.rating_reasons_customer_high || [],
+        },
+      },
+    });
+  }),
+);
+
+/**
  * GET /api/localities — the places currently served, for the apps' pickers.
  * Managed in the admin panel; never the prices, only what is needed to choose.
  */
