@@ -262,7 +262,7 @@ router.post(
 
     const { pricing, lines, durationMins } = await quote(req.body.services, { bookingType: req.body.bookingType, promo, society });
     // Referral balance is offered on every bill and only taken off when asked for.
-    const { balance, usable, cap, percent } = await usableForBooking(req.user, pricing.total);
+    const { balance, usable, cap, percent } = await usableForBooking(req.user, pricing);
     if (req.body.useReferral && usable > 0) pricing.referralCredit = usable;
     res.json({
       lines,
@@ -356,7 +356,7 @@ router.post(
       society: address.society,
     });
     if (useReferral) {
-      const { usable } = await usableForBooking(req.user, pricing.total);
+      const { usable } = await usableForBooking(req.user, pricing);
       if (usable > 0) pricing.referralCredit = usable;
     }
 

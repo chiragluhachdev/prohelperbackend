@@ -192,14 +192,20 @@ export function maxBookingPercent(settings) {
  * never more than the capped share of that booking (50% by default), so every
  * booking is still at least half paid for. The rest stays for later bookings.
  *
+ * Tax is never paid with it. The platform has to hand over every rupee of GST
+ * whatever discount it funds, so the GST on a bill is always paid for real and
+ * the balance can only go against the rest of it.
+ *
  * Switching referral codes off stops new ones being entered; balance already
  * earned can still be spent. Helpers spend theirs on dues instead.
  */
-export async function usableForBooking(user, total) {
+export async function usableForBooking(user, pricing) {
   const settings = await getSettings();
+  const total = Number(pricing?.total) || 0;
+  const gst = Number(pricing?.gst) || 0;
   const balance = user.role === ROLES.CUSTOMER ? await referralBalance(user._id) : 0;
   const percent = maxBookingPercent(settings);
-  const cap = round2(((total || 0) * percent) / 100);
+  const cap = round2(Math.min((total * percent) / 100, Math.max(0, total - gst)));
   const usable = round2(Math.max(0, Math.min(balance, cap)));
   return { balance, usable, cap, percent };
 }
