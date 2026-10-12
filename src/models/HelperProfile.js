@@ -82,7 +82,7 @@ helperProfileSchema.index({ 'serviceArea.lat': 1, 'serviceArea.lng': 1 });
 /** Onboarding checklist shown on the helper's "Verification status" screen. */
 helperProfileSchema.methods.checklist = function checklist(docCount) {
   return {
-    profile: this.bio !== undefined,
+    profile: Boolean(this.gender || this.bio !== undefined),
     identity: this.kycStatus === 'VERIFIED',
     documents: docCount > 0,
     services: (this.services || []).length > 0,

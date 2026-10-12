@@ -71,6 +71,10 @@ router.use(authenticate, requireRole(ROLES.HELPER));
 const loadProfile = wrap(async (req, _res, next) => {
   req.profile = await HelperProfile.findOne({ userId: req.user._id });
   if (!req.profile) req.profile = await HelperProfile.create({ userId: req.user._id });
+  if (req.profile.bio === undefined) {
+    req.profile.bio = '';
+    await req.profile.save();
+  }
   next();
 });
 router.use(loadProfile);
