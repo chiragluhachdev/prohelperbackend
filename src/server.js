@@ -52,29 +52,61 @@ export function createApp() {
 
   app.use((req, res) => res.status(404).json({ error: { message: `No route for ${req.method} ${req.path}`, code: 'NOT_FOUND' } }));
 
+  /*
+   * Answering while a phone is still sending its photo looks, to Android, like
+   * the connection died: the app shows "check your connection" and the real
+   * reason — the wrong file type, an expired session — never reaches it. So an
+   * upload that is still arriving is read to the end first, up to a cap, and
+   * only then answered.
+   */
+  const DRAIN_CAP = 12 * 1024 * 1024;
+  const answer = (req, send) => {
+    const uploading = String(req.headers['content-type'] || '').startsWith('multipart/');
+    if (!uploading || req.readableEnded || req.destroyed) return send();
+
+    let drained = 0;
+    const finish = () => {
+      req.removeListener('data', onData);
+      req.removeListener('end', finish);
+      req.removeListener('error', finish);
+      send();
+    };
+    const onData = (chunk) => {
+      drained += chunk.length;
+      // A body big enough to be an attack is not worth draining politely.
+      if (drained > DRAIN_CAP) finish();
+    };
+    req.on('data', onData);
+    req.once('end', finish);
+    req.once('error', finish);
+    req.resume();
+  };
+
   // Everything that goes wrong leaves through here, in one shape the apps can rely on.
-  app.use((err, _req, res, _next) => {
+  app.use((err, req, res, _next) => {
+    const reply = (status, body) => answer(req, () => res.status(status).json(body));
+
     if (err instanceof ApiError) {
-      return res.status(err.status).json({ error: { message: err.message, code: err.code, details: err.details } });
+      return reply(err.status, { error: { message: err.message, code: err.code, details: err.details } });
     }
     if (err instanceof multer.MulterError) {
       const message = err.code === 'LIMIT_FILE_SIZE' ? 'That file is larger than 8 MB.' : 'Upload failed.';
-      return res.status(400).json({ error: { message, code: err.code } });
+      return reply(400, { error: { message, code: err.code } });
     }
     if (err?.name === 'ValidationError') {
-      return res.status(400).json({
+      return reply(400, {
         error: { message: Object.values(err.errors)[0]?.message || 'Invalid data.', code: 'VALIDATION_ERROR' },
       });
     }
     if (err?.name === 'CastError') {
-      return res.status(400).json({ error: { message: 'That id is not valid.', code: 'INVALID_ID' } });
+      return reply(400, { error: { message: 'That id is not valid.', code: 'INVALID_ID' } });
     }
     if (err?.code === 11000) {
-      return res.status(409).json({ error: { message: 'That record already exists.', code: 'DUPLICATE' } });
+      return reply(409, { error: { message: 'That record already exists.', code: 'DUPLICATE' } });
     }
 
     console.error('[error]', err);
-    res.status(500).json({ error: { message: 'Something went wrong on our side.', code: 'INTERNAL' } });
+    reply(500, { error: { message: 'Something went wrong on our side.', code: 'INTERNAL' } });
   });
 
   return app;
