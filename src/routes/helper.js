@@ -325,12 +325,25 @@ router.post(
     const docCount = await HelperDocument.countDocuments({ helperId: req.user._id });
     const checklist = req.profile.checklist(docCount);
 
+    // Named the way a helper would say it, not the way the checklist stores it.
+    const PLAIN = {
+      name: 'add your name',
+      profile: 'finish your profile',
+      identity: 'verify your Aadhaar',
+      services: 'choose the services you offer',
+      serviceArea: 'choose where you want to work',
+    };
     const missing = Object.entries(checklist)
+      // Documents are optional on purpose: they can be added later from the profile.
       .filter(([key, done]) => key !== 'documents' && !done)
       .map(([key]) => key);
     if (!req.user.name) missing.unshift('name');
     if (missing.length) {
-      throw badRequest(`Still to do: ${missing.join(', ')}.`, 'ONBOARDING_INCOMPLETE', { missing });
+      const readable = missing.map((key) => PLAIN[key] || key);
+      const list = readable.length === 1
+        ? readable[0]
+        : `${readable.slice(0, -1).join(', ')} and ${readable[readable.length - 1]}`;
+      throw badRequest(`Before you submit, please ${list}.`, 'ONBOARDING_INCOMPLETE', { missing });
     }
     if (req.profile.approvalStatus === HELPER_APPROVAL.APPROVED) {
       throw conflict('Your account is already approved.', 'ALREADY_APPROVED');
